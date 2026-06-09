@@ -15,6 +15,7 @@ categories = ["web-programming::http-server", "authentication"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["json"] }
+base64 = "0.22"
 http = "1"
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 mp-config = { path = "../mp-config" }

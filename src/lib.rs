@@ -43,6 +43,8 @@ pub use oidc_middleware_macros::roles_allowed;
 use axum::body::Body;
 use axum::extract::FromRequestParts;
 use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use http::request::Parts;
 use http::{HeaderValue, Request, StatusCode};
@@ -88,6 +90,9 @@ pub struct OidcConfig {
     /// Enables or disables the selected tenant.
     #[config(default = "true")]
     pub tenant_enabled: bool,
+    /// Resolve tenants by the bearer token issuer claim.
+    #[config(default = "false")]
+    pub resolve_tenants_with_issuer: bool,
     /// Base URL of the OpenID Connect provider or realm.
     pub auth_server_url: Option<String>,
     /// Enables OIDC provider metadata discovery.
@@ -127,6 +132,7 @@ impl Default for OidcConfig {
         Self {
             enabled: true,
             tenant_enabled: true,
+            resolve_tenants_with_issuer: false,
             auth_server_url: None,
             discovery_enabled: true,
             discovery_path: ".well-known/openid-configuration".to_owned(),
@@ -1646,6 +1652,7 @@ pub struct Tenants {
     tenants: Arc<[RegisteredTenant]>,
     default_tenant: Option<Oidc>,
     header_name: Option<http::HeaderName>,
+    resolve_with_issuer: bool,
 }
 
 impl Tenants {
@@ -1660,7 +1667,11 @@ impl Tenants {
     /// `quarkus.oidc.<tenant>.*`. Tenant selection uses each tenant's
     /// `tenant-paths` property.
     pub fn from_config(config: &Config) -> mp_config::Result<TenantsBuilder> {
-        let mut builder = Tenants::builder();
+        let mut builder = Tenants::builder().resolve_with_issuer(
+            config
+                .get_optional::<bool>("quarkus.oidc.resolve-tenants-with-issuer")?
+                .unwrap_or_default(),
+        );
         if has_default_tenant_config(config) {
             let default_config = OidcConfig::from_config(config)?;
             builder = builder.default_tenant(
@@ -1702,6 +1713,24 @@ impl Tenants {
             }
         }
 
+        if self.resolve_with_issuer {
+            if let Some(issuer) = request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(bearer_token_from_authorization_value)
+                .and_then(unverified_token_issuer)
+            {
+                if let Some(tenant) = self
+                    .tenants
+                    .iter()
+                    .find(|tenant| tenant.issuer_matches(&issuer))
+                {
+                    return Some(&tenant.oidc);
+                }
+            }
+        }
+
         let path = request.uri().path();
         self.tenants
             .iter()
@@ -1718,6 +1747,7 @@ pub struct TenantsBuilder {
     tenants: Vec<RegisteredTenant>,
     default_tenant: Option<Oidc>,
     header_name: Option<http::HeaderName>,
+    resolve_with_issuer: bool,
 }
 
 impl TenantsBuilder {
@@ -1750,12 +1780,19 @@ impl TenantsBuilder {
         self
     }
 
+    /// Selects tenants by matching bearer token `iss` claims.
+    pub fn resolve_with_issuer(mut self, enabled: bool) -> Self {
+        self.resolve_with_issuer = enabled;
+        self
+    }
+
     /// Finishes the tenant registry.
     pub fn build(self) -> Tenants {
         Tenants {
             tenants: Arc::from(self.tenants),
             default_tenant: self.default_tenant,
             header_name: self.header_name,
+            resolve_with_issuer: self.resolve_with_issuer,
         }
     }
 }
@@ -1773,6 +1810,17 @@ impl RegisteredTenant {
             .iter()
             .filter_map(|path| path_match_score(path, request_path))
             .max()
+    }
+
+    fn issuer_matches(&self, issuer: &str) -> bool {
+        self.oidc
+            .config
+            .token
+            .issuer
+            .as_deref()
+            .filter(|expected| *expected != "any")
+            .or(self.oidc.config.auth_server_url.as_deref())
+            .is_some_and(|expected| expected == issuer)
     }
 }
 
@@ -2093,13 +2141,29 @@ fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc
     let value = header
         .to_str()
         .map_err(|_| Error::InvalidAuthorizationHeader)?;
-    let prefix = format!("{} ", config.authorization_scheme);
-    let token = value
-        .strip_prefix(&prefix)
+    let token = token_with_scheme(value, &config.authorization_scheme)
         .filter(|token| !token.is_empty())
         .ok_or(Error::InvalidAuthorizationHeader)?;
 
     Ok(Arc::from(token))
+}
+
+fn bearer_token_from_authorization_value(value: &str) -> Option<&str> {
+    token_with_scheme(value, "Bearer").filter(|token| !token.is_empty())
+}
+
+fn token_with_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
+    value.strip_prefix(&format!("{scheme} "))
+}
+
+fn unverified_token_issuer(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims = serde_json::from_slice::<Value>(&decoded).ok()?;
+    claims
+        .get("iss")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn discovery_url(auth_server_url: &str, discovery_path: &str) -> BuildResult<reqwest::Url> {
@@ -2369,6 +2433,7 @@ dQIDAQAB
                         "quarkus.oidc.auth-server-url",
                         "https://issuer.example/realms/app",
                     )
+                    .with("quarkus.oidc.resolve-tenants-with-issuer", "true")
                     .with("quarkus.oidc.discovery-enabled", "false")
                     .with("quarkus.oidc.discovery-path", "custom-discovery")
                     .with("quarkus.oidc.jwks-path", "protocol/openid-connect/certs")
@@ -2401,6 +2466,7 @@ dQIDAQAB
             OidcConfig {
                 enabled: true,
                 tenant_enabled: true,
+                resolve_tenants_with_issuer: true,
                 auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
                 discovery_enabled: false,
                 discovery_path: "custom-discovery".to_owned(),
@@ -3831,6 +3897,113 @@ dQIDAQAB
     }
 
     #[tokio::test]
+    async fn tenants_select_by_token_issuer_when_enabled() {
+        let tenant_a_token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/a",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec![],
+            realm_access: RealmAccessClaims { roles: vec![] },
+        });
+        let tenant_b_token = jwt(TestClaims {
+            sub: "bob",
+            iss: "https://issuer.example/realms/b",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec![],
+            realm_access: RealmAccessClaims { roles: vec![] },
+        });
+
+        let response = tenant_app(
+            Tenants::builder()
+                .resolve_with_issuer(true)
+                .tenant(
+                    "tenant-a",
+                    static_tenant_with_issuer(
+                        &tenant_a_token,
+                        "tenant-a",
+                        "https://issuer.example/realms/a",
+                    ),
+                )
+                .tenant(
+                    "tenant-b",
+                    static_tenant_with_issuer(
+                        &tenant_b_token,
+                        "tenant-b",
+                        "https://issuer.example/realms/b",
+                    ),
+                )
+                .build(),
+        )
+        .oneshot(request(
+            "/unmatched",
+            Some(&format!("Bearer {tenant_b_token}")),
+        ))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_body(response).await,
+            "tenant-b",
+            "issuer should select tenant-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_header_takes_precedence_over_token_issuer() {
+        let token = jwt(TestClaims {
+            sub: "bob",
+            iss: "https://issuer.example/realms/b",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec![],
+            realm_access: RealmAccessClaims { roles: vec![] },
+        });
+
+        let response = tenant_app(
+            Tenants::builder()
+                .tenant_header(http::HeaderName::from_static("x-oidc-tenant"))
+                .resolve_with_issuer(true)
+                .tenant(
+                    "tenant-a",
+                    static_tenant_with_issuer(
+                        &token,
+                        "tenant-a",
+                        "https://issuer.example/realms/a",
+                    ),
+                )
+                .tenant(
+                    "tenant-b",
+                    static_tenant_with_issuer(
+                        &token,
+                        "tenant-b",
+                        "https://issuer.example/realms/b",
+                    ),
+                )
+                .build(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/unmatched")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header("x-oidc-tenant", "tenant-a")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_body(response).await,
+            "tenant-a",
+            "header should select tenant-a"
+        );
+    }
+
+    #[tokio::test]
     async fn tenants_preserve_disabled_tenant_behaviour() {
         let response = tenant_app(
             Tenants::builder()
@@ -4440,6 +4613,22 @@ dQIDAQAB
         })
         .validator(StaticTokenValidator::bearer(token, subject))
         .build()
+    }
+
+    fn static_tenant_with_issuer(token: &str, subject: &str, issuer: &str) -> Oidc {
+        Oidc::builder(OidcConfig {
+            auth_server_url: Some(issuer.to_owned()),
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer(token, subject))
+        .build()
+    }
+
+    async fn response_body(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("response body should be readable");
+        String::from_utf8(body.to_vec()).expect("response body should be UTF-8")
     }
 
     fn claims_app(oidc: Oidc) -> Router {
