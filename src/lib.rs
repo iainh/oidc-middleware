@@ -300,6 +300,18 @@ impl ConfigProperties for OidcTokenConfig {
             }
         };
 
+        let token_header_key = key("header");
+        let header = config.get_optional::<String>(&token_header_key)?;
+        if let Some(header) = &header {
+            http::HeaderName::from_str(header).map_err(|error| {
+                mp_config::ConfigError::Conversion {
+                    name: token_header_key.clone(),
+                    value: header.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+        }
+
         Ok(Self {
             issuer: config.get_optional(&key("issuer"))?,
             audience: config.get_optional(&key("audience"))?,
@@ -313,7 +325,7 @@ impl ConfigProperties for OidcTokenConfig {
                 .unwrap_or(true),
             required_claims: load_required_claims(config, &key("required-claims"))?,
             principal_claim: config.get_optional(&key("principal-claim"))?,
-            header: config.get_optional(&key("header"))?,
+            header,
             authorization_scheme: config
                 .get_optional(&key("authorization-scheme"))?
                 .unwrap_or_else(|| "Bearer".to_owned()),
@@ -3742,6 +3754,25 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("expected one of `basic` or `post`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_invalid_token_header() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("test", 100).with("quarkus.oidc.token.header", "not a header"),
+            )
+            .build();
+
+        let error = match OidcConfig::from_config(&config) {
+            Err(error) => error,
+            Ok(_) => panic!("token header should be rejected"),
+        };
+
+        assert!(
+            error.to_string().contains("quarkus.oidc.token.header"),
             "{error}"
         );
     }
