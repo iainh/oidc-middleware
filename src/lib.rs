@@ -869,8 +869,9 @@ impl Authorization {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let policy_name = config.get::<String>(&format!("{prefix}.policy"))?;
-            let policy = policy_from_config(&policy_name, &role_policies);
+            let policy_key = format!("{prefix}.policy");
+            let policy_name = config.get::<String>(&policy_key)?;
+            let policy = policy_from_config(&policy_key, &policy_name, &role_policies)?;
             let shared = config
                 .get_optional::<bool>(&format!("{prefix}.shared"))?
                 .unwrap_or_default();
@@ -3100,12 +3101,24 @@ fn permission_names(config: &Config) -> Vec<String> {
     names.into_iter().collect()
 }
 
-fn policy_from_config(name: &str, role_policies: &HashMap<String, RolePolicy>) -> HttpPolicy {
+fn policy_from_config(
+    property_name: &str,
+    name: &str,
+    role_policies: &HashMap<String, RolePolicy>,
+) -> mp_config::Result<HttpPolicy> {
     match name {
-        "permit" => HttpPolicy::Permit,
-        "deny" => HttpPolicy::Deny,
-        "authenticated" => HttpPolicy::Authenticated,
-        name => HttpPolicy::Roles(role_policies.get(name).cloned().unwrap_or_default()),
+        "permit" => Ok(HttpPolicy::Permit),
+        "deny" => Ok(HttpPolicy::Deny),
+        "authenticated" => Ok(HttpPolicy::Authenticated),
+        name => role_policies
+            .get(name)
+            .cloned()
+            .map(HttpPolicy::Roles)
+            .ok_or_else(|| mp_config::ConfigError::Conversion {
+                name: property_name.to_owned(),
+                value: name.to_owned(),
+                message: format!("authorization policy `{name}` is not defined"),
+            }),
     }
 }
 
@@ -6599,6 +6612,33 @@ dQIDAQAB
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn authorization_rejects_undefined_named_policy() {
+        let error = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-undefined-policy", 100)
+                        .with("quarkus.http.auth.permission.secured.paths", "/resource")
+                        .with("quarkus.http.auth.permission.secured.policy", "missing"),
+                )
+                .build(),
+        )
+        .expect_err("undefined named policy should be rejected");
+
+        assert!(
+            error.to_string().contains(
+                "failed to convert config property `quarkus.http.auth.permission.secured.policy` value `missing`"
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("authorization policy `missing` is not defined"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
