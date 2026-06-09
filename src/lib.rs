@@ -65,6 +65,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ValidationFuture = Pin<Box<dyn Future<Output = Result<Principal>> + Send>>;
 
+/// Result type returned while building OIDC middleware.
+pub type BuildResult<T> = std::result::Result<T, BuildError>;
+
 /// OIDC configuration loaded from the MicroProfile-style config model.
 #[derive(Clone, Debug, ConfigProperties, Eq, PartialEq)]
 #[config(prefix = "quarkus.oidc", rename_all = "kebab-case")]
@@ -254,6 +257,61 @@ impl IntoResponse for Error {
         let mut response = status.into_response();
         response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
         response
+    }
+}
+
+/// Error type returned while building provider-backed middleware.
+#[derive(Debug)]
+pub enum BuildError {
+    /// Provider discovery requires `quarkus.oidc.auth-server-url`.
+    MissingAuthServerUrl,
+    /// A configured provider or metadata URL could not be parsed.
+    InvalidUrl { url: String, message: String },
+    /// Fetching provider metadata or keys failed.
+    Http(reqwest::Error),
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingAuthServerUrl => write!(
+                f,
+                "OIDC provider discovery requires `quarkus.oidc.auth-server-url`"
+            ),
+            Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
+            Self::Http(source) => write!(f, "OIDC provider request failed: {source}"),
+        }
+    }
+}
+
+impl StdError for BuildError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Http(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<reqwest::Error> for BuildError {
+    fn from(source: reqwest::Error) -> Self {
+        Self::Http(source)
+    }
+}
+
+/// OpenID Provider metadata used by discovery.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ProviderMetadata {
+    /// Canonical issuer returned by the provider.
+    pub issuer: Option<String>,
+    /// JSON Web Key Set URL returned by the provider.
+    pub jwks_uri: String,
+}
+
+impl ProviderMetadata {
+    /// Parses provider metadata from JSON.
+    pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
     }
 }
 
@@ -497,6 +555,52 @@ impl OidcBuilder {
         self
     }
 
+    /// Discovers provider metadata and installs a JWKS-backed JWT validator.
+    pub async fn discover(self) -> BuildResult<Oidc> {
+        self.discover_with_client(reqwest::Client::new()).await
+    }
+
+    /// Discovers provider metadata using a caller-supplied HTTP client.
+    pub async fn discover_with_client(self, client: reqwest::Client) -> BuildResult<Oidc> {
+        if !self.config.enabled {
+            return Ok(self.build());
+        }
+
+        let auth_server_url = self
+            .config
+            .auth_server_url
+            .clone()
+            .ok_or(BuildError::MissingAuthServerUrl)?;
+        let metadata_url = discovery_url(&auth_server_url)?;
+        let metadata: ProviderMetadata = client
+            .get(metadata_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let jwks: JwkSet = client
+            .get(&metadata.jwks_uri)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(self.provider_metadata(metadata, jwks))
+    }
+
+    /// Installs provider metadata and a JWKS-backed JWT validator.
+    pub fn provider_metadata(mut self, metadata: ProviderMetadata, jwks: JwkSet) -> Oidc {
+        let mut validation_config = self.config.clone();
+        if validation_config.token.issuer.is_none() {
+            validation_config.token.issuer = metadata.issuer;
+        }
+
+        self.validator = Some(Arc::new(JwtValidator::jwks(jwks, &validation_config)));
+        self.build()
+    }
+
     /// Finishes the OIDC middleware.
     ///
     /// If no validator is supplied, all bearer tokens are rejected. This keeps
@@ -583,6 +687,17 @@ fn bearer_token(request: &Request<Body>) -> Result<Arc<str>> {
         .ok_or(Error::InvalidAuthorizationHeader)?;
 
     Ok(Arc::from(token))
+}
+
+fn discovery_url(auth_server_url: &str) -> BuildResult<reqwest::Url> {
+    let url = format!(
+        "{}/.well-known/openid-configuration",
+        auth_server_url.trim_end_matches('/')
+    );
+    reqwest::Url::parse(&url).map_err(|error| BuildError::InvalidUrl {
+        url,
+        message: error.to_string(),
+    })
 }
 
 fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
@@ -885,6 +1000,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn discovery_url_appends_well_known_path() {
+        assert_eq!(
+            discovery_url("https://issuer.example/realms/app")
+                .expect("discovery URL should parse")
+                .as_str(),
+            "https://issuer.example/realms/app/.well-known/openid-configuration"
+        );
+        assert_eq!(
+            discovery_url("https://issuer.example/realms/app/")
+                .expect("discovery URL should parse")
+                .as_str(),
+            "https://issuer.example/realms/app/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
+    fn provider_metadata_parses_oidc_discovery_document() {
+        let metadata = ProviderMetadata::from_json(
+            r#"{
+                "issuer": "https://issuer.example/realms/app",
+                "jwks_uri": "https://issuer.example/realms/app/protocol/openid-connect/certs"
+            }"#,
+        )
+        .expect("provider metadata should parse");
+
+        assert_eq!(
+            metadata,
+            ProviderMetadata {
+                issuer: Some("https://issuer.example/realms/app".to_owned()),
+                jwks_uri: "https://issuer.example/realms/app/protocol/openid-connect/certs"
+                    .to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_metadata_installs_issuer_and_jwks_validator() {
+        let token = jwt_with_kid(
+            "test-key",
+            TestClaims {
+                sub: "alice",
+                iss: "https://issuer.example/realms/app",
+                aud: "orders-api",
+                exp: 4_102_444_800,
+                groups: vec!["admin"],
+                realm_access: RealmAccessClaims {
+                    roles: vec!["user"],
+                },
+            },
+        );
+
+        let response = claims_app(
+            Oidc::builder(OidcConfig {
+                token: OidcTokenConfig {
+                    issuer: None,
+                    audience: Some("orders-api".to_owned()),
+                },
+                ..OidcConfig::default()
+            })
+            .provider_metadata(test_metadata(), test_jwks()),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     fn oidc() -> Oidc {
         Oidc::builder(OidcConfig::default())
             .validator(StaticTokenValidator::bearer("test-token", "alice"))
@@ -968,6 +1152,13 @@ mod tests {
             ]
         }))
         .expect("test JWKS should parse")
+    }
+
+    fn test_metadata() -> ProviderMetadata {
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+        }
     }
 
     #[derive(Serialize)]
