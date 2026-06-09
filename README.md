@@ -12,6 +12,8 @@ This crate is in early development. The current implementation includes:
 - request `Principal` extensions after successful authentication.
 - pluggable bearer-token validation through `TokenValidator`.
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`.
+- Audience validation from `quarkus.oidc.token.audience`, defaulting to
+  `quarkus.oidc.client-id` when present.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
 - Configurable role extraction with `quarkus.oidc.roles.role-claim-path`.
