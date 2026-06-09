@@ -873,7 +873,7 @@ impl Authorization {
             let methods_key = format!("{prefix}.methods");
             let methods = config
                 .get_optional::<String>(&methods_key)?
-                .map(|methods| parse_http_methods(&methods_key, &methods))
+                .map(|methods| parse_configured_http_methods(&methods_key, &methods))
                 .transpose()?
                 .unwrap_or_default();
             let policy_key = format!("{prefix}.policy");
@@ -1033,6 +1033,23 @@ fn merge_role_mappings(
             .or_default()
             .extend(mapped_roles.iter().cloned());
     }
+}
+
+fn parse_configured_http_methods(
+    property_name: &str,
+    value: &str,
+) -> mp_config::Result<Vec<String>> {
+    let methods = parse_http_methods(property_name, value)?;
+    if methods.is_empty() {
+        return Err(mp_config::ConfigError::Conversion {
+            name: property_name.to_owned(),
+            value: value.to_owned(),
+            message: "permission methods must include at least one method when configured"
+                .to_owned(),
+        });
+    }
+
+    Ok(methods)
 }
 
 fn parse_http_methods(property_name: &str, value: &str) -> mp_config::Result<Vec<String>> {
@@ -6947,6 +6964,37 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("permission paths must include at least one path"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn authorization_rejects_empty_permission_methods() {
+        let error = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-empty-methods", 100)
+                        .with("quarkus.http.auth.permission.secured.paths", "/resource")
+                        .with("quarkus.http.auth.permission.secured.methods", " , ")
+                        .with(
+                            "quarkus.http.auth.permission.secured.policy",
+                            "authenticated",
+                        ),
+                )
+                .build(),
+        )
+        .expect_err("empty permission methods should be rejected");
+
+        assert!(
+            error.to_string().contains(
+                "failed to convert config property `quarkus.http.auth.permission.secured.methods`"
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("permission methods must include at least one method when configured"),
             "{error}"
         );
     }
