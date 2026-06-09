@@ -591,12 +591,14 @@ impl ProviderMetadata {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Authorization {
     permissions: Arc<[HttpPermission]>,
+    role_mappings: Arc<HashMap<String, Vec<String>>>,
 }
 
 impl Authorization {
     /// Loads Quarkus-style HTTP authorization configuration.
     pub fn from_config(config: &Config) -> mp_config::Result<Self> {
         let role_policies = load_role_policies(config)?;
+        let role_mappings = load_role_mappings(config, "quarkus.http.auth.roles-mapping")?;
         let mut permissions = Vec::new();
 
         for name in permission_names(config) {
@@ -634,6 +636,7 @@ impl Authorization {
 
         Ok(Self {
             permissions: Arc::from(permissions),
+            role_mappings: Arc::new(role_mappings),
         })
     }
 
@@ -676,7 +679,7 @@ impl Authorization {
             if shared_policies.is_empty() {
                 return AuthRequirement::Deny;
             }
-            return policies_requirement(shared_policies);
+            return policies_requirement(shared_policies, &self.role_mappings);
         };
 
         let unshared_matches = unshared_matches
@@ -699,7 +702,7 @@ impl Authorization {
                 .map(|permission_match| &permission_match.permission.policy),
         );
 
-        policies_requirement(policies)
+        policies_requirement(policies, &self.role_mappings)
     }
 }
 
@@ -709,7 +712,10 @@ struct PermissionMatch<'a> {
     permission: &'a HttpPermission,
 }
 
-fn policies_requirement(policies: Vec<&HttpPolicy>) -> AuthRequirement {
+fn policies_requirement(
+    policies: Vec<&HttpPolicy>,
+    global_role_mappings: &HashMap<String, Vec<String>>,
+) -> AuthRequirement {
     if policies.is_empty() {
         return AuthRequirement::Permit;
     }
@@ -722,11 +728,16 @@ fn policies_requirement(policies: Vec<&HttpPolicy>) -> AuthRequirement {
     }
 
     let mut roles = Vec::new();
+    let mut role_mappings = global_role_mappings.clone();
     let mut authenticated = false;
     for policy in policies {
         match policy {
             HttpPolicy::Authenticated => authenticated = true,
-            HttpPolicy::Roles(allowed) => roles.extend(allowed.iter().cloned()),
+            HttpPolicy::Roles(role_policy) => {
+                authenticated = true;
+                roles.extend(role_policy.roles_allowed.iter().cloned());
+                merge_role_mappings(&mut role_mappings, &role_policy.role_mappings);
+            }
             HttpPolicy::Permit | HttpPolicy::Deny => {}
         }
     }
@@ -734,13 +745,28 @@ fn policies_requirement(policies: Vec<&HttpPolicy>) -> AuthRequirement {
     if !roles.is_empty() {
         roles.sort();
         roles.dedup();
-        return AuthRequirement::Roles(roles);
+        return AuthRequirement::Roles {
+            roles,
+            role_mappings,
+        };
     }
 
     if authenticated {
-        AuthRequirement::Authenticated
+        AuthRequirement::Authenticated(role_mappings)
     } else {
         AuthRequirement::Permit
+    }
+}
+
+fn merge_role_mappings(
+    target: &mut HashMap<String, Vec<String>>,
+    source: &HashMap<String, Vec<String>>,
+) {
+    for (role, mapped_roles) in source {
+        target
+            .entry(role.clone())
+            .or_default()
+            .extend(mapped_roles.iter().cloned());
     }
 }
 
@@ -783,14 +809,23 @@ enum HttpPolicy {
     Permit,
     Deny,
     Authenticated,
-    Roles(Vec<String>),
+    Roles(RolePolicy),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RolePolicy {
+    roles_allowed: Vec<String>,
+    role_mappings: HashMap<String, Vec<String>>,
 }
 
 enum AuthRequirement {
     Permit,
     Deny,
-    Authenticated,
-    Roles(Vec<String>),
+    Authenticated(HashMap<String, Vec<String>>),
+    Roles {
+        roles: Vec<String>,
+        role_mappings: HashMap<String, Vec<String>>,
+    },
 }
 
 /// Validates a bearer token and returns the authenticated principal.
@@ -1311,16 +1346,23 @@ impl Oidc {
                     self.authenticate_principal(request).await?;
                     return Err(Error::Forbidden);
                 }
-                AuthRequirement::Authenticated => {
-                    self.authenticate_principal(request).await?;
+                AuthRequirement::Authenticated(role_mappings) => {
+                    let mut principal = self.authenticate_principal(request).await?;
+                    apply_role_mappings(&mut principal, &role_mappings);
+                    request.extensions_mut().insert(principal);
                     return Ok(());
                 }
-                AuthRequirement::Roles(roles) => {
-                    let principal = self.authenticate_principal(request).await?;
+                AuthRequirement::Roles {
+                    roles,
+                    role_mappings,
+                } => {
+                    let mut principal = self.authenticate_principal(request).await?;
+                    apply_role_mappings(&mut principal, &role_mappings);
                     if roles
                         .iter()
                         .any(|role| principal.groups().any(|group| group == role))
                     {
+                        request.extensions_mut().insert(principal);
                         return Ok(());
                     }
                     return Err(Error::Forbidden);
@@ -1690,21 +1732,57 @@ where
     }
 }
 
-fn load_role_policies(config: &Config) -> mp_config::Result<HashMap<String, Vec<String>>> {
+fn load_role_policies(config: &Config) -> mp_config::Result<HashMap<String, RolePolicy>> {
     let mut policies = HashMap::new();
 
     for key in config.property_names() {
-        let Some(name) = key
+        if let Some(name) = key
             .strip_prefix("quarkus.http.auth.policy.")
             .and_then(|suffix| suffix.strip_suffix(".roles-allowed"))
+        {
+            policies
+                .entry(name.to_owned())
+                .or_insert_with(RolePolicy::default)
+                .roles_allowed = split_csv(&config.get::<String>(&key)?);
+            continue;
+        }
+
+        let Some((name, role)) = key
+            .strip_prefix("quarkus.http.auth.policy.")
+            .and_then(|suffix| suffix.split_once(".roles."))
         else {
             continue;
         };
 
-        policies.insert(name.to_owned(), split_csv(&config.get::<String>(&key)?));
+        policies
+            .entry(name.to_owned())
+            .or_insert_with(RolePolicy::default)
+            .role_mappings
+            .insert(role.to_owned(), split_csv(&config.get::<String>(&key)?));
     }
 
     Ok(policies)
+}
+
+fn load_role_mappings(
+    config: &Config,
+    prefix: &str,
+) -> mp_config::Result<HashMap<String, Vec<String>>> {
+    let mut mappings = HashMap::new();
+    let property_prefix = format!("{prefix}.");
+
+    for key in config.property_names() {
+        let Some(role) = key.strip_prefix(&property_prefix) else {
+            continue;
+        };
+        if role.is_empty() || role.contains('.') {
+            continue;
+        }
+
+        mappings.insert(role.to_owned(), split_csv(&config.get::<String>(&key)?));
+    }
+
+    Ok(mappings)
 }
 
 fn load_required_claims(
@@ -1785,7 +1863,7 @@ fn permission_names(config: &Config) -> Vec<String> {
     names.into_iter().collect()
 }
 
-fn policy_from_config(name: &str, role_policies: &HashMap<String, Vec<String>>) -> HttpPolicy {
+fn policy_from_config(name: &str, role_policies: &HashMap<String, RolePolicy>) -> HttpPolicy {
     match name {
         "permit" => HttpPolicy::Permit,
         "deny" => HttpPolicy::Deny,
@@ -1940,6 +2018,23 @@ fn extract_roles(claims: &Value, paths: &[String], separator: &str) -> Vec<Strin
     }
     deduplicate(&mut roles);
     roles
+}
+
+fn apply_role_mappings(principal: &mut Principal, role_mappings: &HashMap<String, Vec<String>>) {
+    if role_mappings.is_empty() {
+        return;
+    }
+
+    let mapped_roles = principal
+        .groups
+        .iter()
+        .filter_map(|role| role_mappings.get(role.as_ref()))
+        .flatten()
+        .map(|role| Arc::from(role.clone()))
+        .collect::<Vec<_>>();
+    principal.groups.extend(mapped_roles);
+    principal.groups.sort();
+    principal.groups.dedup();
 }
 
 fn claim_path_value<'a>(claims: &'a Value, path: &str) -> Option<&'a Value> {
@@ -3740,6 +3835,98 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn authorization_applies_global_role_mappings() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-global-role-mapping", 100)
+                        .with("quarkus.http.auth.roles-mapping.admin", "Admin1")
+                        .with("quarkus.http.auth.policy.mapped.roles-allowed", "Admin1")
+                        .with("quarkus.http.auth.permission.mapped.paths", "/mapped")
+                        .with("quarkus.http.auth.permission.mapped.policy", "mapped"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app =
+            authz_app_with_principal(authorization, Principal::with_groups("test", ["admin"]));
+
+        let response = app
+            .clone()
+            .oneshot(request("/mapped", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request("/mapped", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authorization_applies_policy_role_mappings() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-policy-role-mapping", 100)
+                        .with("quarkus.http.auth.policy.mapped.roles-allowed", "Admin1")
+                        .with("quarkus.http.auth.policy.mapped.roles.admin", "Admin1")
+                        .with("quarkus.http.auth.permission.mapped.paths", "/mapped")
+                        .with("quarkus.http.auth.permission.mapped.policy", "mapped"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app =
+            authz_app_with_principal(authorization, Principal::with_groups("test", ["admin"]));
+
+        let response = app
+            .clone()
+            .oneshot(request("/mapped", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request("/mapped", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authorization_role_mapping_policy_requires_authentication() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-mapping-only-policy", 100)
+                        .with("quarkus.http.auth.policy.mapped.roles.admin", "Admin1")
+                        .with("quarkus.http.auth.permission.mapped.paths", "/mapped")
+                        .with("quarkus.http.auth.permission.mapped.policy", "mapped"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app =
+            authz_app_with_principal(authorization, Principal::with_groups("test", ["admin"]));
+
+        let response = app
+            .clone()
+            .oneshot(request("/mapped", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request("/mapped", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     fn oidc() -> Oidc {
         Oidc::builder(OidcConfig::default())
             .validator(StaticTokenValidator::bearer("test-token", "alice"))
@@ -3764,12 +3951,13 @@ mod tests {
     }
 
     fn authz_app(authorization: Authorization) -> Router {
+        authz_app_with_principal(authorization, Principal::with_groups("test", ["test"]))
+    }
+
+    fn authz_app_with_principal(authorization: Authorization, principal: Principal) -> Router {
         Router::new().fallback(|| async { "ok" }).layer(
             Oidc::builder(OidcConfig::default())
-                .validator(StaticTokenValidator::principal(
-                    "test-token",
-                    Principal::with_groups("test", ["test"]),
-                ))
+                .validator(StaticTokenValidator::principal("test-token", principal))
                 .authorization(authorization)
                 .build()
                 .layer(),
