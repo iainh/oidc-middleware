@@ -105,6 +105,8 @@ pub struct OidcConfig {
     pub jwks_path: Option<String>,
     /// Client identifier expected by the provider.
     pub client_id: Option<String>,
+    /// Stable tenant identifier used for tenant selection.
+    pub tenant_id: Option<String>,
     /// Paths that should select this tenant.
     pub tenant_paths: Option<String>,
     /// Public key used for local JWT verification without provider discovery.
@@ -138,6 +140,7 @@ impl Default for OidcConfig {
             discovery_path: ".well-known/openid-configuration".to_owned(),
             jwks_path: None,
             client_id: None,
+            tenant_id: None,
             tenant_paths: None,
             public_key: None,
             application_type: ApplicationType::Service,
@@ -1734,11 +1737,7 @@ impl Tenants {
                 .get(header_name)
                 .and_then(|value| value.to_str().ok())
             {
-                if let Some(tenant) = self
-                    .tenants
-                    .iter()
-                    .find(|tenant| tenant.name.as_ref() == value)
-                {
+                if let Some(tenant) = self.tenants.iter().find(|tenant| tenant.matches_id(value)) {
                     return Some(&tenant.oidc);
                 }
             }
@@ -1790,7 +1789,14 @@ impl TenantsBuilder {
 
     /// Adds a named tenant.
     pub fn tenant(mut self, name: impl Into<String>, oidc: Oidc) -> Self {
-        let name = Arc::from(name.into());
+        let name: Arc<str> = Arc::from(name.into());
+        let id: Arc<str> = Arc::from(
+            oidc.config
+                .tenant_id
+                .as_deref()
+                .unwrap_or(name.as_ref())
+                .to_owned(),
+        );
         let tenant_paths = oidc
             .config
             .tenant_paths
@@ -1799,6 +1805,7 @@ impl TenantsBuilder {
             .unwrap_or_default();
         self.tenants.push(RegisteredTenant {
             name,
+            id,
             tenant_paths,
             oidc,
         });
@@ -1831,11 +1838,16 @@ impl TenantsBuilder {
 #[derive(Clone)]
 struct RegisteredTenant {
     name: Arc<str>,
+    id: Arc<str>,
     tenant_paths: Vec<String>,
     oidc: Oidc,
 }
 
 impl RegisteredTenant {
+    fn matches_id(&self, value: &str) -> bool {
+        self.id.as_ref() == value || self.name.as_ref() == value
+    }
+
     fn match_score(&self, request_path: &str) -> Option<usize> {
         self.tenant_paths
             .iter()
@@ -1995,6 +2007,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.discovery-path"
             || key == "quarkus.oidc.jwks-path"
             || key == "quarkus.oidc.client-id"
+            || key == "quarkus.oidc.tenant-id"
             || key == "quarkus.oidc.tenant-paths"
             || key == "quarkus.oidc.public-key"
             || key == "quarkus.oidc.application-type"
@@ -2021,6 +2034,7 @@ fn named_tenant_names(config: &Config) -> Vec<String> {
                     | "discovery-path"
                     | "jwks-path"
                     | "client-id"
+                    | "tenant-id"
                     | "tenant-paths"
                     | "public-key"
                     | "application-type"
@@ -2471,6 +2485,7 @@ dQIDAQAB
                     .with("quarkus.oidc.discovery-path", "custom-discovery")
                     .with("quarkus.oidc.jwks-path", "protocol/openid-connect/certs")
                     .with("quarkus.oidc.client-id", "orders-service")
+                    .with("quarkus.oidc.tenant-id", "orders-tenant")
                     .with("quarkus.oidc.public-key", "configured-public-key")
                     .with("quarkus.oidc.application-type", "hybrid")
                     .with("quarkus.oidc.token.audience", "orders-api")
@@ -2506,6 +2521,7 @@ dQIDAQAB
                 discovery_path: "custom-discovery".to_owned(),
                 jwks_path: Some("protocol/openid-connect/certs".to_owned()),
                 client_id: Some("orders-service".to_owned()),
+                tenant_id: Some("orders-tenant".to_owned()),
                 tenant_paths: None,
                 public_key: Some("configured-public-key".to_owned()),
                 application_type: ApplicationType::Hybrid,
@@ -3957,6 +3973,7 @@ dQIDAQAB
                     .with("quarkus.oidc.tenant-paths", "/api/default")
                     .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
                     .with("quarkus.oidc.tenant-a.client-id", "tenant-a-client")
+                    .with("quarkus.oidc.tenant-a.tenant-id", "orders")
                     .with("quarkus.oidc.tenant-b.tenant-enabled", "false")
                     .with("quarkus.oidc.tenant-b.tenant-paths", "/api/b/*"),
             )
@@ -3970,6 +3987,7 @@ dQIDAQAB
         let tenant_a = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a").unwrap();
         assert_eq!(tenant_a.tenant_paths, Some("/api/a/*".to_owned()));
         assert_eq!(tenant_a.client_id, Some("tenant-a-client".to_owned()));
+        assert_eq!(tenant_a.tenant_id, Some("orders".to_owned()));
     }
 
     #[tokio::test]
@@ -4021,6 +4039,40 @@ dQIDAQAB
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tenants_select_by_configured_tenant_id_header() {
+        let response = tenant_app(
+            Tenants::builder()
+                .tenant_header(http::HeaderName::from_static("x-oidc-tenant"))
+                .tenant(
+                    "tenant-a",
+                    static_tenant_with_id("a-token", "tenant-a", "orders"),
+                )
+                .tenant(
+                    "tenant-b",
+                    static_tenant_with_id("b-token", "tenant-b", "billing"),
+                )
+                .build(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/unmatched")
+                .header(AUTHORIZATION, "Bearer a-token")
+                .header("x-oidc-tenant", "orders")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_body(response).await,
+            "tenant-a",
+            "tenant-id should select tenant-a"
+        );
     }
 
     #[tokio::test]
@@ -4736,6 +4788,15 @@ dQIDAQAB
     fn static_tenant_with_paths(token: &str, subject: &str, paths: &str) -> Oidc {
         Oidc::builder(OidcConfig {
             tenant_paths: Some(paths.to_owned()),
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer(token, subject))
+        .build()
+    }
+
+    fn static_tenant_with_id(token: &str, subject: &str, tenant_id: &str) -> Oidc {
+        Oidc::builder(OidcConfig {
+            tenant_id: Some(tenant_id.to_owned()),
             ..OidcConfig::default()
         })
         .validator(StaticTokenValidator::bearer(token, subject))

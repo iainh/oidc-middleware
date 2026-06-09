@@ -30,8 +30,8 @@ This crate is in early development. The current implementation includes:
 - Principal-name selection with `quarkus.oidc.token.principal-claim`.
 - Token extraction with `quarkus.oidc.token.header` and
   `quarkus.oidc.token.authorization-scheme`.
-- Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths` and optional
-  header-based or issuer-based tenant selection.
+- Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths`, tenant IDs,
+  and optional header-based or issuer-based tenant selection.
 - Refreshable provider JWKS validation when a token references an unknown `kid`.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
