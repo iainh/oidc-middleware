@@ -311,6 +311,11 @@ impl ConfigProperties for OidcTokenConfig {
                 }
             })?;
         }
+        let authorization_scheme_key = key("authorization-scheme");
+        let authorization_scheme = config
+            .get_optional(&authorization_scheme_key)?
+            .unwrap_or_else(|| "Bearer".to_owned());
+        validate_authorization_scheme(&authorization_scheme_key, &authorization_scheme)?;
 
         Ok(Self {
             issuer: config.get_optional(&key("issuer"))?,
@@ -326,9 +331,7 @@ impl ConfigProperties for OidcTokenConfig {
             required_claims: load_required_claims(config, &key("required-claims"))?,
             principal_claim: config.get_optional(&key("principal-claim"))?,
             header,
-            authorization_scheme: config
-                .get_optional(&key("authorization-scheme"))?
-                .unwrap_or_else(|| "Bearer".to_owned()),
+            authorization_scheme,
             lifespan_grace: config.get_optional(&key("lifespan-grace"))?,
             age: config.get_optional(&key("age"))?,
             forced_jwk_refresh_interval: config
@@ -3260,6 +3263,25 @@ fn split_path_segments(path: &str) -> Vec<&str> {
         .collect()
 }
 
+fn validate_authorization_scheme(property_name: &str, value: &str) -> mp_config::Result<()> {
+    if value.is_empty() || !value.bytes().all(is_http_token_char) {
+        return Err(mp_config::ConfigError::Conversion {
+            name: property_name.to_owned(),
+            value: value.to_owned(),
+            message: "authorization scheme must be a non-empty HTTP token".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn is_http_token_char(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'0'..=b'9' | b'A'..=b'Z' | b'^'..=b'z' | b'|' | b'~'
+    )
+}
+
 fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc<str>> {
     if let Some(header_name) = &config.header {
         let header_name = http::HeaderName::from_str(header_name)
@@ -3825,6 +3847,47 @@ dQIDAQAB
             error.to_string().contains("quarkus.oidc.token.header"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn config_loads_valid_authorization_scheme() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("test", 100).with("quarkus.oidc.token.authorization-scheme", "DPoP"),
+            )
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert_eq!(oidc.token.authorization_scheme, "DPoP");
+    }
+
+    #[test]
+    fn config_rejects_invalid_authorization_scheme() {
+        for scheme in ["Bearer Token", "Bearer/Token"] {
+            let config = Config::builder()
+                .add_source(
+                    MapSource::new("test", 100)
+                        .with("quarkus.oidc.token.authorization-scheme", scheme),
+                )
+                .build();
+
+            let error = OidcConfig::from_config(&config)
+                .expect_err("authorization scheme should be rejected");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("quarkus.oidc.token.authorization-scheme"),
+                "{error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("authorization scheme must be a non-empty HTTP token"),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
