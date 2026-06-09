@@ -206,6 +206,10 @@ impl OidcTokenConfig {
     fn audiences(&self) -> Vec<String> {
         self.audience.as_deref().map(split_csv).unwrap_or_default()
     }
+
+    fn accepts_any_audience(&self) -> bool {
+        self.audiences().iter().any(|audience| audience == "any")
+    }
 }
 
 /// Role extraction configuration loaded from `quarkus.oidc.roles.*`.
@@ -1742,8 +1746,13 @@ fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
         .issuer
         .as_deref()
         .or(config.auth_server_url.as_deref());
-    if let Some(issuer) = issuer {
+    if let Some(issuer) = issuer.filter(|issuer| *issuer != "any") {
         validation.set_issuer(&[issuer]);
+    }
+
+    if config.token.accepts_any_audience() {
+        validation.validate_aud = false;
+        return;
     }
 
     let audiences = config.token.audiences();
@@ -2508,6 +2517,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jwt_validator_skips_audience_validation_when_configured_any() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            client_id: Some("orders-api".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("any".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "inventory-api",
+            exp: 4_102_444_800,
+            groups: vec!["admin"],
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn jwt_validator_accepts_configured_token_type() {
         let config = OidcConfig {
             auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
@@ -2826,6 +2868,38 @@ mod tests {
             response.headers().get(WWW_AUTHENTICATE).unwrap(),
             HeaderValue::from_static(r#"Bearer error="invalid_token""#)
         );
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_skips_issuer_validation_when_configured_any() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: Some("any".to_owned()),
+                audience: Some("orders-api".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://other-issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec!["admin"],
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

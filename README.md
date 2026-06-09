@@ -14,6 +14,8 @@ This crate is in early development. The current implementation includes:
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`.
 - Audience validation from one or more `quarkus.oidc.token.audience` values,
   defaulting to `quarkus.oidc.client-id` when present.
+- Quarkus `any` issuer and audience bypass values for providers with variable
+  claims.
 - JWT `typ` claim enforcement with `quarkus.oidc.token.token-type`.
 - Optional `sub` enforcement with `quarkus.oidc.token.subject-required`.
 - JWT string claim enforcement with `quarkus.oidc.token.required-claims.*`.
