@@ -59,6 +59,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
@@ -66,8 +67,12 @@ use tower_service::Service;
 /// Result type returned by token validators.
 pub type Result<T> = std::result::Result<T, Error>;
 
-type BoxError = Box<dyn StdError + Send + Sync>;
+/// Boxed error type used by extension points.
+pub type BoxError = Box<dyn StdError + Send + Sync>;
 type ValidationFuture = Pin<Box<dyn Future<Output = Result<Principal>> + Send>>;
+/// Future returned by [`JwksProvider`].
+pub type JwksRefreshFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<JwkSet, BoxError>> + Send>>;
 
 /// Result type returned while building OIDC middleware.
 pub type BuildResult<T> = std::result::Result<T, BuildError>;
@@ -663,6 +668,33 @@ impl JwtValidator {
             role_claim_paths: Arc::from(config.roles.claim_paths()),
         }
     }
+
+    /// Builds a JWT validator backed by a refreshable JSON Web Key Set.
+    ///
+    /// The current key set is used first. If a token contains an unknown `kid`,
+    /// the provider is called once to refresh the set before rejecting the
+    /// token.
+    pub fn refreshable_jwks<P>(jwks: JwkSet, provider: P, config: &OidcConfig) -> Self
+    where
+        P: JwksProvider,
+    {
+        let mut validation = Validation::new(Algorithm::RS256);
+        apply_validation_config(&mut validation, config);
+
+        let algorithms = supported_algorithms(&jwks);
+        if !algorithms.is_empty() {
+            validation.algorithms = algorithms;
+        }
+
+        Self {
+            keys: JwtKeys::Refreshing(RefreshingJwks {
+                current: Arc::new(Mutex::new(jwks)),
+                provider: Arc::new(provider),
+            }),
+            validation,
+            role_claim_paths: Arc::from(config.roles.claim_paths()),
+        }
+    }
 }
 
 impl TokenValidator for JwtValidator {
@@ -672,10 +704,49 @@ impl TokenValidator for JwtValidator {
         let role_claim_paths = self.role_claim_paths.clone();
 
         Box::pin(async move {
-            let key = keys.decoding_key(&token)?;
+            let key = keys.decoding_key(&token).await?;
             decode::<TokenClaims>(&token, &key, &validation)
                 .map(|data| Principal::from_claims(data.claims, &role_claim_paths))
                 .map_err(|error| Error::TokenRejected(Box::new(error)))
+        })
+    }
+}
+
+/// Source used to refresh a provider JSON Web Key Set.
+pub trait JwksProvider: Send + Sync + 'static {
+    /// Fetches the current JSON Web Key Set.
+    fn fetch(&self) -> JwksRefreshFuture;
+}
+
+impl<F, Fut> JwksProvider for F
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<JwkSet, BoxError>> + Send + 'static,
+{
+    fn fetch(&self) -> JwksRefreshFuture {
+        Box::pin(self())
+    }
+}
+
+#[derive(Clone)]
+struct HttpJwksProvider {
+    client: reqwest::Client,
+    jwks_uri: String,
+}
+
+impl JwksProvider for HttpJwksProvider {
+    fn fetch(&self) -> JwksRefreshFuture {
+        let client = self.client.clone();
+        let jwks_uri = self.jwks_uri.clone();
+        Box::pin(async move {
+            client
+                .get(&jwks_uri)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<JwkSet>()
+                .await
+                .map_err(|error| Box::new(error) as BoxError)
         })
     }
 }
@@ -684,32 +755,79 @@ impl TokenValidator for JwtValidator {
 enum JwtKeys {
     Single(Arc<DecodingKey>),
     Set(Arc<JwkSet>),
+    Refreshing(RefreshingJwks),
+}
+
+#[derive(Clone)]
+struct RefreshingJwks {
+    current: Arc<Mutex<JwkSet>>,
+    provider: Arc<dyn JwksProvider>,
 }
 
 impl JwtKeys {
-    fn decoding_key(&self, token: &str) -> Result<DecodingKey> {
+    async fn decoding_key(&self, token: &str) -> Result<DecodingKey> {
         match self {
             Self::Single(key) => Ok((**key).clone()),
-            Self::Set(jwks) => {
-                let header =
-                    decode_header(token).map_err(|error| Error::TokenRejected(Box::new(error)))?;
-                let jwk = match header.kid.as_deref() {
-                    Some(kid) => jwks.find(kid).ok_or_else(|| {
-                        Error::TokenRejected(format!("no JWK matched kid `{kid}`").into())
-                    })?,
-                    None if jwks.keys.len() == 1 => &jwks.keys[0],
-                    None => {
-                        return Err(Error::TokenRejected(
-                            "JWT header did not include a key id".into(),
-                        ));
-                    }
+            Self::Set(jwks) => decoding_key_from_jwks(jwks, token),
+            Self::Refreshing(jwks) => {
+                let key_result = {
+                    let current = jwks
+                        .current
+                        .lock()
+                        .map_err(|_| Error::TokenRejected("JWKS cache lock was poisoned".into()))?;
+                    decoding_key_from_jwks(&current, token)
                 };
 
-                DecodingKey::from_jwk(jwk).map_err(|error| Error::TokenRejected(Box::new(error)))
+                match key_result {
+                    Ok(key) => Ok(key),
+                    Err(error) if should_refresh_jwks(&error) => {
+                        let refreshed =
+                            jwks.provider.fetch().await.map_err(Error::TokenRejected)?;
+                        let key = decoding_key_from_jwks(&refreshed, token)?;
+                        let mut current = jwks.current.lock().map_err(|_| {
+                            Error::TokenRejected("JWKS cache lock was poisoned".into())
+                        })?;
+                        *current = refreshed;
+                        Ok(key)
+                    }
+                    Err(error) => Err(error),
+                }
             }
         }
     }
 }
+
+fn decoding_key_from_jwks(jwks: &JwkSet, token: &str) -> Result<DecodingKey> {
+    let header = decode_header(token).map_err(|error| Error::TokenRejected(Box::new(error)))?;
+    let jwk = match header.kid.as_deref() {
+        Some(kid) => jwks
+            .find(kid)
+            .ok_or_else(|| Error::TokenRejected(UnknownKid(kid.to_owned()).into()))?,
+        None if jwks.keys.len() == 1 => &jwks.keys[0],
+        None => {
+            return Err(Error::TokenRejected(
+                "JWT header did not include a key id".into(),
+            ));
+        }
+    };
+
+    DecodingKey::from_jwk(jwk).map_err(|error| Error::TokenRejected(Box::new(error)))
+}
+
+fn should_refresh_jwks(error: &Error) -> bool {
+    matches!(error, Error::TokenRejected(source) if source.is::<UnknownKid>())
+}
+
+#[derive(Debug)]
+struct UnknownKid(String);
+
+impl fmt::Display for UnknownKid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no JWK matched kid `{}`", self.0)
+    }
+}
+
+impl StdError for UnknownKid {}
 
 #[derive(Debug)]
 struct TokenClaims {
@@ -874,7 +992,7 @@ impl OidcBuilder {
             .json()
             .await?;
 
-        Ok(self.provider_metadata(metadata, jwks))
+        Ok(self.provider_metadata_refreshing(metadata, jwks, client))
     }
 
     /// Installs provider metadata and a JWKS-backed JWT validator.
@@ -885,6 +1003,29 @@ impl OidcBuilder {
         }
 
         self.validator = Some(Arc::new(JwtValidator::jwks(jwks, &validation_config)));
+        self.build()
+    }
+
+    /// Installs provider metadata and a refreshable JWKS-backed JWT validator.
+    pub fn provider_metadata_refreshing(
+        mut self,
+        metadata: ProviderMetadata,
+        jwks: JwkSet,
+        client: reqwest::Client,
+    ) -> Oidc {
+        let mut validation_config = self.config.clone();
+        if validation_config.token.issuer.is_none() {
+            validation_config.token.issuer = metadata.issuer;
+        }
+
+        self.validator = Some(Arc::new(JwtValidator::refreshable_jwks(
+            jwks,
+            HttpJwksProvider {
+                client,
+                jwks_uri: metadata.jwks_uri,
+            },
+            &validation_config,
+        )));
         self.build()
     }
 
@@ -1714,6 +1855,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn refreshable_jwks_fetches_when_kid_is_missing() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+            },
+            ..OidcConfig::default()
+        };
+        let refreshed = rotated_jwks();
+        let token = jwt_with_kid_and_secret(
+            "rotated-key",
+            b"rotated",
+            TestClaims {
+                sub: "alice",
+                iss: "https://issuer.example/realms/app",
+                aud: "orders-api",
+                exp: 4_102_444_800,
+                groups: vec!["admin"],
+                realm_access: RealmAccessClaims {
+                    roles: vec!["user"],
+                },
+            },
+        );
+
+        let response = claims_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::refreshable_jwks(
+                    test_jwks(),
+                    move || {
+                        let refreshed = refreshed.clone();
+                        async move { Ok(refreshed) }
+                    },
+                    &config,
+                ))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[test]
     fn discovery_url_appends_well_known_path() {
         assert_eq!(
@@ -2200,10 +2386,14 @@ mod tests {
     }
 
     fn jwt_with_kid(kid: &str, claims: TestClaims<'_>) -> String {
+        jwt_with_kid_and_secret(kid, b"secret", claims)
+    }
+
+    fn jwt_with_kid_and_secret(kid: &str, secret: &[u8], claims: impl Serialize) -> String {
         let mut header = Header::default();
         header.kid = Some(kid.to_owned());
 
-        encode(&header, &claims, &EncodingKey::from_secret(b"secret"))
+        encode(&header, &claims, &EncodingKey::from_secret(secret))
             .expect("test token should encode")
     }
 
@@ -2215,6 +2405,20 @@ mod tests {
                     "alg": "HS256",
                     "kid": "test-key",
                     "k": "c2VjcmV0"
+                }
+            ]
+        }))
+        .expect("test JWKS should parse")
+    }
+
+    fn rotated_jwks() -> JwkSet {
+        serde_json::from_value(json!({
+            "keys": [
+                {
+                    "kty": "oct",
+                    "alg": "HS256",
+                    "kid": "rotated-key",
+                    "k": "cm90YXRlZA"
                 }
             ]
         }))
