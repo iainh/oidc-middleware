@@ -55,7 +55,9 @@ This crate is in early development. The current implementation includes:
   introspection uses `quarkus.oidc.client-id` with
   `quarkus.oidc.credentials.secret` for Basic authentication by default, or
   form-post or query credentials with
-  `quarkus.oidc.credentials.client-secret.method`.
+  `quarkus.oidc.credentials.client-secret.method`. Endpoint-specific
+  introspection Basic credentials can be set with
+  `quarkus.oidc.introspection-credentials.*`.
 - UserInfo-backed opaque-token validation through `UserInfoValidator`, custom
   `UserInfoProvider` implementations, or provider-backed installation for
   `quarkus.oidc.token.verify-access-token-with-user-info`.

@@ -139,6 +139,9 @@ pub struct OidcConfig {
     /// Client credential settings used for provider calls.
     #[config(nested)]
     pub credentials: OidcCredentialsConfig,
+    /// Token introspection endpoint-specific credentials.
+    #[config(nested)]
+    pub introspection_credentials: OidcIntrospectionCredentialsConfig,
     /// Token validation settings.
     #[config(nested)]
     pub token: OidcTokenConfig,
@@ -177,6 +180,7 @@ impl Default for OidcConfig {
             public_key: None,
             application_type: ApplicationType::Service,
             credentials: OidcCredentialsConfig::default(),
+            introspection_credentials: OidcIntrospectionCredentialsConfig::default(),
             token: OidcTokenConfig::default(),
             roles: OidcRolesConfig::default(),
         }
@@ -234,6 +238,29 @@ impl mp_config::FromConfigValue for ClientSecretMethod {
             other => Err(format!(
                 "expected one of `basic`, `post`, or `query`, got `{other}`"
             )),
+        }
+    }
+}
+
+/// Introspection endpoint-specific credentials.
+#[derive(Clone, Debug, ConfigProperties, Eq, PartialEq)]
+#[config(rename_all = "kebab-case")]
+pub struct OidcIntrospectionCredentialsConfig {
+    /// User name used for introspection endpoint Basic authentication.
+    pub name: Option<String>,
+    /// Secret used for introspection endpoint Basic authentication.
+    pub secret: Option<String>,
+    /// Include the configured OIDC client id in the introspection form body.
+    #[config(default = "true")]
+    pub include_client_id: bool,
+}
+
+impl Default for OidcIntrospectionCredentialsConfig {
+    fn default() -> Self {
+        Self {
+            name: None,
+            secret: None,
+            include_client_id: true,
         }
     }
 }
@@ -1734,8 +1761,10 @@ struct HttpTokenIntrospector {
     client: reqwest::Client,
     endpoint: String,
     client_id: Option<String>,
+    client_auth_name: Option<String>,
     client_secret: Option<String>,
     client_secret_method: ClientSecretMethod,
+    include_client_id: bool,
 }
 
 impl TokenIntrospector for HttpTokenIntrospector {
@@ -1743,16 +1772,22 @@ impl TokenIntrospector for HttpTokenIntrospector {
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         let client_id = self.client_id.clone();
+        let client_auth_name = self.client_auth_name.clone();
         let client_secret = self.client_secret.clone();
         let client_secret_method = self.client_secret_method;
+        let include_client_id = self.include_client_id;
         Box::pin(async move {
             introspection_request(
                 &client,
                 &endpoint,
                 token.as_ref(),
-                client_id.as_deref(),
-                client_secret.as_deref(),
-                client_secret_method,
+                IntrospectionRequestAuth {
+                    client_id: client_id.as_deref(),
+                    client_auth_name: client_auth_name.as_deref(),
+                    client_secret: client_secret.as_deref(),
+                    client_secret_method,
+                    include_client_id,
+                },
             )
             .send()
             .await?
@@ -1769,15 +1804,38 @@ fn http_token_introspector(
     client: reqwest::Client,
     endpoint: String,
 ) -> HttpTokenIntrospector {
+    let introspection_secret = config.introspection_credentials.secret.clone();
+    let has_introspection_credentials = introspection_secret.is_some();
+    let client_auth_name = if has_introspection_credentials {
+        config
+            .introspection_credentials
+            .name
+            .clone()
+            .or_else(|| config.client_id.clone())
+    } else {
+        config.client_id.clone()
+    };
+    let client_secret = introspection_secret.or_else(|| {
+        config
+            .credentials
+            .effective_client_secret()
+            .map(ToOwned::to_owned)
+    });
+    let client_secret_method = if has_introspection_credentials {
+        ClientSecretMethod::Basic
+    } else {
+        config.credentials.client_secret.method
+    };
+
     HttpTokenIntrospector {
         client,
         endpoint,
         client_id: config.client_id.clone(),
-        client_secret: config
-            .credentials
-            .effective_client_secret()
-            .map(ToOwned::to_owned),
-        client_secret_method: config.credentials.client_secret.method,
+        client_auth_name,
+        client_secret,
+        client_secret_method,
+        include_client_id: has_introspection_credentials
+            && config.introspection_credentials.include_client_id,
     }
 }
 
@@ -1785,28 +1843,48 @@ fn introspection_request<'a>(
     client: &'a reqwest::Client,
     endpoint: &'a str,
     token: &'a str,
-    client_id: Option<&'a str>,
-    client_secret: Option<&'a str>,
-    client_secret_method: ClientSecretMethod,
+    auth: IntrospectionRequestAuth<'a>,
 ) -> reqwest::RequestBuilder {
-    match (client_id, client_secret, client_secret_method) {
-        (Some(client_id), Some(client_secret), ClientSecretMethod::Basic) => client
-            .post(endpoint)
-            .form(&[("token", token)])
-            .basic_auth(client_id, Some(client_secret)),
-        (Some(client_id), Some(client_secret), ClientSecretMethod::Post) => {
+    match (
+        auth.client_id,
+        auth.client_auth_name,
+        auth.client_secret,
+        auth.client_secret_method,
+    ) {
+        (client_id, Some(client_auth_name), Some(client_secret), ClientSecretMethod::Basic) => {
+            let mut form = vec![("token", token)];
+            if auth.include_client_id {
+                if let Some(client_id) = client_id {
+                    form.push(("client_id", client_id));
+                }
+            }
+            client
+                .post(endpoint)
+                .form(&form)
+                .basic_auth(client_auth_name, Some(client_secret))
+        }
+        (Some(client_id), _, Some(client_secret), ClientSecretMethod::Post) => {
             client.post(endpoint).form(&[
                 ("token", token),
                 ("client_id", client_id),
                 ("client_secret", client_secret),
             ])
         }
-        (Some(client_id), Some(client_secret), ClientSecretMethod::Query) => client
+        (Some(client_id), _, Some(client_secret), ClientSecretMethod::Query) => client
             .post(endpoint)
             .query(&[("client_id", client_id), ("client_secret", client_secret)])
             .form(&[("token", token)]),
         _ => client.post(endpoint).form(&[("token", token)]),
     }
+}
+
+#[derive(Clone, Copy)]
+struct IntrospectionRequestAuth<'a> {
+    client_id: Option<&'a str>,
+    client_auth_name: Option<&'a str>,
+    client_secret: Option<&'a str>,
+    client_secret_method: ClientSecretMethod,
+    include_client_id: bool,
 }
 
 /// Source used to refresh a provider JSON Web Key Set.
@@ -3090,6 +3168,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.public-key"
             || key == "quarkus.oidc.application-type"
             || key.starts_with("quarkus.oidc.credentials.")
+            || key.starts_with("quarkus.oidc.introspection-credentials.")
             || key.starts_with("quarkus.oidc.token.")
             || key.starts_with("quarkus.oidc.roles.")
     })
@@ -3140,8 +3219,13 @@ fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
                 | "application-type"
         ) || property.starts_with("token.")
             || property.starts_with("credentials.")
+            || property.starts_with("introspection-credentials.")
             || property.starts_with("roles.");
-        if !matches!(name.as_str(), "credentials" | "token" | "roles") && tenant_property {
+        if !matches!(
+            name.as_str(),
+            "credentials" | "introspection-credentials" | "token" | "roles"
+        ) && tenant_property
+        {
             names.insert(NamedTenantConfig {
                 name,
                 prefix_segment,
@@ -3744,6 +3828,15 @@ dQIDAQAB
                     .with("quarkus.oidc.client-id", "orders-service")
                     .with("quarkus.oidc.credentials.secret", "orders-secret")
                     .with("quarkus.oidc.credentials.client-secret.method", "post")
+                    .with("quarkus.oidc.introspection-credentials.name", "introspect")
+                    .with(
+                        "quarkus.oidc.introspection-credentials.secret",
+                        "introspect-secret",
+                    )
+                    .with(
+                        "quarkus.oidc.introspection-credentials.include-client-id",
+                        "false",
+                    )
                     .with("quarkus.oidc.tenant-id", "orders-tenant")
                     .with("quarkus.oidc.public-key", "configured-public-key")
                     .with("quarkus.oidc.application-type", "hybrid")
@@ -3813,6 +3906,11 @@ dQIDAQAB
                         value: None,
                         method: ClientSecretMethod::Post,
                     },
+                },
+                introspection_credentials: OidcIntrospectionCredentialsConfig {
+                    name: Some("introspect".to_owned()),
+                    secret: Some("introspect-secret".to_owned()),
+                    include_client_id: false,
                 },
                 token: OidcTokenConfig {
                     issuer: None,
@@ -3903,6 +4001,35 @@ dQIDAQAB
         assert_eq!(
             oidc.credentials.effective_client_secret(),
             Some("primary-secret")
+        );
+    }
+
+    #[test]
+    fn config_loads_introspection_credentials() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("test", 100)
+                    .with("quarkus.oidc.introspection-credentials.name", "introspect")
+                    .with(
+                        "quarkus.oidc.introspection-credentials.secret",
+                        "introspect-secret",
+                    )
+                    .with(
+                        "quarkus.oidc.introspection-credentials.include-client-id",
+                        "false",
+                    ),
+            )
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert_eq!(
+            oidc.introspection_credentials,
+            OidcIntrospectionCredentialsConfig {
+                name: Some("introspect".to_owned()),
+                secret: Some("introspect-secret".to_owned()),
+                include_client_id: false,
+            }
         );
     }
 
@@ -4402,9 +4529,13 @@ dQIDAQAB
             &reqwest::Client::new(),
             "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
             "opaque-token",
-            Some("orders-service"),
-            Some("orders-secret"),
-            ClientSecretMethod::Basic,
+            IntrospectionRequestAuth {
+                client_id: Some("orders-service"),
+                client_auth_name: Some("orders-service"),
+                client_secret: Some("orders-secret"),
+                client_secret_method: ClientSecretMethod::Basic,
+                include_client_id: false,
+            },
         )
         .build()
         .expect("request should build");
@@ -4418,14 +4549,50 @@ dQIDAQAB
     }
 
     #[test]
+    fn introspection_request_can_include_client_id_with_basic_auth() {
+        let request = introspection_request(
+            &reqwest::Client::new(),
+            "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
+            "opaque-token",
+            IntrospectionRequestAuth {
+                client_id: Some("orders-service"),
+                client_auth_name: Some("introspect"),
+                client_secret: Some("introspect-secret"),
+                client_secret_method: ClientSecretMethod::Basic,
+                include_client_id: true,
+            },
+        )
+        .build()
+        .expect("request should build");
+        let body = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .and_then(|body| std::str::from_utf8(body).ok())
+            .expect("request body should be buffered form data");
+
+        assert_eq!(
+            request.headers().get(AUTHORIZATION),
+            Some(&HeaderValue::from_static(
+                "Basic aW50cm9zcGVjdDppbnRyb3NwZWN0LXNlY3JldA=="
+            ))
+        );
+        assert!(body.contains("token=opaque-token"), "{body}");
+        assert!(body.contains("client_id=orders-service"), "{body}");
+    }
+
+    #[test]
     fn introspection_request_posts_client_secret_when_configured() {
         let request = introspection_request(
             &reqwest::Client::new(),
             "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
             "opaque-token",
-            Some("orders-service"),
-            Some("orders-secret"),
-            ClientSecretMethod::Post,
+            IntrospectionRequestAuth {
+                client_id: Some("orders-service"),
+                client_auth_name: Some("orders-service"),
+                client_secret: Some("orders-secret"),
+                client_secret_method: ClientSecretMethod::Post,
+                include_client_id: false,
+            },
         )
         .build()
         .expect("request should build");
@@ -4447,9 +4614,13 @@ dQIDAQAB
             &reqwest::Client::new(),
             "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
             "opaque-token",
-            Some("orders-service"),
-            Some("orders-secret"),
-            ClientSecretMethod::Query,
+            IntrospectionRequestAuth {
+                client_id: Some("orders-service"),
+                client_auth_name: Some("orders-service"),
+                client_secret: Some("orders-secret"),
+                client_secret_method: ClientSecretMethod::Query,
+                include_client_id: false,
+            },
         )
         .build()
         .expect("request should build");
@@ -4474,9 +4645,13 @@ dQIDAQAB
             &reqwest::Client::new(),
             "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
             "opaque-token",
-            Some("orders-service"),
-            None,
-            ClientSecretMethod::Basic,
+            IntrospectionRequestAuth {
+                client_id: Some("orders-service"),
+                client_auth_name: Some("orders-service"),
+                client_secret: None,
+                client_secret_method: ClientSecretMethod::Basic,
+                include_client_id: false,
+            },
         )
         .build()
         .expect("request should build");
@@ -4504,6 +4679,39 @@ dQIDAQAB
         );
 
         assert_eq!(introspector.client_secret.as_deref(), Some("orders-secret"));
+    }
+
+    #[test]
+    fn http_introspector_uses_introspection_credentials() {
+        let config = OidcConfig {
+            client_id: Some("orders-service".to_owned()),
+            credentials: OidcCredentialsConfig {
+                secret: Some("orders-secret".to_owned()),
+                client_secret: OidcClientSecretConfig {
+                    method: ClientSecretMethod::Query,
+                    ..OidcClientSecretConfig::default()
+                },
+            },
+            introspection_credentials: OidcIntrospectionCredentialsConfig {
+                name: Some("introspect".to_owned()),
+                secret: Some("introspect-secret".to_owned()),
+                include_client_id: true,
+            },
+            ..OidcConfig::default()
+        };
+        let introspector = http_token_introspector(
+            &config,
+            reqwest::Client::new(),
+            "https://issuer.example/realms/app/protocol/openid-connect/token/introspect".to_owned(),
+        );
+
+        assert_eq!(introspector.client_auth_name.as_deref(), Some("introspect"));
+        assert_eq!(
+            introspector.client_secret.as_deref(),
+            Some("introspect-secret")
+        );
+        assert_eq!(introspector.client_secret_method, ClientSecretMethod::Basic);
+        assert!(introspector.include_client_id);
     }
 
     #[tokio::test]
@@ -6571,6 +6779,36 @@ dQIDAQAB
     }
 
     #[test]
+    fn tenants_detect_named_tenant_introspection_credentials_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-introspection-credentials", 100)
+                    .with(
+                        "quarkus.oidc.tenant-a.introspection-credentials.name",
+                        "introspect",
+                    )
+                    .with(
+                        "quarkus.oidc.tenant-a.introspection-credentials.secret",
+                        "introspect-secret",
+                    ),
+            )
+            .build();
+
+        assert_eq!(named_tenant_names(&config), vec!["tenant-a".to_owned()]);
+
+        let tenant = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a")
+            .expect("tenant introspection credentials should load");
+        assert_eq!(
+            tenant.introspection_credentials,
+            OidcIntrospectionCredentialsConfig {
+                name: Some("introspect".to_owned()),
+                secret: Some("introspect-secret".to_owned()),
+                include_client_id: true,
+            }
+        );
+    }
+
+    #[test]
     fn tenants_detect_default_tenant_roles_config() {
         let config = Config::builder()
             .add_source(
@@ -6587,6 +6825,34 @@ dQIDAQAB
             .expect("roles config should create default tenant");
 
         assert_eq!(default_tenant.config.roles.role_claim_path, "permissions");
+    }
+
+    #[test]
+    fn tenants_detect_default_tenant_introspection_credentials_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-introspection-credentials", 100).with(
+                    "quarkus.oidc.introspection-credentials.secret",
+                    "introspect-secret",
+                ),
+            )
+            .build();
+
+        let tenants = Tenants::from_config(&config)
+            .expect("default tenant introspection credentials config should load")
+            .build();
+        let default_tenant = tenants
+            .default_tenant
+            .expect("introspection credentials config should create default tenant");
+
+        assert_eq!(
+            default_tenant
+                .config
+                .introspection_credentials
+                .secret
+                .as_deref(),
+            Some("introspect-secret")
+        );
     }
 
     #[test]
