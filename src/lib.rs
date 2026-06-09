@@ -187,8 +187,40 @@ impl Default for OidcConfig {
 #[derive(Clone, Debug, ConfigProperties, Default, Eq, PartialEq)]
 #[config(rename_all = "kebab-case")]
 pub struct OidcCredentialsConfig {
-    /// Client secret used with `client-id` for HTTP Basic authentication.
+    /// Client secret used with `client-id` for provider authentication.
     pub secret: Option<String>,
+    /// Client-secret authentication method.
+    #[config(nested)]
+    pub client_secret: OidcClientSecretConfig,
+}
+
+/// Client-secret authentication settings.
+#[derive(Clone, Debug, ConfigProperties, Default, Eq, PartialEq)]
+#[config(rename_all = "kebab-case")]
+pub struct OidcClientSecretConfig {
+    /// How the client secret is sent to the provider.
+    #[config(default)]
+    pub method: ClientSecretMethod,
+}
+
+/// Client-secret authentication method.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClientSecretMethod {
+    /// Send client credentials with HTTP Basic authentication.
+    #[default]
+    Basic,
+    /// Send client credentials as form parameters.
+    Post,
+}
+
+impl mp_config::FromConfigValue for ClientSecretMethod {
+    fn from_config_value(value: &str) -> std::result::Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "basic" => Ok(Self::Basic),
+            "post" => Ok(Self::Post),
+            other => Err(format!("expected one of `basic` or `post`, got `{other}`")),
+        }
+    }
 }
 
 /// Token validation configuration loaded from `quarkus.oidc.token.*`.
@@ -1635,6 +1667,7 @@ struct HttpTokenIntrospector {
     endpoint: String,
     client_id: Option<String>,
     client_secret: Option<String>,
+    client_secret_method: ClientSecretMethod,
 }
 
 impl TokenIntrospector for HttpTokenIntrospector {
@@ -1643,6 +1676,7 @@ impl TokenIntrospector for HttpTokenIntrospector {
         let endpoint = self.endpoint.clone();
         let client_id = self.client_id.clone();
         let client_secret = self.client_secret.clone();
+        let client_secret_method = self.client_secret_method;
         Box::pin(async move {
             introspection_request(
                 &client,
@@ -1650,6 +1684,7 @@ impl TokenIntrospector for HttpTokenIntrospector {
                 token.as_ref(),
                 client_id.as_deref(),
                 client_secret.as_deref(),
+                client_secret_method,
             )
             .send()
             .await?
@@ -1671,6 +1706,7 @@ fn http_token_introspector(
         endpoint,
         client_id: config.client_id.clone(),
         client_secret: config.credentials.secret.clone(),
+        client_secret_method: config.credentials.client_secret.method,
     }
 }
 
@@ -1680,13 +1716,21 @@ fn introspection_request<'a>(
     token: &'a str,
     client_id: Option<&'a str>,
     client_secret: Option<&'a str>,
+    client_secret_method: ClientSecretMethod,
 ) -> reqwest::RequestBuilder {
-    let request = client.post(endpoint).form(&[("token", token)]);
-    match (client_id, client_secret) {
-        (Some(client_id), Some(client_secret)) => {
-            request.basic_auth(client_id, Some(client_secret))
+    match (client_id, client_secret, client_secret_method) {
+        (Some(client_id), Some(client_secret), ClientSecretMethod::Basic) => client
+            .post(endpoint)
+            .form(&[("token", token)])
+            .basic_auth(client_id, Some(client_secret)),
+        (Some(client_id), Some(client_secret), ClientSecretMethod::Post) => {
+            client.post(endpoint).form(&[
+                ("token", token),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+            ])
         }
-        _ => request,
+        _ => client.post(endpoint).form(&[("token", token)]),
     }
 }
 
@@ -3547,6 +3591,7 @@ dQIDAQAB
                     )
                     .with("quarkus.oidc.client-id", "orders-service")
                     .with("quarkus.oidc.credentials.secret", "orders-secret")
+                    .with("quarkus.oidc.credentials.client-secret.method", "post")
                     .with("quarkus.oidc.tenant-id", "orders-tenant")
                     .with("quarkus.oidc.public-key", "configured-public-key")
                     .with("quarkus.oidc.application-type", "hybrid")
@@ -3612,6 +3657,9 @@ dQIDAQAB
                 application_type: ApplicationType::Hybrid,
                 credentials: OidcCredentialsConfig {
                     secret: Some("orders-secret".to_owned()),
+                    client_secret: OidcClientSecretConfig {
+                        method: ClientSecretMethod::Post,
+                    },
                 },
                 token: OidcTokenConfig {
                     issuer: None,
@@ -4018,6 +4066,7 @@ dQIDAQAB
             "opaque-token",
             Some("orders-service"),
             Some("orders-secret"),
+            ClientSecretMethod::Basic,
         )
         .build()
         .expect("request should build");
@@ -4031,6 +4080,30 @@ dQIDAQAB
     }
 
     #[test]
+    fn introspection_request_posts_client_secret_when_configured() {
+        let request = introspection_request(
+            &reqwest::Client::new(),
+            "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
+            "opaque-token",
+            Some("orders-service"),
+            Some("orders-secret"),
+            ClientSecretMethod::Post,
+        )
+        .build()
+        .expect("request should build");
+        let body = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .and_then(|body| std::str::from_utf8(body).ok())
+            .expect("request body should be buffered form data");
+
+        assert!(!request.headers().contains_key(AUTHORIZATION));
+        assert!(body.contains("token=opaque-token"), "{body}");
+        assert!(body.contains("client_id=orders-service"), "{body}");
+        assert!(body.contains("client_secret=orders-secret"), "{body}");
+    }
+
+    #[test]
     fn introspection_request_skips_basic_auth_without_client_secret() {
         let request = introspection_request(
             &reqwest::Client::new(),
@@ -4038,6 +4111,7 @@ dQIDAQAB
             "opaque-token",
             Some("orders-service"),
             None,
+            ClientSecretMethod::Basic,
         )
         .build()
         .expect("request should build");
