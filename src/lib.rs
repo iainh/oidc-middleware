@@ -42,7 +42,8 @@ use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use http::{HeaderValue, Request, StatusCode};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jsonwebtoken::jwk::{JwkSet, KeyAlgorithm};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use mp_config::{Config, ConfigProperties};
 use serde::Deserialize;
 use serde_json::Value;
@@ -52,6 +53,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower_layer::Layer;
@@ -305,7 +307,7 @@ impl TokenValidator for StaticTokenValidator {
 /// JWT bearer token validator.
 #[derive(Clone)]
 pub struct JwtValidator {
-    key: Arc<DecodingKey>,
+    keys: JwtKeys,
     validation: Validation,
 }
 
@@ -320,7 +322,28 @@ impl JwtValidator {
         apply_validation_config(&mut validation, config);
 
         Self {
-            key: Arc::new(DecodingKey::from_secret(secret.as_ref())),
+            keys: JwtKeys::Single(Arc::new(DecodingKey::from_secret(secret.as_ref()))),
+            validation,
+        }
+    }
+
+    /// Builds a JWT validator backed by a JSON Web Key Set.
+    ///
+    /// The token header `kid` is matched against the supplied key set. If the
+    /// header has no `kid` and the set contains exactly one key, that key is
+    /// used. Supported key algorithms are inferred from JWK `alg` fields when
+    /// present.
+    pub fn jwks(jwks: JwkSet, config: &OidcConfig) -> Self {
+        let mut validation = Validation::new(Algorithm::RS256);
+        apply_validation_config(&mut validation, config);
+
+        let algorithms = supported_algorithms(&jwks);
+        if !algorithms.is_empty() {
+            validation.algorithms = algorithms;
+        }
+
+        Self {
+            keys: JwtKeys::Set(Arc::new(jwks)),
             validation,
         }
     }
@@ -328,14 +351,46 @@ impl JwtValidator {
 
 impl TokenValidator for JwtValidator {
     fn validate(&self, token: Arc<str>) -> ValidationFuture {
-        let key = self.key.clone();
+        let keys = self.keys.clone();
         let validation = self.validation.clone();
 
         Box::pin(async move {
+            let key = keys.decoding_key(&token)?;
             decode::<TokenClaims>(&token, &key, &validation)
                 .map(|data| Principal::from_claims(data.claims))
                 .map_err(|error| Error::TokenRejected(Box::new(error)))
         })
+    }
+}
+
+#[derive(Clone)]
+enum JwtKeys {
+    Single(Arc<DecodingKey>),
+    Set(Arc<JwkSet>),
+}
+
+impl JwtKeys {
+    fn decoding_key(&self, token: &str) -> Result<DecodingKey> {
+        match self {
+            Self::Single(key) => Ok((**key).clone()),
+            Self::Set(jwks) => {
+                let header =
+                    decode_header(token).map_err(|error| Error::TokenRejected(Box::new(error)))?;
+                let jwk = match header.kid.as_deref() {
+                    Some(kid) => jwks.find(kid).ok_or_else(|| {
+                        Error::TokenRejected(format!("no JWK matched kid `{kid}`").into())
+                    })?,
+                    None if jwks.keys.len() == 1 => &jwks.keys[0],
+                    None => {
+                        return Err(Error::TokenRejected(
+                            "JWT header did not include a key id".into(),
+                        ));
+                    }
+                };
+
+                DecodingKey::from_jwk(jwk).map_err(|error| Error::TokenRejected(Box::new(error)))
+            }
+        }
     }
 }
 
@@ -545,6 +600,24 @@ fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
     }
 }
 
+fn supported_algorithms(jwks: &JwkSet) -> Vec<Algorithm> {
+    let mut algorithms = Vec::new();
+    for algorithm in jwks
+        .keys
+        .iter()
+        .filter_map(|jwk| jwk_algorithm(jwk.common.key_algorithm))
+    {
+        if !algorithms.contains(&algorithm) {
+            algorithms.push(algorithm);
+        }
+    }
+    algorithms
+}
+
+fn jwk_algorithm(algorithm: Option<KeyAlgorithm>) -> Option<Algorithm> {
+    Algorithm::from_str(&algorithm?.to_string()).ok()
+}
+
 fn deserialize_audience<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -580,6 +653,7 @@ mod tests {
     use jsonwebtoken::{EncodingKey, Header, encode};
     use mp_config::MapSource;
     use serde::Serialize;
+    use serde_json::json;
     use tower::ServiceExt;
 
     #[test]
@@ -746,6 +820,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn jwks_validator_selects_key_by_kid() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt_with_kid(
+            "test-key",
+            TestClaims {
+                sub: "alice",
+                iss: "https://issuer.example/realms/app",
+                aud: "orders-api",
+                exp: 4_102_444_800,
+                groups: vec!["admin"],
+                realm_access: RealmAccessClaims {
+                    roles: vec!["user"],
+                },
+            },
+        );
+
+        let response = claims_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::jwks(test_jwks(), &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwks_validator_rejects_unknown_kid() {
+        let config = OidcConfig::default();
+        let token = jwt_with_kid(
+            "other-key",
+            TestClaims {
+                sub: "alice",
+                iss: "https://issuer.example/realms/app",
+                aud: "orders-api",
+                exp: 4_102_444_800,
+                groups: Vec::new(),
+                realm_access: RealmAccessClaims { roles: Vec::new() },
+            },
+        );
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::jwks(test_jwks(), &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(WWW_AUTHENTICATE).unwrap(),
+            HeaderValue::from_static(r#"Bearer error="invalid_token""#)
+        );
+    }
+
     fn oidc() -> Oidc {
         Oidc::builder(OidcConfig::default())
             .validator(StaticTokenValidator::bearer("test-token", "alice"))
@@ -807,6 +946,28 @@ mod tests {
             &EncodingKey::from_secret(b"secret"),
         )
         .expect("test token should encode")
+    }
+
+    fn jwt_with_kid(kid: &str, claims: TestClaims<'_>) -> String {
+        let mut header = Header::default();
+        header.kid = Some(kid.to_owned());
+
+        encode(&header, &claims, &EncodingKey::from_secret(b"secret"))
+            .expect("test token should encode")
+    }
+
+    fn test_jwks() -> JwkSet {
+        serde_json::from_value(json!({
+            "keys": [
+                {
+                    "kty": "oct",
+                    "alg": "HS256",
+                    "kid": "test-key",
+                    "k": "c2VjcmV0"
+                }
+            ]
+        }))
+        .expect("test JWKS should parse")
     }
 
     #[derive(Serialize)]
