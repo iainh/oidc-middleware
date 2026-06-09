@@ -136,6 +136,9 @@ pub struct OidcConfig {
     /// Quarkus-style application type.
     #[config(default)]
     pub application_type: ApplicationType,
+    /// Client credential settings used for provider calls.
+    #[config(nested)]
+    pub credentials: OidcCredentialsConfig,
     /// Token validation settings.
     #[config(nested)]
     pub token: OidcTokenConfig,
@@ -173,10 +176,19 @@ impl Default for OidcConfig {
             tenant_paths: None,
             public_key: None,
             application_type: ApplicationType::Service,
+            credentials: OidcCredentialsConfig::default(),
             token: OidcTokenConfig::default(),
             roles: OidcRolesConfig::default(),
         }
     }
+}
+
+/// Client credential configuration loaded from `quarkus.oidc.credentials.*`.
+#[derive(Clone, Debug, ConfigProperties, Default, Eq, PartialEq)]
+#[config(rename_all = "kebab-case")]
+pub struct OidcCredentialsConfig {
+    /// Client secret used with `client-id` for HTTP Basic authentication.
+    pub secret: Option<String>,
 }
 
 /// Token validation configuration loaded from `quarkus.oidc.token.*`.
@@ -1621,23 +1633,60 @@ impl UserInfoProvider for HttpUserInfoProvider {
 struct HttpTokenIntrospector {
     client: reqwest::Client,
     endpoint: String,
+    client_id: Option<String>,
+    client_secret: Option<String>,
 }
 
 impl TokenIntrospector for HttpTokenIntrospector {
     fn introspect(&self, token: Arc<str>) -> IntrospectionFuture {
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
+        let client_id = self.client_id.clone();
+        let client_secret = self.client_secret.clone();
         Box::pin(async move {
-            client
-                .post(endpoint)
-                .form(&[("token", token.as_ref())])
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<IntrospectionResponse>()
-                .await
-                .map_err(|error| Box::new(error) as BoxError)
+            introspection_request(
+                &client,
+                &endpoint,
+                token.as_ref(),
+                client_id.as_deref(),
+                client_secret.as_deref(),
+            )
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<IntrospectionResponse>()
+            .await
+            .map_err(|error| Box::new(error) as BoxError)
         })
+    }
+}
+
+fn http_token_introspector(
+    config: &OidcConfig,
+    client: reqwest::Client,
+    endpoint: String,
+) -> HttpTokenIntrospector {
+    HttpTokenIntrospector {
+        client,
+        endpoint,
+        client_id: config.client_id.clone(),
+        client_secret: config.credentials.secret.clone(),
+    }
+}
+
+fn introspection_request<'a>(
+    client: &'a reqwest::Client,
+    endpoint: &'a str,
+    token: &'a str,
+    client_id: Option<&'a str>,
+    client_secret: Option<&'a str>,
+) -> reqwest::RequestBuilder {
+    let request = client.post(endpoint).form(&[("token", token)]);
+    match (client_id, client_secret) {
+        (Some(client_id), Some(client_secret)) => {
+            request.basic_auth(client_id, Some(client_secret))
+        }
+        _ => request,
     }
 }
 
@@ -2190,10 +2239,7 @@ impl OidcBuilder {
             message: error.to_string(),
         })?;
         self.validator = Some(Arc::new(IntrospectionValidator::new(
-            HttpTokenIntrospector {
-                client,
-                endpoint: endpoint.to_owned(),
-            },
+            http_token_introspector(&self.config, client, endpoint.to_owned()),
             &self.config,
         )));
         Ok(self)
@@ -2396,10 +2442,7 @@ impl OidcBuilder {
             return;
         };
         let introspection = IntrospectionValidator::new(
-            HttpTokenIntrospector {
-                client,
-                endpoint: endpoint.to_string(),
-            },
+            http_token_introspector(&self.config, client, endpoint.to_string()),
             &self.config,
         );
         self.validator = Some(Arc::new(IntrospectionFallbackValidator::new(
@@ -2423,7 +2466,7 @@ impl OidcBuilder {
         };
         let validation_config = provider_validation_config(&self.config, &metadata);
         let introspection = IntrospectionValidator::new(
-            HttpTokenIntrospector { client, endpoint },
+            http_token_introspector(&validation_config, client, endpoint),
             &validation_config,
         );
         Arc::new(IntrospectionFallbackValidator::new(
@@ -2443,7 +2486,7 @@ impl OidcBuilder {
         };
         let validation_config = provider_validation_config(&self.config, &metadata);
         self.validator = Some(Arc::new(IntrospectionValidator::new(
-            HttpTokenIntrospector { client, endpoint },
+            http_token_introspector(&validation_config, client, endpoint),
             &validation_config,
         )));
     }
@@ -2896,6 +2939,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.tenant-paths"
             || key == "quarkus.oidc.public-key"
             || key == "quarkus.oidc.application-type"
+            || key.starts_with("quarkus.oidc.credentials.")
             || key.starts_with("quarkus.oidc.token.")
     })
 }
@@ -2944,8 +2988,9 @@ fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
                 | "public-key"
                 | "application-type"
         ) || property.starts_with("token.")
+            || property.starts_with("credentials.")
             || property.starts_with("roles.");
-        if !matches!(name.as_str(), "token" | "roles") && tenant_property {
+        if !matches!(name.as_str(), "credentials" | "token" | "roles") && tenant_property {
             names.insert(NamedTenantConfig {
                 name,
                 prefix_segment,
@@ -3501,6 +3546,7 @@ dQIDAQAB
                         "protocol/openid-connect/logout",
                     )
                     .with("quarkus.oidc.client-id", "orders-service")
+                    .with("quarkus.oidc.credentials.secret", "orders-secret")
                     .with("quarkus.oidc.tenant-id", "orders-tenant")
                     .with("quarkus.oidc.public-key", "configured-public-key")
                     .with("quarkus.oidc.application-type", "hybrid")
@@ -3564,6 +3610,9 @@ dQIDAQAB
                 tenant_paths: None,
                 public_key: Some("configured-public-key".to_owned()),
                 application_type: ApplicationType::Hybrid,
+                credentials: OidcCredentialsConfig {
+                    secret: Some("orders-secret".to_owned()),
+                },
                 token: OidcTokenConfig {
                     issuer: None,
                     audience: Some("orders-api".to_owned()),
@@ -3959,6 +4008,41 @@ dQIDAQAB
                 .contains("introspection audience did not include"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn introspection_request_uses_basic_auth_when_client_secret_is_configured() {
+        let request = introspection_request(
+            &reqwest::Client::new(),
+            "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
+            "opaque-token",
+            Some("orders-service"),
+            Some("orders-secret"),
+        )
+        .build()
+        .expect("request should build");
+
+        assert_eq!(
+            request.headers().get(AUTHORIZATION),
+            Some(&HeaderValue::from_static(
+                "Basic b3JkZXJzLXNlcnZpY2U6b3JkZXJzLXNlY3JldA=="
+            ))
+        );
+    }
+
+    #[test]
+    fn introspection_request_skips_basic_auth_without_client_secret() {
+        let request = introspection_request(
+            &reqwest::Client::new(),
+            "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
+            "opaque-token",
+            Some("orders-service"),
+            None,
+        )
+        .build()
+        .expect("request should build");
+
+        assert!(!request.headers().contains_key(AUTHORIZATION));
     }
 
     #[tokio::test]
