@@ -3264,9 +3264,12 @@ fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc
     if let Some(header_name) = &config.header {
         let header_name = http::HeaderName::from_str(header_name)
             .map_err(|_| Error::InvalidAuthorizationHeader)?;
-        let Some(header) = request.headers().get(header_name) else {
+        let Some(header) = request.headers().get(&header_name) else {
             return Err(Error::MissingBearerToken);
         };
+        if header_name == AUTHORIZATION {
+            return bearer_token_from_authorization_header(header, &config.authorization_scheme);
+        }
         let token = header
             .to_str()
             .map_err(|_| Error::InvalidAuthorizationHeader)?
@@ -3281,10 +3284,17 @@ fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc
         return Err(Error::MissingBearerToken);
     };
 
+    bearer_token_from_authorization_header(header, &config.authorization_scheme)
+}
+
+fn bearer_token_from_authorization_header(
+    header: &HeaderValue,
+    authorization_scheme: &str,
+) -> Result<Arc<str>> {
     let value = header
         .to_str()
         .map_err(|_| Error::InvalidAuthorizationHeader)?;
-    let token = token_with_scheme(value, &config.authorization_scheme)
+    let token = token_with_scheme(value, authorization_scheme)
         .filter(|token| !token.is_empty())
         .ok_or(Error::InvalidAuthorizationHeader)?;
 
@@ -3985,6 +3995,43 @@ dQIDAQAB
             "x-access-token",
             "test-token",
         ))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_authorization_token_header_uses_scheme() {
+        let response = app(Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                header: Some("Authorization".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer("test-token", "alice"))
+        .build())
+        .oneshot(request("/protected", Some("Bearer test-token")))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_authorization_token_header_respects_custom_scheme() {
+        let response = app(Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                header: Some("Authorization".to_owned()),
+                authorization_scheme: "Token".to_owned(),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer("test-token", "alice"))
+        .build())
+        .oneshot(request("/protected", Some("Token test-token")))
         .await
         .expect("request should complete");
 
