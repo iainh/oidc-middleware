@@ -2403,9 +2403,33 @@ fn apply_role_mappings(principal: &mut Principal, role_mappings: &HashMap<String
 }
 
 fn claim_path_value<'a>(claims: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split(['.', '/'])
-        .filter(|part| !part.is_empty())
+    claim_path_parts(path)
+        .into_iter()
         .try_fold(claims, |value, part| value.get(part))
+}
+
+fn claim_path_parts(path: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+
+    for character in path.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            '.' | '/' if !quoted => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            character => current.push(character),
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    parts
 }
 
 fn collect_roles(value: &Value, roles: &mut Vec<String>, separator: &str) {
@@ -2975,6 +2999,42 @@ dQIDAQAB
                     roles: vec!["orders-admin", "orders-user"],
                 },
             },
+        });
+
+        let response = custom_roles_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_extracts_quoted_namespace_role_claim_path() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: None,
+                ..OidcTokenConfig::default()
+            },
+            roles: OidcRolesConfig {
+                role_claim_path: "\"https://claims.example/roles\"".to_owned(),
+                ..OidcRolesConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(NamespacedRoleClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            namespaced_roles: vec!["orders-admin", "orders-user"],
         });
 
         let response = custom_roles_app(
@@ -4770,6 +4830,22 @@ dQIDAQAB
         assert_eq!(path_match_score("/public*", "/public-info"), None);
     }
 
+    #[test]
+    fn claim_path_parts_preserve_quoted_segments() {
+        assert_eq!(
+            claim_path_parts("resource_access.\"https://claims.example/roles\".roles"),
+            vec![
+                "resource_access".to_owned(),
+                "https://claims.example/roles".to_owned(),
+                "roles".to_owned()
+            ]
+        );
+        assert_eq!(
+            claim_path_parts("\"https://claims.example/roles\""),
+            vec!["https://claims.example/roles".to_owned()]
+        );
+    }
+
     #[tokio::test]
     async fn authorization_applies_shared_permissions_with_most_specific_match() {
         let authorization = Authorization::from_config(
@@ -5370,6 +5446,16 @@ dQIDAQAB
         aud: &'a str,
         exp: u64,
         resource_access: ResourceAccessClaims<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct NamespacedRoleClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        exp: u64,
+        #[serde(rename = "https://claims.example/roles")]
+        namespaced_roles: Vec<&'a str>,
     }
 
     #[derive(Serialize)]
