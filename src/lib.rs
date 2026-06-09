@@ -1301,9 +1301,7 @@ fn claim_string_value(claims: &TokenClaims, claim_name: &str) -> Option<String> 
         "sub" => claims.sub.clone(),
         "iss" => claims.iss.clone(),
         "typ" => claims.typ.clone(),
-        _ => claims
-            .extra
-            .get(claim_name)
+        _ => claim_path_value(&claims.extra, claim_name)
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
     }
@@ -1316,7 +1314,7 @@ fn claim_string_values(claims: &TokenClaims, claim_name: &str) -> Option<Vec<Str
         "aud" => Some(claims.aud.clone()),
         "typ" => claims.typ.clone().map(|token_type| vec![token_type]),
         "iat" => claims.iat.map(|issued_at| vec![issued_at.to_string()]),
-        _ => json_string_values(claims.extra.get(claim_name)?),
+        _ => json_string_values(claim_path_value(&claims.extra, claim_name)?),
     }
 }
 
@@ -2969,6 +2967,41 @@ dQIDAQAB
     }
 
     #[tokio::test]
+    async fn jwt_validator_uses_configured_principal_claim_path() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                principal_claim: Some("profile.email".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(ProfilePrincipalClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            profile: ProfileClaims {
+                email: "alice@orders.example",
+            },
+            exp: 4_102_444_800,
+        });
+
+        let response = subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+            "alice@orders.example",
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn jwt_validator_rejects_missing_configured_principal_claim() {
         let config = OidcConfig {
             auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
@@ -3403,6 +3436,45 @@ dQIDAQAB
             org_id: "org_xyz",
             scope: vec!["read", "write", "delete"],
             exp: 4_102_444_800,
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_accepts_nested_required_claim_values() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                required_claims: HashMap::from([(
+                    "resource_access.orders.roles".to_owned(),
+                    vec!["orders-admin".to_owned()],
+                )]),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(CustomRoleClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            resource_access: ResourceAccessClaims {
+                orders: ResourceRolesClaims {
+                    roles: vec!["orders-admin", "orders-user"],
+                },
+            },
         });
 
         let response = claims_subject_app(
@@ -5046,6 +5118,20 @@ dQIDAQAB
         org_id: &'a str,
         scope: Vec<&'a str>,
         exp: u64,
+    }
+
+    #[derive(Serialize)]
+    struct ProfilePrincipalClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        profile: ProfileClaims<'a>,
+        exp: u64,
+    }
+
+    #[derive(Serialize)]
+    struct ProfileClaims<'a> {
+        email: &'a str,
     }
 
     #[derive(Serialize)]

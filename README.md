@@ -23,11 +23,13 @@ This crate is in early development. The current implementation includes:
   `quarkus.oidc.token.signature-algorithm`.
 - JWT `typ` claim enforcement with `quarkus.oidc.token.token-type`.
 - Optional `sub` enforcement with `quarkus.oidc.token.subject-required`.
-- JWT string claim enforcement with `quarkus.oidc.token.required-claims.*`.
+- JWT string claim enforcement with `quarkus.oidc.token.required-claims.*`,
+  including nested claim paths.
 - JWT lifespan grace and age checks with `quarkus.oidc.token.lifespan-grace`
   and `quarkus.oidc.token.age`, including
   `quarkus.oidc.token.issued-at-required`.
-- Principal-name selection with `quarkus.oidc.token.principal-claim`.
+- Principal-name selection with `quarkus.oidc.token.principal-claim`,
+  including nested claim paths.
 - Token extraction with `quarkus.oidc.token.header` and
   `quarkus.oidc.token.authorization-scheme`.
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths`, tenant IDs,
