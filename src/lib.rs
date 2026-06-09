@@ -1251,6 +1251,59 @@ impl TokenValidator for JwtValidator {
     }
 }
 
+/// Token validator that falls back to introspection after local JWT rejection.
+#[derive(Clone)]
+pub struct IntrospectionFallbackValidator {
+    jwt: Arc<dyn TokenValidator>,
+    introspection: Arc<dyn TokenValidator>,
+    allow_jwt_introspection: bool,
+    allow_opaque_token_introspection: bool,
+}
+
+impl IntrospectionFallbackValidator {
+    /// Builds a fallback validator from a local JWT validator and introspection validator.
+    pub fn new<J, I>(jwt: J, introspection: I, config: &OidcConfig) -> Self
+    where
+        J: TokenValidator,
+        I: TokenValidator,
+    {
+        Self {
+            jwt: Arc::new(jwt),
+            introspection: Arc::new(introspection),
+            allow_jwt_introspection: config.token.allow_jwt_introspection,
+            allow_opaque_token_introspection: config.token.allow_opaque_token_introspection,
+        }
+    }
+}
+
+impl TokenValidator for IntrospectionFallbackValidator {
+    fn validate(&self, token: Arc<str>) -> ValidationFuture {
+        let jwt = self.jwt.clone();
+        let introspection = self.introspection.clone();
+        let allow_jwt_introspection = self.allow_jwt_introspection;
+        let allow_opaque_token_introspection = self.allow_opaque_token_introspection;
+
+        Box::pin(async move {
+            match jwt.validate(token.clone()).await {
+                Ok(principal) => Ok(principal),
+                Err(error) => {
+                    let token_is_jwt = token_looks_like_jwt(&token);
+                    if (token_is_jwt && !allow_jwt_introspection)
+                        || (!token_is_jwt && !allow_opaque_token_introspection)
+                    {
+                        return Err(error);
+                    }
+                    introspection.validate(token).await
+                }
+            }
+        })
+    }
+}
+
+fn token_looks_like_jwt(token: &str) -> bool {
+    token.split('.').count() == 3
+}
+
 /// OAuth2 token introspection response.
 ///
 /// The standard `active` member controls whether the token is accepted. Common
@@ -2235,7 +2288,7 @@ impl OidcBuilder {
                 .json()
                 .await?;
             let mut builder = self;
-            builder.validator = Some(Arc::new(JwtValidator::jwks(jwks, &builder.config)));
+            builder.install_jwks_with_optional_introspection(jwks, client);
             return Ok(builder.build());
         }
 
@@ -2292,7 +2345,9 @@ impl OidcBuilder {
         }
 
         let validation_config = provider_validation_config(&self.config, &metadata);
-        self.validator = Some(Arc::new(JwtValidator::jwks(jwks, &validation_config)));
+        let jwt = JwtValidator::jwks(jwks, &validation_config);
+        self.validator =
+            Some(self.jwt_with_metadata_introspection(jwt, metadata, reqwest::Client::new()));
         self.build()
     }
 
@@ -2314,15 +2369,68 @@ impl OidcBuilder {
         }
 
         let validation_config = provider_validation_config(&self.config, &metadata);
-        self.validator = Some(Arc::new(JwtValidator::refreshable_jwks(
+        let jwt = JwtValidator::refreshable_jwks(
             jwks,
             HttpJwksProvider {
-                client,
-                jwks_uri: metadata.jwks_uri,
+                client: client.clone(),
+                jwks_uri: metadata.jwks_uri.clone(),
             },
             &validation_config,
-        )));
+        );
+        self.validator = Some(self.jwt_with_metadata_introspection(jwt, metadata, client));
         self.build()
+    }
+
+    fn install_jwks_with_optional_introspection(&mut self, jwks: JwkSet, client: reqwest::Client) {
+        let jwt = JwtValidator::jwks(jwks, &self.config);
+        let Some(introspection_path) = self.config.introspection_path.as_deref() else {
+            self.validator = Some(Arc::new(jwt));
+            return;
+        };
+        let Some(auth_server_url) = self.config.auth_server_url.as_deref() else {
+            self.validator = Some(Arc::new(jwt));
+            return;
+        };
+        let Ok(endpoint) = provider_endpoint_url(auth_server_url, introspection_path) else {
+            self.validator = Some(Arc::new(jwt));
+            return;
+        };
+        let introspection = IntrospectionValidator::new(
+            HttpTokenIntrospector {
+                client,
+                endpoint: endpoint.to_string(),
+            },
+            &self.config,
+        );
+        self.validator = Some(Arc::new(IntrospectionFallbackValidator::new(
+            jwt,
+            introspection,
+            &self.config,
+        )));
+    }
+
+    fn jwt_with_metadata_introspection<J>(
+        &self,
+        jwt: J,
+        metadata: ProviderMetadata,
+        client: reqwest::Client,
+    ) -> Arc<dyn TokenValidator>
+    where
+        J: TokenValidator,
+    {
+        let Some(endpoint) = metadata.introspection_endpoint.clone() else {
+            return Arc::new(jwt);
+        };
+        let validation_config = provider_validation_config(&self.config, &metadata);
+        let introspection = IntrospectionValidator::new(
+            HttpTokenIntrospector { client, endpoint },
+            &validation_config,
+        );
+        Arc::new(IntrospectionFallbackValidator::new(
+            jwt,
+            introspection,
+            &self.config,
+        ))
     }
 
     fn install_metadata_introspection(
@@ -3851,6 +3959,84 @@ dQIDAQAB
                 .contains("introspection audience did not include"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn introspection_fallback_uses_primary_jwt_validator_first() {
+        let validator = IntrospectionFallbackValidator::new(
+            StaticTokenValidator::bearer("jwt-token", "alice"),
+            StaticTokenValidator::bearer("opaque-token", "bob"),
+            &OidcConfig::default(),
+        );
+
+        let principal = validator
+            .validate(Arc::from("jwt-token"))
+            .await
+            .expect("primary validator should accept token");
+
+        assert_eq!(principal.subject(), "alice");
+    }
+
+    #[tokio::test]
+    async fn introspection_fallback_accepts_opaque_token_when_enabled() {
+        let validator = IntrospectionFallbackValidator::new(
+            StaticTokenValidator::bearer("jwt-token", "alice"),
+            StaticTokenValidator::bearer("opaque-token", "bob"),
+            &OidcConfig::default(),
+        );
+
+        let principal = validator
+            .validate(Arc::from("opaque-token"))
+            .await
+            .expect("opaque token should fall back to introspection");
+
+        assert_eq!(principal.subject(), "bob");
+    }
+
+    #[tokio::test]
+    async fn introspection_fallback_rejects_opaque_token_when_disabled() {
+        let config = OidcConfig {
+            token: OidcTokenConfig {
+                allow_opaque_token_introspection: false,
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let validator = IntrospectionFallbackValidator::new(
+            StaticTokenValidator::bearer("jwt-token", "alice"),
+            StaticTokenValidator::bearer("opaque-token", "bob"),
+            &config,
+        );
+
+        let error = validator
+            .validate(Arc::from("opaque-token"))
+            .await
+            .expect_err("opaque fallback should be disabled");
+
+        assert!(error.to_string().contains("bearer token did not match"));
+    }
+
+    #[tokio::test]
+    async fn introspection_fallback_rejects_jwt_token_when_jwt_introspection_disabled() {
+        let config = OidcConfig {
+            token: OidcTokenConfig {
+                allow_jwt_introspection: false,
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let validator = IntrospectionFallbackValidator::new(
+            StaticTokenValidator::bearer("jwt-token", "alice"),
+            StaticTokenValidator::bearer("a.b.c", "bob"),
+            &config,
+        );
+
+        let error = validator
+            .validate(Arc::from("a.b.c"))
+            .await
+            .expect_err("JWT fallback should be disabled");
+
+        assert!(error.to_string().contains("bearer token did not match"));
     }
 
     #[tokio::test]
