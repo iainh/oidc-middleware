@@ -601,6 +601,13 @@ impl Authorization {
 
         for name in permission_names(config) {
             let prefix = format!("quarkus.http.auth.permission.{name}");
+            if !config
+                .get_optional::<bool>(&format!("{prefix}.enabled"))?
+                .unwrap_or(true)
+            {
+                continue;
+            }
+
             let paths = split_csv(&config.get::<String>(&format!("{prefix}.paths"))?);
             let methods = config
                 .get_optional::<String>(&format!("{prefix}.methods"))?
@@ -3389,6 +3396,31 @@ mod tests {
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorization_ignores_disabled_permissions() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-disabled-permission", 100)
+                        .with("quarkus.http.auth.permission.permit.paths", "/resource")
+                        .with("quarkus.http.auth.permission.permit.policy", "permit")
+                        .with("quarkus.http.auth.permission.deny.paths", "/resource")
+                        .with("quarkus.http.auth.permission.deny.policy", "deny")
+                        .with("quarkus.http.auth.permission.deny.enabled", "false"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .oneshot(request("/resource", None))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

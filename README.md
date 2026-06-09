@@ -34,7 +34,8 @@ This crate is in early development. The current implementation includes:
 - Configurable role extraction with `quarkus.oidc.roles.role-claim-path` and
   `quarkus.oidc.roles.role-claim-separator`.
 - Quarkus-style `quarkus.http.auth.permission.*` path policies for `permit`,
-  `deny`, `authenticated`, and named `roles-allowed` policies.
+  `deny`, `authenticated`, named `roles-allowed` policies, and disabled
+  permission entries.
 - `#[roles_allowed(...)]` handler macro for Quarkus-style role checks with the
   `OidcPrincipal` extractor.
 - Quarkus-style handling for disabled OIDC and disabled tenants.
