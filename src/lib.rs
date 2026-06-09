@@ -33,6 +33,7 @@
 //! behaviour explicit and testable:
 //!
 //! - `quarkus.oidc.auth-server-url` maps to [`OidcConfig::auth_server_url`].
+//! - `quarkus.oidc.provider` maps to [`OidcConfig::provider`].
 //! - `quarkus.oidc.client-id` maps to [`OidcConfig::client_id`].
 //! - `quarkus.oidc.application-type` maps to [`OidcConfig::application_type`].
 //! - `quarkus.oidc.enabled=false` disables authentication for the layer.
@@ -103,6 +104,8 @@ pub struct OidcConfig {
     pub resolve_tenants_with_issuer: bool,
     /// Base URL of the OpenID Connect provider or realm.
     pub auth_server_url: Option<String>,
+    /// Well-known OpenID Connect provider identifier.
+    pub provider: Option<WellKnownProvider>,
     /// Enables OIDC provider metadata discovery.
     #[config(default = "true")]
     pub discovery_enabled: bool,
@@ -166,6 +169,7 @@ impl Default for OidcConfig {
             tenant_enabled: true,
             resolve_tenants_with_issuer: false,
             auth_server_url: None,
+            provider: None,
             discovery_enabled: true,
             discovery_path: ".well-known/openid-configuration".to_owned(),
             jwks_path: None,
@@ -240,6 +244,63 @@ impl mp_config::FromConfigValue for ClientSecretMethod {
             "query" => Ok(Self::Query),
             other => Err(format!(
                 "expected one of `basic`, `post`, or `query`, got `{other}`"
+            )),
+        }
+    }
+}
+
+/// Quarkus-compatible well-known OpenID Connect provider identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WellKnownProvider {
+    /// Apple.
+    Apple,
+    /// Discord.
+    Discord,
+    /// Facebook.
+    Facebook,
+    /// GitHub.
+    Github,
+    /// Google.
+    Google,
+    /// LinkedIn.
+    Linkedin,
+    /// Mastodon.
+    Mastodon,
+    /// Microsoft.
+    Microsoft,
+    /// Slack.
+    Slack,
+    /// Spotify.
+    Spotify,
+    /// Strava.
+    Strava,
+    /// Twitch.
+    Twitch,
+    /// Twitter.
+    Twitter,
+    /// X.
+    X,
+}
+
+impl mp_config::FromConfigValue for WellKnownProvider {
+    fn from_config_value(value: &str) -> std::result::Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "apple" => Ok(Self::Apple),
+            "discord" => Ok(Self::Discord),
+            "facebook" => Ok(Self::Facebook),
+            "github" => Ok(Self::Github),
+            "google" => Ok(Self::Google),
+            "linkedin" => Ok(Self::Linkedin),
+            "mastodon" => Ok(Self::Mastodon),
+            "microsoft" => Ok(Self::Microsoft),
+            "slack" => Ok(Self::Slack),
+            "spotify" => Ok(Self::Spotify),
+            "strava" => Ok(Self::Strava),
+            "twitch" => Ok(Self::Twitch),
+            "twitter" => Ok(Self::Twitter),
+            "x" => Ok(Self::X),
+            other => Err(format!(
+                "expected one of `apple`, `discord`, `facebook`, `github`, `google`, `linkedin`, `mastodon`, `microsoft`, `slack`, `spotify`, `strava`, `twitch`, `twitter`, or `x`, got `{other}`"
             )),
         }
     }
@@ -3154,6 +3215,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
         key == "quarkus.oidc.enabled"
             || key == "quarkus.oidc.tenant-enabled"
             || key == "quarkus.oidc.auth-server-url"
+            || key == "quarkus.oidc.provider"
             || key == "quarkus.oidc.discovery-enabled"
             || key == "quarkus.oidc.discovery-path"
             || key == "quarkus.oidc.jwks-path"
@@ -3206,6 +3268,7 @@ fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
             "enabled"
                 | "tenant-enabled"
                 | "auth-server-url"
+                | "provider"
                 | "discovery-enabled"
                 | "discovery-path"
                 | "jwks-path"
@@ -3804,6 +3867,7 @@ dQIDAQAB
                         "quarkus.oidc.auth-server-url",
                         "https://issuer.example/realms/app",
                     )
+                    .with("quarkus.oidc.provider", "github")
                     .with("quarkus.oidc.resolve-tenants-with-issuer", "true")
                     .with("quarkus.oidc.discovery-enabled", "false")
                     .with("quarkus.oidc.discovery-path", "custom-discovery")
@@ -3891,6 +3955,7 @@ dQIDAQAB
                 tenant_enabled: true,
                 resolve_tenants_with_issuer: true,
                 auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+                provider: Some(WellKnownProvider::Github),
                 discovery_enabled: false,
                 discovery_path: "custom-discovery".to_owned(),
                 jwks_path: Some("protocol/openid-connect/certs".to_owned()),
@@ -3969,6 +4034,22 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("expected one of `accesstoken`, `idtoken`, or `userinfo`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_provider() {
+        let config = Config::builder()
+            .add_source(MapSource::new("test", 100).with("quarkus.oidc.provider", "custom"))
+            .build();
+
+        let error = OidcConfig::from_config(&config).expect_err("provider should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected one of `apple`, `discord`, `facebook`"),
             "{error}"
         );
     }
@@ -6702,6 +6783,7 @@ dQIDAQAB
                 MapSource::new("tenants", 100)
                     .with("quarkus.oidc.tenant-paths", "/api/default")
                     .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
+                    .with("quarkus.oidc.tenant-a.provider", "google")
                     .with("quarkus.oidc.tenant-a.client-id", "tenant-a-client")
                     .with("quarkus.oidc.tenant-a.client-name", "Tenant A")
                     .with("quarkus.oidc.tenant-a.tenant-id", "orders")
@@ -6717,6 +6799,7 @@ dQIDAQAB
 
         let tenant_a = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a").unwrap();
         assert_eq!(tenant_a.tenant_paths, Some("/api/a/*".to_owned()));
+        assert_eq!(tenant_a.provider, Some(WellKnownProvider::Google));
         assert_eq!(tenant_a.client_id, Some("tenant-a-client".to_owned()));
         assert_eq!(tenant_a.client_name, Some("Tenant A".to_owned()));
         assert_eq!(tenant_a.tenant_id, Some("orders".to_owned()));
