@@ -2695,18 +2695,20 @@ impl Tenants {
         }
         if has_default_tenant_config(config) {
             let default_config = OidcConfig::from_config(config)?;
-            builder = builder.default_tenant(
-                oidc_builder_from_config(default_config, "quarkus.oidc.public-key")?.build(),
-            );
+            let default_tenant =
+                oidc_builder_from_config(default_config, "quarkus.oidc.public-key")?
+                    .authorization_from_config(config)?
+                    .build();
+            builder = builder.default_tenant(default_tenant);
         }
 
         for tenant in named_tenant_configs(config) {
             let prefix = format!("quarkus.oidc.{}", tenant.prefix_segment);
             let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
-            builder = builder.tenant(
-                tenant.name,
-                oidc_builder_from_config(tenant_config, &format!("{prefix}.public-key"))?.build(),
-            );
+            let oidc = oidc_builder_from_config(tenant_config, &format!("{prefix}.public-key"))?
+                .authorization_from_config(config)?
+                .build();
+            builder = builder.tenant(tenant.name, oidc);
         }
 
         Ok(builder)
@@ -6464,6 +6466,48 @@ dQIDAQAB
             mp_config::ConfigError::Conversion { name, .. }
                 if name == "quarkus.oidc.tenant-id-header"
         ));
+    }
+
+    #[tokio::test]
+    async fn tenants_from_config_apply_http_authorization() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-authz", 100)
+                    .with("quarkus.oidc.tenant-a.tenant-paths", "/tenant-a/*")
+                    .with(
+                        "quarkus.http.auth.permission.public.paths",
+                        "/tenant-a/public",
+                    )
+                    .with("quarkus.http.auth.permission.public.policy", "permit")
+                    .with(
+                        "quarkus.http.auth.permission.private.paths",
+                        "/tenant-a/private",
+                    )
+                    .with(
+                        "quarkus.http.auth.permission.private.policy",
+                        "authenticated",
+                    ),
+            )
+            .build();
+        let tenants = Tenants::from_config(&config)
+            .expect("tenant config should load")
+            .build();
+        let app = Router::new()
+            .fallback(|| async { "ok" })
+            .layer(tenants.layer());
+
+        let response = app
+            .clone()
+            .oneshot(request("/tenant-a/public", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(request("/tenant-a/private", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
