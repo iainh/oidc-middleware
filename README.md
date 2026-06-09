@@ -14,6 +14,7 @@ This crate is in early development. The current implementation includes:
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`.
 - Audience validation from `quarkus.oidc.token.audience`, defaulting to
   `quarkus.oidc.client-id` when present.
+- JWT `typ` claim enforcement with `quarkus.oidc.token.token-type`.
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths` and optional
   header-based tenant selection.
 - Refreshable provider JWKS validation when a token references an unknown `kid`.

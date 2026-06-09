@@ -134,6 +134,8 @@ pub struct OidcTokenConfig {
     pub issuer: Option<String>,
     /// Expected token audience.
     pub audience: Option<String>,
+    /// Expected JWT `typ` claim value.
+    pub token_type: Option<String>,
 }
 
 /// Role extraction configuration loaded from `quarkus.oidc.roles.*`.
@@ -628,6 +630,7 @@ pub struct JwtValidator {
     keys: JwtKeys,
     validation: Validation,
     role_claim_paths: Arc<[String]>,
+    token_type: Option<Arc<str>>,
 }
 
 impl JwtValidator {
@@ -644,6 +647,7 @@ impl JwtValidator {
             keys: JwtKeys::Single(Arc::new(DecodingKey::from_secret(secret.as_ref()))),
             validation,
             role_claim_paths: Arc::from(config.roles.claim_paths()),
+            token_type: config.token.token_type.clone().map(Arc::from),
         }
     }
 
@@ -666,6 +670,7 @@ impl JwtValidator {
             keys: JwtKeys::Set(Arc::new(jwks)),
             validation,
             role_claim_paths: Arc::from(config.roles.claim_paths()),
+            token_type: config.token.token_type.clone().map(Arc::from),
         }
     }
 
@@ -693,6 +698,7 @@ impl JwtValidator {
             }),
             validation,
             role_claim_paths: Arc::from(config.roles.claim_paths()),
+            token_type: config.token.token_type.clone().map(Arc::from),
         }
     }
 }
@@ -702,12 +708,16 @@ impl TokenValidator for JwtValidator {
         let keys = self.keys.clone();
         let validation = self.validation.clone();
         let role_claim_paths = self.role_claim_paths.clone();
+        let token_type = self.token_type.clone();
 
         Box::pin(async move {
             let key = keys.decoding_key(&token).await?;
             decode::<TokenClaims>(&token, &key, &validation)
-                .map(|data| Principal::from_claims(data.claims, &role_claim_paths))
                 .map_err(|error| Error::TokenRejected(Box::new(error)))
+                .and_then(|data| {
+                    validate_token_type(&data.claims, token_type.as_deref())?;
+                    Ok(Principal::from_claims(data.claims, &role_claim_paths))
+                })
         })
     }
 }
@@ -818,6 +828,22 @@ fn should_refresh_jwks(error: &Error) -> bool {
     matches!(error, Error::TokenRejected(source) if source.is::<UnknownKid>())
 }
 
+fn validate_token_type(claims: &TokenClaims, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+
+    match claims.typ.as_deref() {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(Error::TokenRejected(
+            format!("JWT typ claim `{actual}` did not match expected `{expected}`").into(),
+        )),
+        None => Err(Error::TokenRejected(
+            format!("JWT typ claim is required to be `{expected}`").into(),
+        )),
+    }
+}
+
 #[derive(Debug)]
 struct UnknownKid(String);
 
@@ -834,6 +860,7 @@ struct TokenClaims {
     sub: String,
     iss: Option<String>,
     aud: Vec<String>,
+    typ: Option<String>,
     extra: Value,
 }
 
@@ -849,6 +876,8 @@ impl<'de> Deserialize<'de> for TokenClaims {
             iss: Option<String>,
             #[serde(default, deserialize_with = "deserialize_audience")]
             aud: Vec<String>,
+            #[serde(default)]
+            typ: Option<String>,
             #[serde(flatten)]
             extra: serde_json::Map<String, Value>,
         }
@@ -859,6 +888,7 @@ impl<'de> Deserialize<'de> for TokenClaims {
             sub: raw.sub,
             iss: raw.iss,
             aud: raw.aud,
+            typ: raw.typ,
             extra: Value::Object(raw.extra),
         })
     }
@@ -1539,6 +1569,7 @@ mod tests {
                     .with("quarkus.oidc.client-id", "orders-service")
                     .with("quarkus.oidc.application-type", "hybrid")
                     .with("quarkus.oidc.token.audience", "orders-api")
+                    .with("quarkus.oidc.token.token-type", "bearer")
                     .with(
                         "quarkus.oidc.roles.role-claim-path",
                         "resource_access.api.roles",
@@ -1560,6 +1591,7 @@ mod tests {
                 token: OidcTokenConfig {
                     issuer: None,
                     audience: Some("orders-api".to_owned()),
+                    token_type: Some("bearer".to_owned()),
                 },
                 roles: OidcRolesConfig {
                     role_claim_path: "resource_access.api.roles".to_owned(),
@@ -1644,6 +1676,7 @@ mod tests {
             token: OidcTokenConfig {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
+                token_type: None,
             },
             ..OidcConfig::default()
         };
@@ -1677,6 +1710,7 @@ mod tests {
             token: OidcTokenConfig {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
+                token_type: None,
             },
             roles: OidcRolesConfig {
                 role_claim_path: "resource_access.orders.roles".to_owned(),
@@ -1762,6 +1796,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jwt_validator_accepts_configured_token_type() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: Some("bearer".to_owned()),
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TokenTypeClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            typ: "bearer",
+            exp: 4_102_444_800,
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_wrong_token_type() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: Some("bearer".to_owned()),
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TokenTypeClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            typ: "id_token",
+            exp: 4_102_444_800,
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_missing_token_type() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: Some("bearer".to_owned()),
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn jwt_validator_rejects_wrong_issuer() {
         let config = OidcConfig {
             auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
@@ -1797,6 +1921,7 @@ mod tests {
             token: OidcTokenConfig {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
+                token_type: None,
             },
             ..OidcConfig::default()
         };
@@ -1862,6 +1987,7 @@ mod tests {
             token: OidcTokenConfig {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
+                token_type: None,
             },
             ..OidcConfig::default()
         };
@@ -1957,6 +2083,7 @@ mod tests {
                 token: OidcTokenConfig {
                     issuer: None,
                     audience: Some("orders-api".to_owned()),
+                    token_type: None,
                 },
                 ..OidcConfig::default()
             })
@@ -2440,6 +2567,15 @@ mod tests {
         exp: u64,
         groups: Vec<&'a str>,
         realm_access: RealmAccessClaims<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct TokenTypeClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        typ: &'a str,
+        exp: u64,
     }
 
     #[derive(Serialize)]
