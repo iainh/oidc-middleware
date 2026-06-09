@@ -42,7 +42,11 @@ use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use http::{HeaderValue, Request, StatusCode};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use mp_config::{Config, ConfigProperties};
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::fmt;
@@ -76,6 +80,9 @@ pub struct OidcConfig {
     /// Quarkus-style application type.
     #[config(default)]
     pub application_type: ApplicationType,
+    /// Token validation settings.
+    #[config(nested)]
+    pub token: OidcTokenConfig,
 }
 
 impl OidcConfig {
@@ -93,8 +100,19 @@ impl Default for OidcConfig {
             auth_server_url: None,
             client_id: None,
             application_type: ApplicationType::Service,
+            token: OidcTokenConfig::default(),
         }
     }
+}
+
+/// Token validation configuration loaded from `quarkus.oidc.token.*`.
+#[derive(Clone, Debug, ConfigProperties, Default, Eq, PartialEq)]
+#[config(rename_all = "kebab-case")]
+pub struct OidcTokenConfig {
+    /// Expected token issuer. Defaults to `auth-server-url` when unset.
+    pub issuer: Option<String>,
+    /// Expected token audience.
+    pub audience: Option<String>,
 }
 
 /// Quarkus-compatible OIDC application type.
@@ -126,6 +144,9 @@ impl mp_config::FromConfigValue for ApplicationType {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Principal {
     subject: Arc<str>,
+    issuer: Option<Arc<str>>,
+    audience: Vec<Arc<str>>,
+    groups: Vec<Arc<str>>,
 }
 
 impl Principal {
@@ -133,12 +154,39 @@ impl Principal {
     pub fn new(subject: impl Into<String>) -> Self {
         Self {
             subject: Arc::from(subject.into()),
+            issuer: None,
+            audience: Vec::new(),
+            groups: Vec::new(),
         }
     }
 
     /// Returns the token subject.
     pub fn subject(&self) -> &str {
         &self.subject
+    }
+
+    /// Returns the token issuer when present.
+    pub fn issuer(&self) -> Option<&str> {
+        self.issuer.as_deref()
+    }
+
+    /// Returns token audiences.
+    pub fn audience(&self) -> impl Iterator<Item = &str> {
+        self.audience.iter().map(AsRef::as_ref)
+    }
+
+    /// Returns group or role names carried by the token.
+    pub fn groups(&self) -> impl Iterator<Item = &str> {
+        self.groups.iter().map(AsRef::as_ref)
+    }
+
+    fn from_claims(claims: TokenClaims) -> Self {
+        Self {
+            subject: Arc::from(claims.sub),
+            issuer: claims.iss.map(Arc::from),
+            audience: claims.aud.into_iter().map(Arc::from).collect(),
+            groups: claims.groups.into_iter().map(Arc::from).collect(),
+        }
     }
 }
 
@@ -250,6 +298,88 @@ impl TokenValidator for StaticTokenValidator {
             } else {
                 Err(Error::TokenRejected("bearer token did not match".into()))
             }
+        })
+    }
+}
+
+/// JWT bearer token validator.
+#[derive(Clone)]
+pub struct JwtValidator {
+    key: Arc<DecodingKey>,
+    validation: Validation,
+}
+
+impl JwtValidator {
+    /// Builds an HS256 JWT validator.
+    ///
+    /// This is useful for tests and development providers. Production OIDC
+    /// deployments should normally use asymmetric keys from provider metadata,
+    /// which will be added as the discovery/JWKS support grows.
+    pub fn hs256(secret: impl AsRef<[u8]>, config: &OidcConfig) -> Self {
+        let mut validation = Validation::new(Algorithm::HS256);
+        apply_validation_config(&mut validation, config);
+
+        Self {
+            key: Arc::new(DecodingKey::from_secret(secret.as_ref())),
+            validation,
+        }
+    }
+}
+
+impl TokenValidator for JwtValidator {
+    fn validate(&self, token: Arc<str>) -> ValidationFuture {
+        let key = self.key.clone();
+        let validation = self.validation.clone();
+
+        Box::pin(async move {
+            decode::<TokenClaims>(&token, &key, &validation)
+                .map(|data| Principal::from_claims(data.claims))
+                .map_err(|error| Error::TokenRejected(Box::new(error)))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct TokenClaims {
+    sub: String,
+    iss: Option<String>,
+    aud: Vec<String>,
+    groups: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RealmAccess {
+    #[serde(default)]
+    roles: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for TokenClaims {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawClaims {
+            sub: String,
+            #[serde(default)]
+            iss: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_audience")]
+            aud: Vec<String>,
+            #[serde(default)]
+            groups: Vec<String>,
+            #[serde(default)]
+            realm_access: RealmAccess,
+        }
+
+        let mut raw = RawClaims::deserialize(deserializer)?;
+        raw.groups.extend(raw.realm_access.roles);
+        deduplicate(&mut raw.groups);
+
+        Ok(Self {
+            sub: raw.sub,
+            iss: raw.iss,
+            aud: raw.aud,
+            groups: raw.groups,
         })
     }
 }
@@ -400,13 +530,56 @@ fn bearer_token(request: &Request<Body>) -> Result<Arc<str>> {
     Ok(Arc::from(token))
 }
 
+fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
+    let issuer = config
+        .token
+        .issuer
+        .as_deref()
+        .or(config.auth_server_url.as_deref());
+    if let Some(issuer) = issuer {
+        validation.set_issuer(&[issuer]);
+    }
+
+    if let Some(audience) = config.token.audience.as_deref() {
+        validation.set_audience(&[audience]);
+    }
+}
+
+fn deserialize_audience<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?.unwrap_or(Value::Null);
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(audience) => Ok(vec![audience]),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(audience) => Ok(audience),
+                _ => Err(serde::de::Error::custom("audience entries must be strings")),
+            })
+            .collect(),
+        _ => Err(serde::de::Error::custom(
+            "audience must be a string or string array",
+        )),
+    }
+}
+
+fn deduplicate(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::Router;
     use axum::extract::Extension;
     use axum::routing::get;
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use mp_config::MapSource;
+    use serde::Serialize;
     use tower::ServiceExt;
 
     #[test]
@@ -419,7 +592,8 @@ mod tests {
                         "https://issuer.example/realms/app",
                     )
                     .with("quarkus.oidc.client-id", "orders-service")
-                    .with("quarkus.oidc.application-type", "hybrid"),
+                    .with("quarkus.oidc.application-type", "hybrid")
+                    .with("quarkus.oidc.token.audience", "orders-api"),
             )
             .build();
 
@@ -433,6 +607,10 @@ mod tests {
                 auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
                 client_id: Some("orders-service".to_owned()),
                 application_type: ApplicationType::Hybrid,
+                token: OidcTokenConfig {
+                    issuer: None,
+                    audience: Some("orders-api".to_owned()),
+                },
             }
         );
     }
@@ -506,6 +684,68 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn jwt_validator_accepts_signed_token_and_extracts_claims() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec!["admin"],
+            realm_access: RealmAccessClaims {
+                roles: vec!["user"],
+            },
+        });
+
+        let response = claims_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_wrong_issuer() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://other-issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(WWW_AUTHENTICATE).unwrap(),
+            HeaderValue::from_static(r#"Bearer error="invalid_token""#)
+        );
+    }
+
     fn oidc() -> Oidc {
         Oidc::builder(OidcConfig::default())
             .validator(StaticTokenValidator::bearer("test-token", "alice"))
@@ -529,6 +769,27 @@ mod tests {
             .layer(oidc.layer())
     }
 
+    fn claims_app(oidc: Oidc) -> Router {
+        Router::new()
+            .route(
+                "/protected",
+                get(|Extension(principal): Extension<Principal>| async move {
+                    assert_eq!(principal.subject(), "alice");
+                    assert_eq!(
+                        principal.issuer(),
+                        Some("https://issuer.example/realms/app")
+                    );
+                    assert_eq!(principal.audience().collect::<Vec<_>>(), vec!["orders-api"]);
+                    assert_eq!(
+                        principal.groups().collect::<Vec<_>>(),
+                        vec!["admin", "user"]
+                    );
+                    "ok"
+                }),
+            )
+            .layer(oidc.layer())
+    }
+
     fn request(uri: &str, authorization: Option<&str>) -> Request<Body> {
         let mut builder = Request::builder().uri(uri);
         if let Some(authorization) = authorization {
@@ -537,5 +798,29 @@ mod tests {
         builder
             .body(Body::empty())
             .expect("request should be valid")
+    }
+
+    fn jwt(claims: TestClaims<'_>) -> String {
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("test token should encode")
+    }
+
+    #[derive(Serialize)]
+    struct TestClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        exp: u64,
+        groups: Vec<&'a str>,
+        realm_access: RealmAccessClaims<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct RealmAccessClaims<'a> {
+        roles: Vec<&'a str>,
     }
 }

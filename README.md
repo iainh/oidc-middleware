@@ -11,6 +11,7 @@ This crate is in early development. The current implementation includes:
 - `Oidc::layer()` for protecting axum routers.
 - request `Principal` extensions after successful authentication.
 - pluggable bearer-token validation through `TokenValidator`.
+- HS256 JWT validation with issuer, audience, groups, and Keycloak realm roles.
 - Quarkus-style handling for disabled OIDC and disabled tenants.
 
 ```rust
