@@ -221,6 +221,8 @@ pub enum ClientSecretMethod {
     Basic,
     /// Send client credentials as form parameters.
     Post,
+    /// Send client credentials as query parameters.
+    Query,
 }
 
 impl mp_config::FromConfigValue for ClientSecretMethod {
@@ -228,7 +230,10 @@ impl mp_config::FromConfigValue for ClientSecretMethod {
         match value.to_ascii_lowercase().as_str() {
             "basic" => Ok(Self::Basic),
             "post" => Ok(Self::Post),
-            other => Err(format!("expected one of `basic` or `post`, got `{other}`")),
+            "query" => Ok(Self::Query),
+            other => Err(format!(
+                "expected one of `basic`, `post`, or `query`, got `{other}`"
+            )),
         }
     }
 }
@@ -1796,6 +1801,10 @@ fn introspection_request<'a>(
                 ("client_secret", client_secret),
             ])
         }
+        (Some(client_id), Some(client_secret), ClientSecretMethod::Query) => client
+            .post(endpoint)
+            .query(&[("client_id", client_id), ("client_secret", client_secret)])
+            .form(&[("token", token)]),
         _ => client.post(endpoint).form(&[("token", token)]),
     }
 }
@@ -3898,11 +3907,28 @@ dQIDAQAB
     }
 
     #[test]
-    fn config_rejects_unknown_client_secret_method() {
+    fn config_loads_query_client_secret_method() {
         let config = Config::builder()
             .add_source(
                 MapSource::new("test", 100)
                     .with("quarkus.oidc.credentials.client-secret.method", "query"),
+            )
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert_eq!(
+            oidc.credentials.client_secret.method,
+            ClientSecretMethod::Query
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_client_secret_method() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("test", 100)
+                    .with("quarkus.oidc.credentials.client-secret.method", "post-jwt"),
             )
             .build();
 
@@ -3912,7 +3938,7 @@ dQIDAQAB
         assert!(
             error
                 .to_string()
-                .contains("expected one of `basic` or `post`"),
+                .contains("expected one of `basic`, `post`, or `query`"),
             "{error}"
         );
     }
@@ -4413,6 +4439,33 @@ dQIDAQAB
         assert!(body.contains("token=opaque-token"), "{body}");
         assert!(body.contains("client_id=orders-service"), "{body}");
         assert!(body.contains("client_secret=orders-secret"), "{body}");
+    }
+
+    #[test]
+    fn introspection_request_uses_query_client_secret_when_configured() {
+        let request = introspection_request(
+            &reqwest::Client::new(),
+            "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
+            "opaque-token",
+            Some("orders-service"),
+            Some("orders-secret"),
+            ClientSecretMethod::Query,
+        )
+        .build()
+        .expect("request should build");
+        let body = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .and_then(|body| std::str::from_utf8(body).ok())
+            .expect("request body should be buffered form data");
+        let query = request.url().query().expect("query should be present");
+
+        assert!(!request.headers().contains_key(AUTHORIZATION));
+        assert!(body.contains("token=opaque-token"), "{body}");
+        assert!(!body.contains("client_id="), "{body}");
+        assert!(!body.contains("client_secret="), "{body}");
+        assert!(query.contains("client_id=orders-service"), "{query}");
+        assert!(query.contains("client_secret=orders-secret"), "{query}");
     }
 
     #[test]

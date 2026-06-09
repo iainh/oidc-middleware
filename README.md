@@ -54,7 +54,8 @@ This crate is in early development. The current implementation includes:
   validation when JWT or opaque-token introspection is enabled. HTTP
   introspection uses `quarkus.oidc.client-id` with
   `quarkus.oidc.credentials.secret` for Basic authentication by default, or
-  form-post credentials with `quarkus.oidc.credentials.client-secret.method=post`.
+  form-post or query credentials with
+  `quarkus.oidc.credentials.client-secret.method`.
 - UserInfo-backed opaque-token validation through `UserInfoValidator`, custom
   `UserInfoProvider` implementations, or provider-backed installation for
   `quarkus.oidc.token.verify-access-token-with-user-info`.
