@@ -2125,6 +2125,14 @@ fn path_match_score(pattern: &str, request_path: &str) -> Option<usize> {
     if pattern == request_path {
         return Some(1_000_000 + pattern.len());
     }
+    if pattern != "/"
+        && !pattern.ends_with('/')
+        && request_path
+            .strip_suffix('/')
+            .is_some_and(|request_path| request_path == pattern)
+    {
+        return Some(999_000 + pattern.len());
+    }
 
     if pattern == "/*" {
         return Some(1);
@@ -4647,6 +4655,64 @@ dQIDAQAB
             .await
             .expect("request should complete");
 
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authorization_exact_path_matches_trailing_slash() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-exact-path-trailing-slash", 100)
+                        .with("quarkus.http.auth.permission.deny.paths", "/forbidden")
+                        .with("quarkus.http.auth.permission.deny.policy", "deny"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/forbidden", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(request("/forbidden/", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorization_explicit_trailing_slash_path_wins() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-explicit-trailing-slash", 100)
+                        .with("quarkus.http.auth.permission.deny.paths", "/forbidden")
+                        .with("quarkus.http.auth.permission.deny.policy", "deny")
+                        .with("quarkus.http.auth.permission.permit.paths", "/forbidden/")
+                        .with("quarkus.http.auth.permission.permit.policy", "permit"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/forbidden", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(request("/forbidden/", None))
+            .await
+            .expect("request should complete");
         assert_eq!(response.status(), StatusCode::OK);
     }
 

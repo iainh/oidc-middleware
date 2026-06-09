@@ -43,8 +43,9 @@ This crate is in early development. The current implementation includes:
   `quarkus.oidc.roles.role-claim-separator`.
 - Quarkus-style `quarkus.http.auth.permission.*` path policies for `permit`,
   `deny`, `authenticated`, named `roles-allowed` policies, method-specific
-  matches, segment wildcards, method-mismatch rejection, disabled or shared
-  permission entries, and global or policy-local role mappings.
+  matches, exact trailing-slash matching, segment wildcards, method-mismatch
+  rejection, disabled or shared permission entries, and global or policy-local
+  role mappings.
 - `#[roles_allowed(...)]` handler macro for Quarkus-style role checks with the
   `OidcPrincipal` extractor.
 - Quarkus-style handling for disabled OIDC and disabled tenants.
