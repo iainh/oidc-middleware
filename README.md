@@ -45,8 +45,8 @@ This crate is in early development. The current implementation includes:
   `deny`, `authenticated`, named `roles-allowed` policies, method-specific
   matches, `quarkus.http.root-path` relative path handling, exact
   trailing-slash matching, segment wildcards, method-mismatch rejection,
-  disabled or shared permission entries, and global or policy-local role
-  mappings.
+  simultaneous winning role policies, disabled or shared permission entries,
+  and global or policy-local role mappings.
 - `#[roles_allowed(...)]` handler macro for Quarkus-style role checks with the
   `OidcPrincipal` extractor.
 - Quarkus-style handling for disabled OIDC and disabled tenants.
