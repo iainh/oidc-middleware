@@ -194,10 +194,20 @@ pub struct OidcCredentialsConfig {
     pub client_secret: OidcClientSecretConfig,
 }
 
+impl OidcCredentialsConfig {
+    fn effective_client_secret(&self) -> Option<&str> {
+        self.secret
+            .as_deref()
+            .or(self.client_secret.value.as_deref())
+    }
+}
+
 /// Client-secret authentication settings.
 #[derive(Clone, Debug, ConfigProperties, Default, Eq, PartialEq)]
 #[config(rename_all = "kebab-case")]
 pub struct OidcClientSecretConfig {
+    /// Client secret value used when `credentials.secret` is not configured.
+    pub value: Option<String>,
     /// How the client secret is sent to the provider.
     #[config(default)]
     pub method: ClientSecretMethod,
@@ -1758,7 +1768,10 @@ fn http_token_introspector(
         client,
         endpoint,
         client_id: config.client_id.clone(),
-        client_secret: config.credentials.secret.clone(),
+        client_secret: config
+            .credentials
+            .effective_client_secret()
+            .map(ToOwned::to_owned),
         client_secret_method: config.credentials.client_secret.method,
     }
 }
@@ -3788,6 +3801,7 @@ dQIDAQAB
                 credentials: OidcCredentialsConfig {
                     secret: Some("orders-secret".to_owned()),
                     client_secret: OidcClientSecretConfig {
+                        value: None,
                         method: ClientSecretMethod::Post,
                     },
                 },
@@ -3842,6 +3856,44 @@ dQIDAQAB
                 .to_string()
                 .contains("expected one of `accesstoken`, `idtoken`, or `userinfo`"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn config_loads_client_secret_value() {
+        let config = Config::builder()
+            .add_source(MapSource::new("test", 100).with(
+                "quarkus.oidc.credentials.client-secret.value",
+                "orders-secret",
+            ))
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert_eq!(
+            oidc.credentials.effective_client_secret(),
+            Some("orders-secret")
+        );
+    }
+
+    #[test]
+    fn config_prefers_credentials_secret_over_client_secret_value() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("test", 100)
+                    .with("quarkus.oidc.credentials.secret", "primary-secret")
+                    .with(
+                        "quarkus.oidc.credentials.client-secret.value",
+                        "fallback-secret",
+                    ),
+            )
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert_eq!(
+            oidc.credentials.effective_client_secret(),
+            Some("primary-secret")
         );
     }
 
@@ -4377,6 +4429,28 @@ dQIDAQAB
         .expect("request should build");
 
         assert!(!request.headers().contains_key(AUTHORIZATION));
+    }
+
+    #[test]
+    fn http_introspector_uses_client_secret_value() {
+        let config = OidcConfig {
+            client_id: Some("orders-service".to_owned()),
+            credentials: OidcCredentialsConfig {
+                client_secret: OidcClientSecretConfig {
+                    value: Some("orders-secret".to_owned()),
+                    ..OidcClientSecretConfig::default()
+                },
+                ..OidcCredentialsConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let introspector = http_token_introspector(
+            &config,
+            reqwest::Client::new(),
+            "https://issuer.example/realms/app/protocol/openid-connect/token/introspect".to_owned(),
+        );
+
+        assert_eq!(introspector.client_secret.as_deref(), Some("orders-secret"));
     }
 
     #[tokio::test]
@@ -6436,6 +6510,7 @@ dQIDAQAB
             OidcCredentialsConfig {
                 secret: Some("tenant-secret".to_owned()),
                 client_secret: OidcClientSecretConfig {
+                    value: None,
                     method: ClientSecretMethod::Post,
                 },
             }
