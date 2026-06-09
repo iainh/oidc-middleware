@@ -12,8 +12,8 @@ This crate is in early development. The current implementation includes:
 - request `Principal` extensions after successful authentication.
 - pluggable bearer-token validation through `TokenValidator`.
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`.
-- Audience validation from `quarkus.oidc.token.audience`, defaulting to
-  `quarkus.oidc.client-id` when present.
+- Audience validation from one or more `quarkus.oidc.token.audience` values,
+  defaulting to `quarkus.oidc.client-id` when present.
 - JWT `typ` claim enforcement with `quarkus.oidc.token.token-type`.
 - Optional `sub` enforcement with `quarkus.oidc.token.subject-required`.
 - JWT string claim enforcement with `quarkus.oidc.token.required-claims.*`.

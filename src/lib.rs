@@ -202,6 +202,12 @@ impl ConfigProperties for OidcTokenConfig {
     }
 }
 
+impl OidcTokenConfig {
+    fn audiences(&self) -> Vec<String> {
+        self.audience.as_deref().map(split_csv).unwrap_or_default()
+    }
+}
+
 /// Role extraction configuration loaded from `quarkus.oidc.roles.*`.
 #[derive(Clone, Debug, ConfigProperties, Eq, PartialEq)]
 #[config(rename_all = "kebab-case")]
@@ -1740,13 +1746,13 @@ fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
         validation.set_issuer(&[issuer]);
     }
 
-    if let Some(audience) = config
-        .token
-        .audience
-        .as_deref()
-        .or(config.client_id.as_deref())
-    {
-        validation.set_audience(&[audience]);
+    let audiences = config.token.audiences();
+    if audiences.is_empty() {
+        if let Some(client_id) = config.client_id.as_deref() {
+            validation.set_audience(&[client_id]);
+        }
+    } else {
+        validation.set_audience(&audiences);
     }
 }
 
@@ -2426,6 +2432,68 @@ mod tests {
             aud: "other-api",
             exp: 4_102_444_800,
             groups: vec!["admin"],
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_accepts_any_configured_audience() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api,billing-api".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "billing-api",
+            exp: 4_102_444_800,
+            groups: vec!["admin"],
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_unlisted_configured_audience() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api,billing-api".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "inventory-api",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
             realm_access: RealmAccessClaims { roles: Vec::new() },
         });
 
