@@ -85,6 +85,13 @@ fn expand_roles_allowed(roles: RolesAllowedArgs, function: &mut ItemFn) -> Token
         );
     }
 
+    if !errors.is_empty() {
+        return quote! {
+            #function
+            #(#errors)*
+        };
+    }
+
     let role_values = roles.roles.iter();
     let check = quote! {
         if !principal.has_any_group([#(#role_values),*]) {

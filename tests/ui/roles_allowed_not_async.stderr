@@ -1,0 +1,5 @@
+error: roles_allowed handlers must be async
+ --> tests/ui/roles_allowed_not_async.rs:4:4
+  |
+4 | fn admin(principal: OidcPrincipal) -> Result<(), Error> {
+  |    ^^^^^

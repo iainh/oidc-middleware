@@ -28,3 +28,4 @@ tower-service = "0.3"
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
+trybuild = "1"
