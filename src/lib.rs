@@ -3715,6 +3715,26 @@ dQIDAQAB
         );
     }
 
+    #[test]
+    fn config_rejects_unknown_client_secret_method() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("test", 100)
+                    .with("quarkus.oidc.credentials.client-secret.method", "query"),
+            )
+            .build();
+
+        let error =
+            OidcConfig::from_config(&config).expect_err("client secret method should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected one of `basic` or `post`"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn disabled_oidc_allows_request_without_bearer_token() {
         let response = public_app(
@@ -6116,6 +6136,34 @@ dQIDAQAB
         let _tenants = Tenants::from_config(&config)
             .expect("quoted tenant config should load")
             .build();
+    }
+
+    #[test]
+    fn tenants_detect_named_tenant_credentials_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-credentials", 100)
+                    .with("quarkus.oidc.tenant-a.credentials.secret", "tenant-secret")
+                    .with(
+                        "quarkus.oidc.tenant-a.credentials.client-secret.method",
+                        "post",
+                    ),
+            )
+            .build();
+
+        assert_eq!(named_tenant_names(&config), vec!["tenant-a".to_owned()]);
+
+        let tenant = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a")
+            .expect("tenant credentials should load");
+        assert_eq!(
+            tenant.credentials,
+            OidcCredentialsConfig {
+                secret: Some("tenant-secret".to_owned()),
+                client_secret: OidcClientSecretConfig {
+                    method: ClientSecretMethod::Post,
+                },
+            }
+        );
     }
 
     #[tokio::test]
