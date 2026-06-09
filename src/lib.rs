@@ -2171,7 +2171,8 @@ impl Oidc {
 
     /// Loads configuration from `quarkus.oidc.*` and starts building.
     pub fn from_config(config: &Config) -> mp_config::Result<OidcBuilder> {
-        oidc_builder_from_config(OidcConfig::from_config(config)?, "quarkus.oidc.public-key")
+        oidc_builder_from_config(OidcConfig::from_config(config)?, "quarkus.oidc.public-key")?
+            .authorization_from_config(config)
     }
 
     /// Returns a tower layer suitable for `Router::layer`.
@@ -2273,6 +2274,13 @@ impl OidcBuilder {
     pub fn authorization(mut self, authorization: Authorization) -> Self {
         self.authorization = Some(authorization);
         self
+    }
+
+    fn authorization_from_config(mut self, config: &Config) -> mp_config::Result<Self> {
+        if has_authorization_config(config) {
+            self.authorization = Some(Authorization::from_config(config)?);
+        }
+        Ok(self)
     }
 
     /// Installs a `quarkus.oidc.public-key` backed JWT validator.
@@ -3116,6 +3124,10 @@ fn permission_names(config: &Config) -> Vec<String> {
     }
 
     names.into_iter().collect()
+}
+
+fn has_authorization_config(config: &Config) -> bool {
+    !permission_names(config).is_empty()
 }
 
 fn policy_from_config(
@@ -4553,6 +4565,42 @@ dQIDAQAB
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oidc_from_config_applies_http_authorization() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("authz", 100)
+                    .with("quarkus.http.auth.permission.public.paths", "/public")
+                    .with("quarkus.http.auth.permission.public.policy", "permit")
+                    .with("quarkus.http.auth.permission.private.paths", "/private")
+                    .with(
+                        "quarkus.http.auth.permission.private.policy",
+                        "authenticated",
+                    ),
+            )
+            .build();
+        let app = Router::new().fallback(|| async { "ok" }).layer(
+            Oidc::from_config(&config)
+                .expect("OIDC config should load")
+                .validator(StaticTokenValidator::bearer("test-token", "alice"))
+                .build()
+                .layer(),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(request("/public", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(request("/private", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
