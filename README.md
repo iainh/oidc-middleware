@@ -14,6 +14,8 @@ This crate is in early development. The current implementation includes:
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`.
 - Audience validation from `quarkus.oidc.token.audience`, defaulting to
   `quarkus.oidc.client-id` when present.
+- Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths` and optional
+  header-based tenant selection.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
 - Configurable role extraction with `quarkus.oidc.roles.role-claim-path`.

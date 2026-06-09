@@ -86,6 +86,8 @@ pub struct OidcConfig {
     pub auth_server_url: Option<String>,
     /// Client identifier expected by the provider.
     pub client_id: Option<String>,
+    /// Paths that should select this tenant.
+    pub tenant_paths: Option<String>,
     /// Quarkus-style application type.
     #[config(default)]
     pub application_type: ApplicationType,
@@ -111,6 +113,7 @@ impl Default for OidcConfig {
             tenant_enabled: true,
             auth_server_url: None,
             client_id: None,
+            tenant_paths: None,
             application_type: ApplicationType::Service,
             token: OidcTokenConfig::default(),
             roles: OidcRolesConfig::default(),
@@ -958,6 +961,191 @@ where
     }
 }
 
+/// Multi-tenant OIDC middleware.
+#[derive(Clone, Default)]
+pub struct Tenants {
+    tenants: Arc<[RegisteredTenant]>,
+    default_tenant: Option<Oidc>,
+    header_name: Option<http::HeaderName>,
+}
+
+impl Tenants {
+    /// Starts building a multi-tenant OIDC layer.
+    pub fn builder() -> TenantsBuilder {
+        TenantsBuilder::default()
+    }
+
+    /// Loads the default tenant and named tenants from `mp-config`.
+    ///
+    /// The default tenant uses `quarkus.oidc.*`; named tenants use
+    /// `quarkus.oidc.<tenant>.*`. Tenant selection uses each tenant's
+    /// `tenant-paths` property.
+    pub fn from_config(config: &Config) -> mp_config::Result<TenantsBuilder> {
+        let mut builder = Tenants::builder();
+        if has_default_tenant_config(config) {
+            let default_config = OidcConfig::from_config(config)?;
+            builder = builder.default_tenant(Oidc::builder(default_config).build());
+        }
+
+        for name in named_tenant_names(config) {
+            let tenant_config =
+                OidcConfig::from_config_prefix(config, &format!("quarkus.oidc.{name}"))?;
+            builder = builder.tenant(name, Oidc::builder(tenant_config).build());
+        }
+
+        Ok(builder)
+    }
+
+    /// Returns a tower layer suitable for `Router::layer`.
+    pub fn layer(self) -> TenantsLayer {
+        TenantsLayer { tenants: self }
+    }
+
+    fn select(&self, request: &Request<Body>) -> Option<&Oidc> {
+        if let Some(header_name) = &self.header_name {
+            if let Some(value) = request
+                .headers()
+                .get(header_name)
+                .and_then(|value| value.to_str().ok())
+            {
+                if let Some(tenant) = self
+                    .tenants
+                    .iter()
+                    .find(|tenant| tenant.name.as_ref() == value)
+                {
+                    return Some(&tenant.oidc);
+                }
+            }
+        }
+
+        let path = request.uri().path();
+        self.tenants
+            .iter()
+            .filter_map(|tenant| tenant.match_score(path).map(|score| (score, tenant)))
+            .max_by_key(|(score, _)| *score)
+            .map(|(_, tenant)| &tenant.oidc)
+            .or(self.default_tenant.as_ref())
+    }
+}
+
+/// Builder for [`Tenants`].
+#[derive(Default)]
+pub struct TenantsBuilder {
+    tenants: Vec<RegisteredTenant>,
+    default_tenant: Option<Oidc>,
+    header_name: Option<http::HeaderName>,
+}
+
+impl TenantsBuilder {
+    /// Sets the fallback tenant used when no named tenant matches.
+    pub fn default_tenant(mut self, oidc: Oidc) -> Self {
+        self.default_tenant = Some(oidc);
+        self
+    }
+
+    /// Adds a named tenant.
+    pub fn tenant(mut self, name: impl Into<String>, oidc: Oidc) -> Self {
+        let name = Arc::from(name.into());
+        let tenant_paths = oidc
+            .config
+            .tenant_paths
+            .as_deref()
+            .map(split_csv)
+            .unwrap_or_default();
+        self.tenants.push(RegisteredTenant {
+            name,
+            tenant_paths,
+            oidc,
+        });
+        self
+    }
+
+    /// Selects tenants from a request header before path matching.
+    pub fn tenant_header(mut self, header_name: http::HeaderName) -> Self {
+        self.header_name = Some(header_name);
+        self
+    }
+
+    /// Finishes the tenant registry.
+    pub fn build(self) -> Tenants {
+        Tenants {
+            tenants: Arc::from(self.tenants),
+            default_tenant: self.default_tenant,
+            header_name: self.header_name,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RegisteredTenant {
+    name: Arc<str>,
+    tenant_paths: Vec<String>,
+    oidc: Oidc,
+}
+
+impl RegisteredTenant {
+    fn match_score(&self, request_path: &str) -> Option<usize> {
+        self.tenant_paths
+            .iter()
+            .filter_map(|path| path_match_score(path, request_path))
+            .max()
+    }
+}
+
+/// Tower layer produced by [`Tenants::layer`].
+#[derive(Clone)]
+pub struct TenantsLayer {
+    tenants: Tenants,
+}
+
+impl<S> Layer<S> for TenantsLayer {
+    type Service = TenantsService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TenantsService {
+            inner,
+            tenants: self.tenants.clone(),
+        }
+    }
+}
+
+/// Tower service that selects a tenant and authenticates requests.
+#[derive(Clone)]
+pub struct TenantsService<S> {
+    inner: S,
+    tenants: Tenants,
+}
+
+impl<S> Service<Request<Body>> for TenantsService<S>
+where
+    S: Service<Request<Body>, Response = Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Response, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        let tenants = self.tenants.clone();
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let Some(tenant) = tenants.select(&request) else {
+                return inner.call(request).await;
+            };
+
+            match tenant.authenticate(&mut request).await {
+                Ok(()) => inner.call(request).await,
+                Err(error) => Ok(error.into_response()),
+            }
+        })
+    }
+}
+
 fn load_role_policies(config: &Config) -> mp_config::Result<HashMap<String, Vec<String>>> {
     let mut policies = HashMap::new();
 
@@ -973,6 +1161,43 @@ fn load_role_policies(config: &Config) -> mp_config::Result<HashMap<String, Vec<
     }
 
     Ok(policies)
+}
+
+fn has_default_tenant_config(config: &Config) -> bool {
+    config.property_names().into_iter().any(|key| {
+        key == "quarkus.oidc.enabled"
+            || key == "quarkus.oidc.tenant-enabled"
+            || key == "quarkus.oidc.auth-server-url"
+            || key == "quarkus.oidc.client-id"
+            || key == "quarkus.oidc.tenant-paths"
+            || key == "quarkus.oidc.application-type"
+    })
+}
+
+fn named_tenant_names(config: &Config) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for key in config.property_names() {
+        let Some(rest) = key.strip_prefix("quarkus.oidc.") else {
+            continue;
+        };
+        let Some((name, property)) = rest.split_once('.') else {
+            continue;
+        };
+        if !matches!(name, "token" | "roles")
+            && matches!(
+                property,
+                "enabled"
+                    | "tenant-enabled"
+                    | "auth-server-url"
+                    | "client-id"
+                    | "tenant-paths"
+                    | "application-type"
+            )
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    names.into_iter().collect()
 }
 
 fn permission_names(config: &Config) -> Vec<String> {
@@ -1189,6 +1414,7 @@ mod tests {
                 tenant_enabled: true,
                 auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
                 client_id: Some("orders-service".to_owned()),
+                tenant_paths: None,
                 application_type: ApplicationType::Hybrid,
                 token: OidcTokenConfig {
                     issuer: None,
@@ -1557,6 +1783,103 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn tenants_load_named_tenant_paths_from_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenants", 100)
+                    .with("quarkus.oidc.tenant-paths", "/api/default")
+                    .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
+                    .with("quarkus.oidc.tenant-a.client-id", "tenant-a-client")
+                    .with("quarkus.oidc.tenant-b.tenant-enabled", "false")
+                    .with("quarkus.oidc.tenant-b.tenant-paths", "/api/b/*"),
+            )
+            .build();
+
+        assert_eq!(
+            named_tenant_names(&config),
+            vec!["tenant-a".to_owned(), "tenant-b".to_owned()]
+        );
+
+        let tenant_a = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a").unwrap();
+        assert_eq!(tenant_a.tenant_paths, Some("/api/a/*".to_owned()));
+        assert_eq!(tenant_a.client_id, Some("tenant-a-client".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn tenants_select_by_most_specific_tenant_path() {
+        let response = tenant_app(
+            Tenants::builder()
+                .default_tenant(static_tenant("default-token", "default"))
+                .tenant(
+                    "tenant-a",
+                    static_tenant_with_paths("a-token", "tenant-a", "/api/a/*"),
+                )
+                .tenant(
+                    "tenant-b",
+                    static_tenant_with_paths("b-token", "tenant-b", "/api/a/special"),
+                )
+                .build(),
+        )
+        .oneshot(request("/api/a/special", Some("Bearer b-token")))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tenants_select_by_header_before_path() {
+        let response = tenant_app(
+            Tenants::builder()
+                .tenant_header(http::HeaderName::from_static("x-oidc-tenant"))
+                .tenant(
+                    "tenant-a",
+                    static_tenant_with_paths("a-token", "tenant-a", "/api/a/*"),
+                )
+                .tenant(
+                    "tenant-b",
+                    static_tenant_with_paths("b-token", "tenant-b", "/api/b/*"),
+                )
+                .build(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/api/a/resource")
+                .header(AUTHORIZATION, "Bearer b-token")
+                .header("x-oidc-tenant", "tenant-b")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tenants_preserve_disabled_tenant_behaviour() {
+        let response = tenant_app(
+            Tenants::builder()
+                .tenant(
+                    "tenant-a",
+                    Oidc::builder(OidcConfig {
+                        tenant_enabled: false,
+                        tenant_paths: Some("/api/a/*".to_owned()),
+                        ..OidcConfig::default()
+                    })
+                    .validator(StaticTokenValidator::bearer("a-token", "tenant-a"))
+                    .build(),
+                )
+                .build(),
+        )
+        .oneshot(request("/api/a/resource", Some("Bearer a-token")))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn authorization_matches_quarkus_default_deny_permissions() {
         let authorization = Authorization::from_config(
@@ -1775,6 +2098,29 @@ mod tests {
                 .build()
                 .layer(),
         )
+    }
+
+    fn tenant_app(tenants: Tenants) -> Router {
+        Router::new()
+            .fallback(|Extension(principal): Extension<Principal>| async move {
+                principal.subject().to_owned()
+            })
+            .layer(tenants.layer())
+    }
+
+    fn static_tenant(token: &str, subject: &str) -> Oidc {
+        Oidc::builder(OidcConfig::default())
+            .validator(StaticTokenValidator::bearer(token, subject))
+            .build()
+    }
+
+    fn static_tenant_with_paths(token: &str, subject: &str, paths: &str) -> Oidc {
+        Oidc::builder(OidcConfig {
+            tenant_paths: Some(paths.to_owned()),
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer(token, subject))
+        .build()
     }
 
     fn claims_app(oidc: Oidc) -> Router {
