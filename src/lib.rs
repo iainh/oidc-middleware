@@ -1374,7 +1374,13 @@ fn claim_string_values(claims: &TokenClaims, claim_name: &str) -> Option<Vec<Str
 
 fn json_string_values(value: &Value) -> Option<Vec<String>> {
     match value {
-        Value::String(value) => Some(vec![value.clone()]),
+        Value::String(value) => {
+            let mut values = vec![value.clone()];
+            values.extend(value.split_whitespace().map(ToOwned::to_owned));
+            values.sort();
+            values.dedup();
+            Some(values)
+        }
         Value::Array(values) => values
             .iter()
             .map(|value| value.as_str().map(ToOwned::to_owned))
@@ -3816,6 +3822,41 @@ dQIDAQAB
     }
 
     #[tokio::test]
+    async fn jwt_validator_accepts_space_separated_required_claim_values() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                required_claims: HashMap::from([(
+                    "scope".to_owned(),
+                    vec!["read".to_owned(), "write".to_owned()],
+                )]),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(StringScopeClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            scope: "read write delete",
+            exp: 4_102_444_800,
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn jwt_validator_accepts_nested_required_claim_values() {
         let config = OidcConfig {
             auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
@@ -5814,6 +5855,15 @@ dQIDAQAB
         aud: &'a str,
         org_id: &'a str,
         scope: Vec<&'a str>,
+        exp: u64,
+    }
+
+    #[derive(Serialize)]
+    struct StringScopeClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
         exp: u64,
     }
 
