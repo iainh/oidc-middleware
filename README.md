@@ -11,7 +11,9 @@ This crate is in early development. The current implementation includes:
 - `Oidc::layer()` for protecting axum routers.
 - request `Principal` extensions after successful authentication.
 - pluggable bearer-token validation through `TokenValidator`.
-- OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`.
+- OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`,
+  including `quarkus.oidc.discovery-path` and direct `jwks-path` loading when
+  `quarkus.oidc.discovery-enabled=false`.
 - Local JWT verification with `quarkus.oidc.public-key`.
 - Audience validation from one or more `quarkus.oidc.token.audience` values,
   defaulting to `quarkus.oidc.client-id` when present.

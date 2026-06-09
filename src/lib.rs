@@ -90,6 +90,14 @@ pub struct OidcConfig {
     pub tenant_enabled: bool,
     /// Base URL of the OpenID Connect provider or realm.
     pub auth_server_url: Option<String>,
+    /// Enables OIDC provider metadata discovery.
+    #[config(default = "true")]
+    pub discovery_enabled: bool,
+    /// Relative or absolute OIDC provider metadata discovery path.
+    #[config(default = ".well-known/openid-configuration")]
+    pub discovery_path: String,
+    /// Relative or absolute JWKS endpoint used when discovery is disabled.
+    pub jwks_path: Option<String>,
     /// Client identifier expected by the provider.
     pub client_id: Option<String>,
     /// Paths that should select this tenant.
@@ -120,6 +128,9 @@ impl Default for OidcConfig {
             enabled: true,
             tenant_enabled: true,
             auth_server_url: None,
+            discovery_enabled: true,
+            discovery_path: ".well-known/openid-configuration".to_owned(),
+            jwks_path: None,
             client_id: None,
             tenant_paths: None,
             public_key: None,
@@ -536,6 +547,8 @@ impl IntoResponse for Error {
 pub enum BuildError {
     /// Provider discovery requires `quarkus.oidc.auth-server-url`.
     MissingAuthServerUrl,
+    /// Direct JWKS loading requires `quarkus.oidc.jwks-path`.
+    MissingJwksPath,
     /// The configured public key could not be parsed.
     InvalidPublicKey(BoxError),
     /// A configured provider or metadata URL could not be parsed.
@@ -550,6 +563,10 @@ impl fmt::Display for BuildError {
             Self::MissingAuthServerUrl => write!(
                 f,
                 "OIDC provider discovery requires `quarkus.oidc.auth-server-url`"
+            ),
+            Self::MissingJwksPath => write!(
+                f,
+                "OIDC JWKS loading requires `quarkus.oidc.jwks-path` when discovery is disabled"
             ),
             Self::InvalidPublicKey(source) => write!(f, "invalid OIDC public key: {source}"),
             Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
@@ -1469,7 +1486,7 @@ impl OidcBuilder {
 
     /// Discovers provider metadata using a caller-supplied HTTP client.
     pub async fn discover_with_client(self, client: reqwest::Client) -> BuildResult<Oidc> {
-        if !self.config.enabled {
+        if !self.config.enabled || self.config.public_key.is_some() {
             return Ok(self.build());
         }
 
@@ -1478,7 +1495,26 @@ impl OidcBuilder {
             .auth_server_url
             .clone()
             .ok_or(BuildError::MissingAuthServerUrl)?;
-        let metadata_url = discovery_url(&auth_server_url)?;
+        if !self.config.discovery_enabled {
+            let jwks_path = self
+                .config
+                .jwks_path
+                .clone()
+                .ok_or(BuildError::MissingJwksPath)?;
+            let jwks_url = provider_endpoint_url(&auth_server_url, &jwks_path)?;
+            let jwks: JwkSet = client
+                .get(jwks_url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let mut builder = self;
+            builder.validator = Some(Arc::new(JwtValidator::jwks(jwks, &builder.config)));
+            return Ok(builder.build());
+        }
+
+        let metadata_url = discovery_url(&auth_server_url, &self.config.discovery_path)?;
         let metadata: ProviderMetadata = client
             .get(metadata_url)
             .send()
@@ -1876,6 +1912,9 @@ fn has_default_tenant_config(config: &Config) -> bool {
         key == "quarkus.oidc.enabled"
             || key == "quarkus.oidc.tenant-enabled"
             || key == "quarkus.oidc.auth-server-url"
+            || key == "quarkus.oidc.discovery-enabled"
+            || key == "quarkus.oidc.discovery-path"
+            || key == "quarkus.oidc.jwks-path"
             || key == "quarkus.oidc.client-id"
             || key == "quarkus.oidc.tenant-paths"
             || key == "quarkus.oidc.public-key"
@@ -1899,6 +1938,9 @@ fn named_tenant_names(config: &Config) -> Vec<String> {
                 "enabled"
                     | "tenant-enabled"
                     | "auth-server-url"
+                    | "discovery-enabled"
+                    | "discovery-path"
+                    | "jwks-path"
                     | "client-id"
                     | "tenant-paths"
                     | "public-key"
@@ -2060,11 +2102,20 @@ fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc
     Ok(Arc::from(token))
 }
 
-fn discovery_url(auth_server_url: &str) -> BuildResult<reqwest::Url> {
-    let url = format!(
-        "{}/.well-known/openid-configuration",
-        auth_server_url.trim_end_matches('/')
-    );
+fn discovery_url(auth_server_url: &str, discovery_path: &str) -> BuildResult<reqwest::Url> {
+    provider_endpoint_url(auth_server_url, discovery_path)
+}
+
+fn provider_endpoint_url(auth_server_url: &str, path: &str) -> BuildResult<reqwest::Url> {
+    let url = if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_owned()
+    } else {
+        format!(
+            "{}/{}",
+            auth_server_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    };
     reqwest::Url::parse(&url).map_err(|error| BuildError::InvalidUrl {
         url,
         message: error.to_string(),
@@ -2318,6 +2369,9 @@ dQIDAQAB
                         "quarkus.oidc.auth-server-url",
                         "https://issuer.example/realms/app",
                     )
+                    .with("quarkus.oidc.discovery-enabled", "false")
+                    .with("quarkus.oidc.discovery-path", "custom-discovery")
+                    .with("quarkus.oidc.jwks-path", "protocol/openid-connect/certs")
                     .with("quarkus.oidc.client-id", "orders-service")
                     .with("quarkus.oidc.public-key", "configured-public-key")
                     .with("quarkus.oidc.application-type", "hybrid")
@@ -2348,6 +2402,9 @@ dQIDAQAB
                 enabled: true,
                 tenant_enabled: true,
                 auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+                discovery_enabled: false,
+                discovery_path: "custom-discovery".to_owned(),
+                jwks_path: Some("protocol/openid-connect/certs".to_owned()),
                 client_id: Some("orders-service".to_owned()),
                 tenant_paths: None,
                 public_key: Some("configured-public-key".to_owned()),
@@ -3581,17 +3638,67 @@ dQIDAQAB
     #[test]
     fn discovery_url_appends_well_known_path() {
         assert_eq!(
-            discovery_url("https://issuer.example/realms/app")
-                .expect("discovery URL should parse")
-                .as_str(),
+            discovery_url(
+                "https://issuer.example/realms/app",
+                ".well-known/openid-configuration"
+            )
+            .expect("discovery URL should parse")
+            .as_str(),
             "https://issuer.example/realms/app/.well-known/openid-configuration"
         );
         assert_eq!(
-            discovery_url("https://issuer.example/realms/app/")
-                .expect("discovery URL should parse")
-                .as_str(),
+            discovery_url(
+                "https://issuer.example/realms/app/",
+                ".well-known/openid-configuration"
+            )
+            .expect("discovery URL should parse")
+            .as_str(),
             "https://issuer.example/realms/app/.well-known/openid-configuration"
         );
+        assert_eq!(
+            discovery_url("https://issuer.example/realms/app", "custom-discovery")
+                .expect("discovery URL should parse")
+                .as_str(),
+            "https://issuer.example/realms/app/custom-discovery"
+        );
+    }
+
+    #[test]
+    fn provider_endpoint_url_supports_relative_and_absolute_paths() {
+        assert_eq!(
+            provider_endpoint_url(
+                "https://issuer.example/realms/app",
+                "/protocol/openid-connect/certs"
+            )
+            .expect("endpoint URL should parse")
+            .as_str(),
+            "https://issuer.example/realms/app/protocol/openid-connect/certs"
+        );
+        assert_eq!(
+            provider_endpoint_url(
+                "https://issuer.example/realms/app",
+                "https://keys.example/jwks"
+            )
+            .expect("endpoint URL should parse")
+            .as_str(),
+            "https://keys.example/jwks"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_disabled_requires_jwks_path() {
+        let result = Oidc::builder(OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            discovery_enabled: false,
+            ..OidcConfig::default()
+        })
+        .discover()
+        .await;
+        let Err(error) = result else {
+            panic!("disabled discovery requires jwks-path");
+        };
+
+        assert!(matches!(error, BuildError::MissingJwksPath));
     }
 
     #[test]
