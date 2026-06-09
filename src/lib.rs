@@ -61,6 +61,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_layer::Layer;
 use tower_service::Service;
 
@@ -137,6 +138,10 @@ pub struct OidcTokenConfig {
     pub token_type: Option<String>,
     /// Required claims and their expected string values.
     pub required_claims: HashMap<String, Vec<String>>,
+    /// Grace period applied to token expiry and issued-at checks.
+    pub lifespan_grace: Option<u64>,
+    /// Maximum age allowed since the token `iat` claim.
+    pub age: Option<Duration>,
 }
 
 impl ConfigProperties for OidcTokenConfig {
@@ -158,6 +163,8 @@ impl ConfigProperties for OidcTokenConfig {
             audience: config.get_optional(&key("audience"))?,
             token_type: config.get_optional(&key("token-type"))?,
             required_claims: load_required_claims(config, &key("required-claims"))?,
+            lifespan_grace: config.get_optional(&key("lifespan-grace"))?,
+            age: config.get_optional(&key("age"))?,
         })
     }
 }
@@ -656,6 +663,7 @@ pub struct JwtValidator {
     role_claim_paths: Arc<[String]>,
     token_type: Option<Arc<str>>,
     required_claims: Arc<HashMap<String, Vec<String>>>,
+    token_age: Option<Duration>,
 }
 
 impl JwtValidator {
@@ -674,6 +682,7 @@ impl JwtValidator {
             role_claim_paths: Arc::from(config.roles.claim_paths()),
             token_type: config.token.token_type.clone().map(Arc::from),
             required_claims: Arc::new(config.token.required_claims.clone()),
+            token_age: config.token.age,
         }
     }
 
@@ -698,6 +707,7 @@ impl JwtValidator {
             role_claim_paths: Arc::from(config.roles.claim_paths()),
             token_type: config.token.token_type.clone().map(Arc::from),
             required_claims: Arc::new(config.token.required_claims.clone()),
+            token_age: config.token.age,
         }
     }
 
@@ -727,6 +737,7 @@ impl JwtValidator {
             role_claim_paths: Arc::from(config.roles.claim_paths()),
             token_type: config.token.token_type.clone().map(Arc::from),
             required_claims: Arc::new(config.token.required_claims.clone()),
+            token_age: config.token.age,
         }
     }
 }
@@ -738,6 +749,8 @@ impl TokenValidator for JwtValidator {
         let role_claim_paths = self.role_claim_paths.clone();
         let token_type = self.token_type.clone();
         let required_claims = self.required_claims.clone();
+        let token_age = self.token_age;
+        let leeway = validation.leeway;
 
         Box::pin(async move {
             let key = keys.decoding_key(&token).await?;
@@ -746,6 +759,7 @@ impl TokenValidator for JwtValidator {
                 .and_then(|data| {
                     validate_token_type(&data.claims, token_type.as_deref())?;
                     validate_required_claims(&data.claims, &required_claims)?;
+                    validate_token_age(&data.claims, token_age, leeway)?;
                     Ok(Principal::from_claims(data.claims, &role_claim_paths))
                 })
         })
@@ -896,12 +910,48 @@ fn validate_required_claims(
     Ok(())
 }
 
+fn validate_token_age(claims: &TokenClaims, max_age: Option<Duration>, leeway: u64) -> Result<()> {
+    let Some(max_age) = max_age else {
+        return Ok(());
+    };
+    let issued_at = claims.iat.ok_or_else(|| {
+        Error::TokenRejected("JWT iat claim is required for token age validation".into())
+    })?;
+    let now = unix_timestamp()?;
+
+    if issued_at > now.saturating_add(leeway) {
+        return Err(Error::TokenRejected(
+            "JWT iat claim is later than the allowed lifespan grace".into(),
+        ));
+    }
+
+    if now
+        > issued_at
+            .saturating_add(max_age.as_secs())
+            .saturating_add(leeway)
+    {
+        return Err(Error::TokenRejected(
+            "JWT age exceeded the configured token age".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn unix_timestamp() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| Error::TokenRejected(Box::new(error)))
+}
+
 fn claim_string_values(claims: &TokenClaims, claim_name: &str) -> Option<Vec<String>> {
     match claim_name {
         "sub" => Some(vec![claims.sub.clone()]),
         "iss" => claims.iss.clone().map(|issuer| vec![issuer]),
         "aud" => Some(claims.aud.clone()),
         "typ" => claims.typ.clone().map(|token_type| vec![token_type]),
+        "iat" => claims.iat.map(|issued_at| vec![issued_at.to_string()]),
         _ => json_string_values(claims.extra.get(claim_name)?),
     }
 }
@@ -934,6 +984,7 @@ struct TokenClaims {
     iss: Option<String>,
     aud: Vec<String>,
     typ: Option<String>,
+    iat: Option<u64>,
     extra: Value,
 }
 
@@ -951,6 +1002,8 @@ impl<'de> Deserialize<'de> for TokenClaims {
             aud: Vec<String>,
             #[serde(default)]
             typ: Option<String>,
+            #[serde(default)]
+            iat: Option<u64>,
             #[serde(flatten)]
             extra: serde_json::Map<String, Value>,
         }
@@ -962,6 +1015,7 @@ impl<'de> Deserialize<'de> for TokenClaims {
             iss: raw.iss,
             aud: raw.aud,
             typ: raw.typ,
+            iat: raw.iat,
             extra: Value::Object(raw.extra),
         })
     }
@@ -1552,6 +1606,8 @@ fn discovery_url(auth_server_url: &str) -> BuildResult<reqwest::Url> {
 }
 
 fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
+    validation.leeway = config.token.lifespan_grace.unwrap_or_default();
+
     let issuer = config
         .token
         .issuer
@@ -1671,6 +1727,8 @@ mod tests {
                     .with("quarkus.oidc.token.token-type", "bearer")
                     .with("quarkus.oidc.token.required-claims.org_id", "org_xyz")
                     .with("quarkus.oidc.token.required-claims.scope", "read,write")
+                    .with("quarkus.oidc.token.lifespan-grace", "5")
+                    .with("quarkus.oidc.token.age", "60s")
                     .with(
                         "quarkus.oidc.roles.role-claim-path",
                         "resource_access.api.roles",
@@ -1700,6 +1758,8 @@ mod tests {
                             vec!["read".to_owned(), "write".to_owned()],
                         ),
                     ]),
+                    lifespan_grace: Some(5),
+                    age: Some(Duration::from_secs(60)),
                 },
                 roles: OidcRolesConfig {
                     role_claim_path: "resource_access.api.roles".to_owned(),
@@ -2090,6 +2150,101 @@ mod tests {
             org_id: "org_xyz",
             scope: vec!["read"],
             exp: 4_102_444_800,
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_accepts_expiry_within_lifespan_grace() {
+        let now = unix_timestamp().expect("system time should be after epoch");
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                lifespan_grace: Some(5),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TimeClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: now - 2,
+            iat: now - 30,
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_token_older_than_configured_age() {
+        let now = unix_timestamp().expect("system time should be after epoch");
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                age: Some(Duration::from_secs(5)),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TimeClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: now + 60,
+            iat: now - 30,
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_missing_iat_when_token_age_is_configured() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                age: Some(Duration::from_secs(60)),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
+            realm_access: RealmAccessClaims { roles: Vec::new() },
         });
 
         let response = app(Oidc::builder(config.clone())
@@ -2806,6 +2961,15 @@ mod tests {
         org_id: &'a str,
         scope: Vec<&'a str>,
         exp: u64,
+    }
+
+    #[derive(Serialize)]
+    struct TimeClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        exp: u64,
+        iat: u64,
     }
 
     #[derive(Serialize)]
