@@ -512,14 +512,27 @@ impl Error {
     }
 
     fn challenge(&self) -> HeaderValue {
-        match self {
-            Self::MissingBearerToken => HeaderValue::from_static("Bearer"),
-            Self::InvalidAuthorizationHeader => {
-                HeaderValue::from_static(r#"Bearer error="invalid_request""#)
-            }
-            Self::TokenRejected(_) => HeaderValue::from_static(r#"Bearer error="invalid_token""#),
-            Self::TenantDisabled | Self::Forbidden => HeaderValue::from_static("Bearer"),
+        self.challenge_with_scheme("Bearer")
+    }
+
+    fn challenge_with_scheme(&self, scheme: &str) -> HeaderValue {
+        let value = match self {
+            Self::MissingBearerToken | Self::TenantDisabled | Self::Forbidden => scheme.to_owned(),
+            Self::InvalidAuthorizationHeader => format!(r#"{scheme} error="invalid_request""#),
+            Self::TokenRejected(_) => format!(r#"{scheme} error="invalid_token""#),
+        };
+        HeaderValue::from_str(&value).unwrap_or_else(|_| self.challenge())
+    }
+
+    fn into_response_with_scheme(self, scheme: &str) -> Response {
+        let status = self.status();
+        let mut response = status.into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response
+                .headers_mut()
+                .insert(WWW_AUTHENTICATE, self.challenge_with_scheme(scheme));
         }
+        response
     }
 }
 
@@ -1678,12 +1691,13 @@ where
 
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
         let oidc = self.oidc.clone();
+        let authorization_scheme = oidc.config.token.authorization_scheme.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             match oidc.authenticate(&mut request).await {
                 Ok(()) => inner.call(request).await,
-                Err(error) => Ok(error.into_response()),
+                Err(error) => Ok(error.into_response_with_scheme(&authorization_scheme)),
             }
         })
     }
@@ -1924,7 +1938,9 @@ where
 
             match tenant.authenticate(&mut request).await {
                 Ok(()) => inner.call(request).await,
-                Err(error) => Ok(error.into_response()),
+                Err(error) => {
+                    Ok(error.into_response_with_scheme(&tenant.config.token.authorization_scheme))
+                }
             }
         })
     }
@@ -2655,6 +2671,50 @@ dQIDAQAB
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_authorization_scheme_is_used_in_missing_token_challenge() {
+        let response = app(Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                authorization_scheme: "Token".to_owned(),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer("test-token", "alice"))
+        .build())
+        .oneshot(request("/protected", None))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(WWW_AUTHENTICATE).unwrap(),
+            HeaderValue::from_static("Token")
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_authorization_scheme_is_used_in_invalid_token_challenge() {
+        let response = app(Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                authorization_scheme: "Token".to_owned(),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer("test-token", "alice"))
+        .build())
+        .oneshot(request("/protected", Some("Token wrong-token")))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(WWW_AUTHENTICATE).unwrap(),
+            HeaderValue::from_static(r#"Token error="invalid_token""#)
+        );
     }
 
     #[tokio::test]
