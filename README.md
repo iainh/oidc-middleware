@@ -18,8 +18,8 @@ This crate is in early development. The current implementation includes:
   registration, revocation, introspection, user info, and end-session endpoints,
   plus parsing of the matching discovery metadata.
 - Local JWT verification with `quarkus.oidc.public-key`.
-- Audience validation from one or more `quarkus.oidc.token.audience` values,
-  defaulting to `quarkus.oidc.client-id` when present.
+- Audience validation from one or more configured
+  `quarkus.oidc.token.audience` values.
 - Quarkus `any` issuer and audience bypass values for providers with variable
   claims.
 - Signature algorithm restrictions with

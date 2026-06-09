@@ -2487,9 +2487,7 @@ fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
 
     let audiences = config.token.audiences();
     if audiences.is_empty() {
-        if let Some(client_id) = config.client_id.as_deref() {
-            validation.set_audience(&[client_id]);
-        }
+        validation.validate_aud = false;
     } else {
         validation.set_audience(&audiences);
     }
@@ -3568,7 +3566,7 @@ dQIDAQAB
     }
 
     #[tokio::test]
-    async fn jwt_validator_uses_client_id_as_default_audience() {
+    async fn jwt_validator_does_not_require_audience_when_unconfigured() {
         let config = OidcConfig {
             auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
             client_id: Some("orders-api".to_owned()),
@@ -3596,7 +3594,7 @@ dQIDAQAB
     }
 
     #[tokio::test]
-    async fn jwt_validator_rejects_wrong_client_id_audience() {
+    async fn jwt_validator_does_not_use_client_id_as_default_audience() {
         let config = OidcConfig {
             auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
             client_id: Some("orders-api".to_owned()),
@@ -3611,14 +3609,16 @@ dQIDAQAB
             realm_access: RealmAccessClaims { roles: Vec::new() },
         });
 
-        let response = app(Oidc::builder(config.clone())
-            .validator(JwtValidator::hs256("secret", &config))
-            .build())
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
         .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
         .await
         .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
