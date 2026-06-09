@@ -512,7 +512,7 @@ pub enum ApplicationType {
 
 impl mp_config::FromConfigValue for ApplicationType {
     fn from_config_value(value: &str) -> std::result::Result<Self, String> {
-        match value {
+        match value.to_ascii_lowercase().as_str() {
             "service" => Ok(Self::Service),
             "web-app" => Ok(Self::WebApp),
             "hybrid" => Ok(Self::Hybrid),
@@ -3756,6 +3756,19 @@ dQIDAQAB
                 .contains("expected one of `basic` or `post`"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn config_loads_application_type_case_insensitively() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("test", 100).with("quarkus.oidc.application-type", "WEB-APP"),
+            )
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert_eq!(oidc.application_type, ApplicationType::WebApp);
     }
 
     #[test]
