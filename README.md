@@ -21,7 +21,7 @@ This crate is in early development. The current implementation includes:
   claims.
 - Signature algorithm restrictions with
   `quarkus.oidc.token.signature-algorithm`.
-- JWT `typ` claim enforcement with `quarkus.oidc.token.token-type`.
+- JWT `typ` header or claim enforcement with `quarkus.oidc.token.token-type`.
 - Optional `sub` enforcement with `quarkus.oidc.token.subject-required`.
 - JWT string claim enforcement with `quarkus.oidc.token.required-claims.*`,
   including nested claim paths.

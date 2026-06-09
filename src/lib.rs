@@ -1055,7 +1055,11 @@ impl TokenValidator for JwtValidator {
             decode::<TokenClaims>(&token, &key, &validation)
                 .map_err(|error| Error::TokenRejected(Box::new(error)))
                 .and_then(|data| {
-                    validate_token_type(&data.claims, token_type.as_deref())?;
+                    validate_token_type(
+                        data.header.typ.as_deref(),
+                        &data.claims,
+                        token_type.as_deref(),
+                    )?;
                     validate_subject(&data.claims, subject_required)?;
                     validate_issued_at(&data.claims, issued_at_required, leeway)?;
                     validate_required_claims(&data.claims, &required_claims)?;
@@ -1177,18 +1181,25 @@ fn should_refresh_jwks(error: &Error) -> bool {
     matches!(error, Error::TokenRejected(source) if source.is::<UnknownKid>())
 }
 
-fn validate_token_type(claims: &TokenClaims, expected: Option<&str>) -> Result<()> {
+fn validate_token_type(
+    header_token_type: Option<&str>,
+    claims: &TokenClaims,
+    expected: Option<&str>,
+) -> Result<()> {
     let Some(expected) = expected else {
         return Ok(());
     };
 
-    match claims.typ.as_deref() {
+    match header_token_type
+        .filter(|actual| *actual != "JWT")
+        .or(claims.typ.as_deref())
+    {
         Some(actual) if actual == expected => Ok(()),
         Some(actual) => Err(Error::TokenRejected(
-            format!("JWT typ claim `{actual}` did not match expected `{expected}`").into(),
+            format!("JWT typ `{actual}` did not match expected `{expected}`").into(),
         )),
         None => Err(Error::TokenRejected(
-            format!("JWT typ claim is required to be `{expected}`").into(),
+            format!("JWT typ is required to be `{expected}`").into(),
         )),
     }
 }
@@ -3335,6 +3346,42 @@ dQIDAQAB
     }
 
     #[tokio::test]
+    async fn jwt_validator_accepts_configured_header_token_type() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: Some("at+jwt".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt_with_header_type(
+            "at+jwt",
+            TestClaims {
+                sub: "alice",
+                iss: "https://issuer.example/realms/app",
+                aud: "orders-api",
+                exp: 4_102_444_800,
+                groups: Vec::new(),
+                realm_access: RealmAccessClaims { roles: Vec::new() },
+            },
+        );
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn jwt_validator_rejects_wrong_token_type() {
         let config = OidcConfig {
             auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
@@ -5021,19 +5068,29 @@ dQIDAQAB
         jwt_value(claims, false)
     }
 
+    fn jwt_with_header_type(token_type: &str, claims: impl Serialize) -> String {
+        let mut header = Header::default();
+        header.typ = Some(token_type.to_owned());
+        jwt_value_with_header(header, claims, true)
+    }
+
     fn jwt_value(claims: impl Serialize, include_default_iat: bool) -> String {
+        jwt_value_with_header(Header::default(), claims, include_default_iat)
+    }
+
+    fn jwt_value_with_header(
+        header: Header,
+        claims: impl Serialize,
+        include_default_iat: bool,
+    ) -> String {
         let mut claims = serde_json::to_value(claims).expect("test claims should serialize");
         if include_default_iat {
             if let Value::Object(claims) = &mut claims {
                 claims.entry("iat").or_insert_with(|| Value::from(TEST_IAT));
             }
         }
-        encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(b"secret"),
-        )
-        .expect("test token should encode")
+        encode(&header, &claims, &EncodingKey::from_secret(b"secret"))
+            .expect("test token should encode")
     }
 
     fn jwt_rs256(claims: impl Serialize) -> String {
