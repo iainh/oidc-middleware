@@ -14,8 +14,9 @@ This crate is in early development. The current implementation includes:
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`,
   including `quarkus.oidc.discovery-path` and direct `jwks-path` loading when
   `quarkus.oidc.discovery-enabled=false`.
-- Quarkus-style endpoint path configuration for token, introspection, user info,
-  and end-session endpoints, plus parsing of the matching discovery metadata.
+- Quarkus-style endpoint path configuration for authorization, token,
+  registration, revocation, introspection, user info, and end-session endpoints,
+  plus parsing of the matching discovery metadata.
 - Local JWT verification with `quarkus.oidc.public-key`.
 - Audience validation from one or more `quarkus.oidc.token.audience` values,
   defaulting to `quarkus.oidc.client-id` when present.

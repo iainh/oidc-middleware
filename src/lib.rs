@@ -105,8 +105,14 @@ pub struct OidcConfig {
     pub discovery_path: String,
     /// Relative or absolute JWKS endpoint used when discovery is disabled.
     pub jwks_path: Option<String>,
+    /// Relative or absolute authorization endpoint path.
+    pub authorization_path: Option<String>,
     /// Relative or absolute token endpoint path.
     pub token_path: Option<String>,
+    /// Relative or absolute dynamic client registration endpoint path.
+    pub registration_path: Option<String>,
+    /// Relative or absolute token revocation endpoint path.
+    pub revoke_path: Option<String>,
     /// Relative or absolute token introspection endpoint path.
     pub introspection_path: Option<String>,
     /// Relative or absolute user info endpoint path.
@@ -149,7 +155,10 @@ impl Default for OidcConfig {
             discovery_enabled: true,
             discovery_path: ".well-known/openid-configuration".to_owned(),
             jwks_path: None,
+            authorization_path: None,
             token_path: None,
+            registration_path: None,
+            revoke_path: None,
             introspection_path: None,
             user_info_path: None,
             end_session_path: None,
@@ -664,6 +673,10 @@ pub struct ProviderMetadata {
     pub authorization_endpoint: Option<String>,
     /// OAuth2 token endpoint returned by the provider.
     pub token_endpoint: Option<String>,
+    /// Dynamic client registration endpoint returned by the provider.
+    pub registration_endpoint: Option<String>,
+    /// OAuth2 token revocation endpoint returned by the provider.
+    pub revocation_endpoint: Option<String>,
     /// OAuth2 token introspection endpoint returned by the provider.
     pub introspection_endpoint: Option<String>,
     /// OIDC user info endpoint returned by the provider.
@@ -2144,7 +2157,10 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.discovery-enabled"
             || key == "quarkus.oidc.discovery-path"
             || key == "quarkus.oidc.jwks-path"
+            || key == "quarkus.oidc.authorization-path"
             || key == "quarkus.oidc.token-path"
+            || key == "quarkus.oidc.registration-path"
+            || key == "quarkus.oidc.revoke-path"
             || key == "quarkus.oidc.introspection-path"
             || key == "quarkus.oidc.user-info-path"
             || key == "quarkus.oidc.end-session-path"
@@ -2188,7 +2204,10 @@ fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
                 | "discovery-enabled"
                 | "discovery-path"
                 | "jwks-path"
+                | "authorization-path"
                 | "token-path"
+                | "registration-path"
+                | "revoke-path"
                 | "introspection-path"
                 | "user-info-path"
                 | "end-session-path"
@@ -2726,7 +2745,16 @@ dQIDAQAB
                     .with("quarkus.oidc.discovery-enabled", "false")
                     .with("quarkus.oidc.discovery-path", "custom-discovery")
                     .with("quarkus.oidc.jwks-path", "protocol/openid-connect/certs")
+                    .with(
+                        "quarkus.oidc.authorization-path",
+                        "protocol/openid-connect/auth",
+                    )
                     .with("quarkus.oidc.token-path", "protocol/openid-connect/token")
+                    .with(
+                        "quarkus.oidc.registration-path",
+                        "clients-registrations/openid-connect",
+                    )
+                    .with("quarkus.oidc.revoke-path", "protocol/openid-connect/revoke")
                     .with(
                         "quarkus.oidc.introspection-path",
                         "protocol/openid-connect/token/introspect",
@@ -2780,7 +2808,10 @@ dQIDAQAB
                 discovery_enabled: false,
                 discovery_path: "custom-discovery".to_owned(),
                 jwks_path: Some("protocol/openid-connect/certs".to_owned()),
+                authorization_path: Some("protocol/openid-connect/auth".to_owned()),
                 token_path: Some("protocol/openid-connect/token".to_owned()),
+                registration_path: Some("clients-registrations/openid-connect".to_owned()),
+                revoke_path: Some("protocol/openid-connect/revoke".to_owned()),
                 introspection_path: Some("protocol/openid-connect/token/introspect".to_owned()),
                 user_info_path: Some("protocol/openid-connect/userinfo".to_owned()),
                 end_session_path: Some("protocol/openid-connect/logout".to_owned()),
@@ -4579,6 +4610,8 @@ dQIDAQAB
                 "jwks_uri": "https://issuer.example/realms/app/protocol/openid-connect/certs",
                 "authorization_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/auth",
                 "token_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/token",
+                "registration_endpoint": "https://issuer.example/realms/app/clients-registrations/openid-connect",
+                "revocation_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/revoke",
                 "introspection_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
                 "userinfo_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/userinfo",
                 "end_session_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/logout"
@@ -4597,6 +4630,13 @@ dQIDAQAB
                 ),
                 token_endpoint: Some(
                     "https://issuer.example/realms/app/protocol/openid-connect/token".to_owned(),
+                ),
+                registration_endpoint: Some(
+                    "https://issuer.example/realms/app/clients-registrations/openid-connect"
+                        .to_owned(),
+                ),
+                revocation_endpoint: Some(
+                    "https://issuer.example/realms/app/protocol/openid-connect/revoke".to_owned(),
                 ),
                 introspection_endpoint: Some(
                     "https://issuer.example/realms/app/protocol/openid-connect/token/introspect"
@@ -5968,6 +6008,8 @@ dQIDAQAB
             jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
             authorization_endpoint: None,
             token_endpoint: None,
+            registration_endpoint: None,
+            revocation_endpoint: None,
             introspection_endpoint: None,
             userinfo_endpoint: None,
             end_session_endpoint: None,
