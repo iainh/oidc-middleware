@@ -3022,6 +3022,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.application-type"
             || key.starts_with("quarkus.oidc.credentials.")
             || key.starts_with("quarkus.oidc.token.")
+            || key.starts_with("quarkus.oidc.roles.")
     })
 }
 
@@ -6245,6 +6246,25 @@ dQIDAQAB
                 },
             }
         );
+    }
+
+    #[test]
+    fn tenants_detect_default_tenant_roles_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-roles", 100)
+                    .with("quarkus.oidc.roles.role-claim-path", "permissions"),
+            )
+            .build();
+
+        let tenants = Tenants::from_config(&config)
+            .expect("default tenant roles config should load")
+            .build();
+        let default_tenant = tenants
+            .default_tenant
+            .expect("roles config should create default tenant");
+
+        assert_eq!(default_tenant.config.roles.role_claim_path, "permissions");
     }
 
     #[test]
