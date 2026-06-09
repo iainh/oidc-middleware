@@ -860,14 +860,11 @@ impl Authorization {
                 split_csv(&config.get::<String>(&format!("{prefix}.paths"))?),
                 &root_path,
             );
+            let methods_key = format!("{prefix}.methods");
             let methods = config
-                .get_optional::<String>(&format!("{prefix}.methods"))?
-                .map(|methods| {
-                    split_csv(&methods)
-                        .into_iter()
-                        .map(|method| method.to_ascii_uppercase())
-                        .collect::<Vec<_>>()
-                })
+                .get_optional::<String>(&methods_key)?
+                .map(|methods| parse_http_methods(&methods_key, &methods))
+                .transpose()?
                 .unwrap_or_default();
             let policy_key = format!("{prefix}.policy");
             let policy_name = config.get::<String>(&policy_key)?;
@@ -1026,6 +1023,22 @@ fn merge_role_mappings(
             .or_default()
             .extend(mapped_roles.iter().cloned());
     }
+}
+
+fn parse_http_methods(property_name: &str, value: &str) -> mp_config::Result<Vec<String>> {
+    split_csv(value)
+        .into_iter()
+        .map(|method| {
+            let method = method.to_ascii_uppercase();
+            http::Method::from_bytes(method.as_bytes())
+                .map(|_| method.clone())
+                .map_err(|error| mp_config::ConfigError::Conversion {
+                    name: property_name.to_owned(),
+                    value: method,
+                    message: error.to_string(),
+                })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6637,6 +6650,43 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("authorization policy `missing` is not defined"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn authorization_normalizes_configured_methods() {
+        assert_eq!(
+            parse_http_methods("quarkus.http.auth.permission.secured.methods", "get,Post")
+                .expect("methods should parse"),
+            vec!["GET".to_owned(), "POST".to_owned()]
+        );
+    }
+
+    #[test]
+    fn authorization_rejects_invalid_configured_methods() {
+        let error = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-invalid-method", 100)
+                        .with("quarkus.http.auth.permission.secured.paths", "/resource")
+                        .with(
+                            "quarkus.http.auth.permission.secured.methods",
+                            "GET,not a method",
+                        )
+                        .with(
+                            "quarkus.http.auth.permission.secured.policy",
+                            "authenticated",
+                        ),
+                )
+                .build(),
+        )
+        .expect_err("invalid method should be rejected");
+
+        assert!(
+            error.to_string().contains(
+                "failed to convert config property `quarkus.http.auth.permission.secured.methods` value `NOT A METHOD`"
+            ),
             "{error}"
         );
     }
