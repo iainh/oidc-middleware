@@ -92,6 +92,9 @@ pub struct OidcConfig {
     /// Token validation settings.
     #[config(nested)]
     pub token: OidcTokenConfig,
+    /// Role extraction settings.
+    #[config(nested)]
+    pub roles: OidcRolesConfig,
 }
 
 impl OidcConfig {
@@ -110,6 +113,7 @@ impl Default for OidcConfig {
             client_id: None,
             application_type: ApplicationType::Service,
             token: OidcTokenConfig::default(),
+            roles: OidcRolesConfig::default(),
         }
     }
 }
@@ -122,6 +126,31 @@ pub struct OidcTokenConfig {
     pub issuer: Option<String>,
     /// Expected token audience.
     pub audience: Option<String>,
+}
+
+/// Role extraction configuration loaded from `quarkus.oidc.roles.*`.
+#[derive(Clone, Debug, ConfigProperties, Eq, PartialEq)]
+#[config(rename_all = "kebab-case")]
+pub struct OidcRolesConfig {
+    /// Token claim paths used to extract role names.
+    ///
+    /// The default covers standard `groups` claims and Keycloak realm roles.
+    #[config(default = "groups,realm_access.roles")]
+    pub role_claim_path: String,
+}
+
+impl Default for OidcRolesConfig {
+    fn default() -> Self {
+        Self {
+            role_claim_path: "groups,realm_access.roles".to_owned(),
+        }
+    }
+}
+
+impl OidcRolesConfig {
+    fn claim_paths(&self) -> Vec<String> {
+        split_csv(&self.role_claim_path)
+    }
 }
 
 /// Quarkus-compatible OIDC application type.
@@ -217,12 +246,15 @@ impl Principal {
         groups.into_iter().any(|group| self.has_group(group))
     }
 
-    fn from_claims(claims: TokenClaims) -> Self {
+    fn from_claims(claims: TokenClaims, role_claim_paths: &[String]) -> Self {
         Self {
             subject: Arc::from(claims.sub),
             issuer: claims.iss.map(Arc::from),
             audience: claims.aud.into_iter().map(Arc::from).collect(),
-            groups: claims.groups.into_iter().map(Arc::from).collect(),
+            groups: extract_roles(&claims.extra, role_claim_paths)
+                .into_iter()
+                .map(Arc::from)
+                .collect(),
         }
     }
 }
@@ -587,6 +619,7 @@ impl TokenValidator for StaticTokenValidator {
 pub struct JwtValidator {
     keys: JwtKeys,
     validation: Validation,
+    role_claim_paths: Arc<[String]>,
 }
 
 impl JwtValidator {
@@ -602,6 +635,7 @@ impl JwtValidator {
         Self {
             keys: JwtKeys::Single(Arc::new(DecodingKey::from_secret(secret.as_ref()))),
             validation,
+            role_claim_paths: Arc::from(config.roles.claim_paths()),
         }
     }
 
@@ -623,6 +657,7 @@ impl JwtValidator {
         Self {
             keys: JwtKeys::Set(Arc::new(jwks)),
             validation,
+            role_claim_paths: Arc::from(config.roles.claim_paths()),
         }
     }
 }
@@ -631,11 +666,12 @@ impl TokenValidator for JwtValidator {
     fn validate(&self, token: Arc<str>) -> ValidationFuture {
         let keys = self.keys.clone();
         let validation = self.validation.clone();
+        let role_claim_paths = self.role_claim_paths.clone();
 
         Box::pin(async move {
             let key = keys.decoding_key(&token)?;
             decode::<TokenClaims>(&token, &key, &validation)
-                .map(|data| Principal::from_claims(data.claims))
+                .map(|data| Principal::from_claims(data.claims, &role_claim_paths))
                 .map_err(|error| Error::TokenRejected(Box::new(error)))
         })
     }
@@ -677,13 +713,7 @@ struct TokenClaims {
     sub: String,
     iss: Option<String>,
     aud: Vec<String>,
-    groups: Vec<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RealmAccess {
-    #[serde(default)]
-    roles: Vec<String>,
+    extra: Value,
 }
 
 impl<'de> Deserialize<'de> for TokenClaims {
@@ -698,21 +728,17 @@ impl<'de> Deserialize<'de> for TokenClaims {
             iss: Option<String>,
             #[serde(default, deserialize_with = "deserialize_audience")]
             aud: Vec<String>,
-            #[serde(default)]
-            groups: Vec<String>,
-            #[serde(default)]
-            realm_access: RealmAccess,
+            #[serde(flatten)]
+            extra: serde_json::Map<String, Value>,
         }
 
-        let mut raw = RawClaims::deserialize(deserializer)?;
-        raw.groups.extend(raw.realm_access.roles);
-        deduplicate(&mut raw.groups);
+        let raw = RawClaims::deserialize(deserializer)?;
 
         Ok(Self {
             sub: raw.sub,
             iss: raw.iss,
             aud: raw.aud,
-            groups: raw.groups,
+            extra: Value::Object(raw.extra),
         })
     }
 }
@@ -1063,6 +1089,35 @@ fn jwk_algorithm(algorithm: Option<KeyAlgorithm>) -> Option<Algorithm> {
     Algorithm::from_str(&algorithm?.to_string()).ok()
 }
 
+fn extract_roles(claims: &Value, paths: &[String]) -> Vec<String> {
+    let mut roles = Vec::new();
+    for path in paths {
+        if let Some(value) = claim_path_value(claims, path) {
+            collect_roles(value, &mut roles);
+        }
+    }
+    deduplicate(&mut roles);
+    roles
+}
+
+fn claim_path_value<'a>(claims: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.')
+        .filter(|part| !part.is_empty())
+        .try_fold(claims, |value, part| value.get(part))
+}
+
+fn collect_roles(value: &Value, roles: &mut Vec<String>) {
+    match value {
+        Value::String(role) => roles.push(role.clone()),
+        Value::Array(values) => {
+            for value in values {
+                collect_roles(value, roles);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn deserialize_audience<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1112,7 +1167,11 @@ mod tests {
                     )
                     .with("quarkus.oidc.client-id", "orders-service")
                     .with("quarkus.oidc.application-type", "hybrid")
-                    .with("quarkus.oidc.token.audience", "orders-api"),
+                    .with("quarkus.oidc.token.audience", "orders-api")
+                    .with(
+                        "quarkus.oidc.roles.role-claim-path",
+                        "resource_access.api.roles",
+                    ),
             )
             .build();
 
@@ -1129,6 +1188,9 @@ mod tests {
                 token: OidcTokenConfig {
                     issuer: None,
                     audience: Some("orders-api".to_owned()),
+                },
+                roles: OidcRolesConfig {
+                    role_claim_path: "resource_access.api.roles".to_owned(),
                 },
             }
         );
@@ -1225,6 +1287,43 @@ mod tests {
         });
 
         let response = claims_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_extracts_configured_role_claim_path() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+            },
+            roles: OidcRolesConfig {
+                role_claim_path: "resource_access.orders.roles".to_owned(),
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(CustomRoleClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            resource_access: ResourceAccessClaims {
+                orders: ResourceRolesClaims {
+                    roles: vec!["orders-admin", "orders-user"],
+                },
+            },
+        });
+
+        let response = custom_roles_app(
             Oidc::builder(config.clone())
                 .validator(JwtValidator::hs256("secret", &config))
                 .build(),
@@ -1640,6 +1739,21 @@ mod tests {
             .layer(oidc.layer())
     }
 
+    fn custom_roles_app(oidc: Oidc) -> Router {
+        Router::new()
+            .route(
+                "/protected",
+                get(|Extension(principal): Extension<Principal>| async move {
+                    assert_eq!(
+                        principal.groups().collect::<Vec<_>>(),
+                        vec!["orders-admin", "orders-user"]
+                    );
+                    "ok"
+                }),
+            )
+            .layer(oidc.layer())
+    }
+
     fn request(uri: &str, authorization: Option<&str>) -> Request<Body> {
         request_with_method(http::Method::GET, uri, authorization)
     }
@@ -1659,7 +1773,7 @@ mod tests {
             .expect("request should be valid")
     }
 
-    fn jwt(claims: TestClaims<'_>) -> String {
+    fn jwt(claims: impl Serialize) -> String {
         encode(
             &Header::default(),
             &claims,
@@ -1709,6 +1823,25 @@ mod tests {
 
     #[derive(Serialize)]
     struct RealmAccessClaims<'a> {
+        roles: Vec<&'a str>,
+    }
+
+    #[derive(Serialize)]
+    struct CustomRoleClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        exp: u64,
+        resource_access: ResourceAccessClaims<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct ResourceAccessClaims<'a> {
+        orders: ResourceRolesClaims<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct ResourceRolesClaims<'a> {
         roles: Vec<&'a str>,
     }
 }

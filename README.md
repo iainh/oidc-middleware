@@ -14,6 +14,7 @@ This crate is in early development. The current implementation includes:
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
+- Configurable role extraction with `quarkus.oidc.roles.role-claim-path`.
 - Quarkus-style `quarkus.http.auth.permission.*` path policies for `permit`,
   `deny`, `authenticated`, and named `roles-allowed` policies.
 - `#[roles_allowed(...)]` handler macro for Quarkus-style role checks with the
