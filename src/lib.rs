@@ -2646,6 +2646,16 @@ impl Tenants {
                 .get_optional::<bool>("quarkus.oidc.resolve-tenants-with-issuer")?
                 .unwrap_or_default(),
         );
+        if let Some(header_name) = config.get_optional::<String>("quarkus.oidc.tenant-id-header")? {
+            let parsed = http::HeaderName::from_str(&header_name).map_err(|error| {
+                mp_config::ConfigError::Conversion {
+                    name: "quarkus.oidc.tenant-id-header".to_owned(),
+                    value: header_name,
+                    message: error.to_string(),
+                }
+            })?;
+            builder = builder.tenant_header(parsed);
+        }
         if has_default_tenant_config(config) {
             let default_config = OidcConfig::from_config(config)?;
             builder = builder.default_tenant(
@@ -2980,6 +2990,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.end-session-path"
             || key == "quarkus.oidc.client-id"
             || key == "quarkus.oidc.tenant-id"
+            || key == "quarkus.oidc.tenant-id-header"
             || key == "quarkus.oidc.tenant-paths"
             || key == "quarkus.oidc.public-key"
             || key == "quarkus.oidc.application-type"
@@ -6164,6 +6175,47 @@ dQIDAQAB
                 },
             }
         );
+    }
+
+    #[test]
+    fn tenants_load_tenant_id_header_from_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-header", 100)
+                    .with("quarkus.oidc.tenant-id-header", "x-oidc-tenant")
+                    .with("quarkus.oidc.tenant-a.tenant-id", "orders"),
+            )
+            .build();
+
+        let tenants = Tenants::from_config(&config)
+            .expect("tenant header config should load")
+            .build();
+
+        assert_eq!(
+            tenants.header_name,
+            Some(http::HeaderName::from_static("x-oidc-tenant"))
+        );
+    }
+
+    #[test]
+    fn tenants_reject_invalid_tenant_id_header_from_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-header", 100)
+                    .with("quarkus.oidc.tenant-id-header", "not a header"),
+            )
+            .build();
+
+        let error = match Tenants::from_config(&config) {
+            Ok(_) => panic!("tenant header should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { name, .. }
+                if name == "quarkus.oidc.tenant-id-header"
+        ));
     }
 
     #[tokio::test]

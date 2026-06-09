@@ -39,7 +39,8 @@ This crate is in early development. The current implementation includes:
   responses.
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths`, quoted tenant
   aliases, tenant IDs, static first-path-segment tenant selection, and optional
-  header-based or issuer-based tenant selection.
+  header-based (`quarkus.oidc.tenant-id-header`) or issuer-based tenant
+  selection.
 - Refreshable provider JWKS validation when a token references an unknown `kid`,
   with `quarkus.oidc.token.forced-jwk-refresh-interval` throttling.
 - Quarkus token introspection configuration flags for JWT, opaque-token, and
