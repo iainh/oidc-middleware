@@ -15,6 +15,7 @@ This crate is in early development. The current implementation includes:
 - Audience validation from `quarkus.oidc.token.audience`, defaulting to
   `quarkus.oidc.client-id` when present.
 - JWT `typ` claim enforcement with `quarkus.oidc.token.token-type`.
+- Optional `sub` enforcement with `quarkus.oidc.token.subject-required`.
 - JWT string claim enforcement with `quarkus.oidc.token.required-claims.*`.
 - JWT lifespan grace and age checks with `quarkus.oidc.token.lifespan-grace`
   and `quarkus.oidc.token.age`.
