@@ -298,10 +298,38 @@ impl OidcTokenConfig {
     }
 }
 
+/// Token source used for role extraction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RolesSource {
+    /// Extract roles from the access token.
+    #[default]
+    AccessToken,
+    /// Extract roles from the ID token.
+    IdToken,
+    /// Extract roles from the UserInfo response.
+    UserInfo,
+}
+
+impl mp_config::FromConfigValue for RolesSource {
+    fn from_config_value(value: &str) -> std::result::Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "accesstoken" | "access-token" => Ok(Self::AccessToken),
+            "idtoken" | "id-token" => Ok(Self::IdToken),
+            "userinfo" | "user-info" => Ok(Self::UserInfo),
+            other => Err(format!(
+                "expected one of `accesstoken`, `idtoken`, or `userinfo`, got `{other}`"
+            )),
+        }
+    }
+}
+
 /// Role extraction configuration loaded from `quarkus.oidc.roles.*`.
 #[derive(Clone, Debug, ConfigProperties, Eq, PartialEq)]
 #[config(rename_all = "kebab-case")]
 pub struct OidcRolesConfig {
+    /// Token or response source used to extract roles.
+    #[config(default)]
+    pub source: RolesSource,
     /// Token claim paths used to extract role names.
     ///
     /// The default covers standard `groups` claims and Keycloak realm roles.
@@ -315,6 +343,7 @@ pub struct OidcRolesConfig {
 impl Default for OidcRolesConfig {
     fn default() -> Self {
         Self {
+            source: RolesSource::AccessToken,
             role_claim_path: DEFAULT_ROLE_CLAIM_PATH.to_owned(),
             role_claim_separator: " ".to_owned(),
         }
@@ -2824,6 +2853,7 @@ dQIDAQAB
                         "quarkus.oidc.roles.role-claim-path",
                         "resource_access.api.roles",
                     )
+                    .with("quarkus.oidc.roles.source", "userinfo")
                     .with("quarkus.oidc.roles.role-claim-separator", "|"),
             )
             .build();
@@ -2882,10 +2912,27 @@ dQIDAQAB
                     verify_access_token_with_user_info: true,
                 },
                 roles: OidcRolesConfig {
+                    source: RolesSource::UserInfo,
                     role_claim_path: "resource_access.api.roles".to_owned(),
                     role_claim_separator: "|".to_owned(),
                 },
             }
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_roles_source() {
+        let config = Config::builder()
+            .add_source(MapSource::new("test", 100).with("quarkus.oidc.roles.source", "session"))
+            .build();
+
+        let error = OidcConfig::from_config(&config).expect_err("roles source should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected one of `accesstoken`, `idtoken`, or `userinfo`"),
+            "{error}"
         );
     }
 
@@ -3355,6 +3402,7 @@ dQIDAQAB
                 ..OidcTokenConfig::default()
             },
             roles: OidcRolesConfig {
+                source: RolesSource::AccessToken,
                 role_claim_path: "permissions".to_owned(),
                 role_claim_separator: "|".to_owned(),
             },
