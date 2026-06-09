@@ -638,43 +638,75 @@ impl Authorization {
     }
 
     fn requirement(&self, method: &http::Method, path: &str) -> AuthRequirement {
-        let matches = self
+        let path_matches = self
             .permissions
             .iter()
             .filter_map(|permission| {
                 permission
-                    .matches(method, path)
-                    .map(|score| (score, permission))
+                    .path_match_score(path)
+                    .map(|path_score| PermissionMatch {
+                        path_score,
+                        method_score: permission.method_match_score(method),
+                        permission,
+                    })
             })
             .collect::<Vec<_>>();
 
-        let shared_policies = matches
+        if path_matches.is_empty() {
+            return AuthRequirement::Permit;
+        }
+
+        let shared_policies = path_matches
             .iter()
-            .filter(|(_, permission)| permission.shared)
-            .map(|(_, permission)| &permission.policy)
+            .filter(|permission_match| {
+                permission_match.permission.shared && permission_match.method_score.is_some()
+            })
+            .map(|permission_match| &permission_match.permission.policy)
             .collect::<Vec<_>>();
-        let unshared_matches = matches
+        let unshared_matches = path_matches
             .iter()
-            .filter(|(_, permission)| !permission.shared)
+            .filter(|permission_match| !permission_match.permission.shared)
             .collect::<Vec<_>>();
 
-        let Some(max_score) = unshared_matches.iter().map(|(score, _)| *score).max() else {
+        let Some(max_path_score) = unshared_matches
+            .iter()
+            .map(|permission_match| permission_match.path_score)
+            .max()
+        else {
             if shared_policies.is_empty() {
-                return AuthRequirement::Permit;
+                return AuthRequirement::Deny;
             }
             return policies_requirement(shared_policies);
+        };
+
+        let unshared_matches = unshared_matches
+            .into_iter()
+            .filter(|permission_match| permission_match.path_score == max_path_score)
+            .collect::<Vec<_>>();
+        let Some(max_method_score) = unshared_matches
+            .iter()
+            .filter_map(|permission_match| permission_match.method_score)
+            .max()
+        else {
+            return AuthRequirement::Deny;
         };
 
         let mut policies = shared_policies;
         policies.extend(
             unshared_matches
                 .into_iter()
-                .filter(|(score, _)| *score == max_score)
-                .map(|(_, permission)| &permission.policy),
+                .filter(|permission_match| permission_match.method_score == Some(max_method_score))
+                .map(|permission_match| &permission_match.permission.policy),
         );
 
         policies_requirement(policies)
     }
+}
+
+struct PermissionMatch<'a> {
+    path_score: usize,
+    method_score: Option<usize>,
+    permission: &'a HttpPermission,
 }
 
 fn policies_requirement(policies: Vec<&HttpPolicy>) -> AuthRequirement {
@@ -721,8 +753,18 @@ struct HttpPermission {
 }
 
 impl HttpPermission {
-    fn matches(&self, method: &http::Method, request_path: &str) -> Option<usize> {
-        let method_score = if self.methods.is_empty() { 0 } else { 1 };
+    fn path_match_score(&self, request_path: &str) -> Option<usize> {
+        self.paths
+            .iter()
+            .filter_map(|path| path_match_score(path, request_path))
+            .max()
+    }
+
+    fn method_match_score(&self, method: &http::Method) -> Option<usize> {
+        if self.methods.is_empty() {
+            return Some(0);
+        }
+
         if !self.methods.is_empty()
             && !self
                 .methods
@@ -732,11 +774,7 @@ impl HttpPermission {
             return None;
         }
 
-        self.paths
-            .iter()
-            .filter_map(|path| path_match_score(path, request_path))
-            .map(|path_score| path_score * 2 + method_score)
-            .max()
+        Some(1)
     }
 }
 
@@ -3493,6 +3531,64 @@ mod tests {
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorization_rejects_path_match_without_method_match() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-method-mismatch", 100)
+                        .with(
+                            "quarkus.http.auth.permission.permit-get.paths",
+                            "/resource/*",
+                        )
+                        .with("quarkus.http.auth.permission.permit-get.methods", "GET")
+                        .with("quarkus.http.auth.permission.permit-get.policy", "permit"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/resource/item", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_method(
+                http::Method::POST,
+                "/resource/item",
+                None,
+            ))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_method(
+                http::Method::POST,
+                "/resource/item",
+                Some("Bearer test-token"),
+            ))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(request_with_method(
+                http::Method::POST,
+                "/unmatched",
+                Some("Bearer test-token"),
+            ))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
