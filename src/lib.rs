@@ -376,6 +376,14 @@ fn role_claim_paths(config: &OidcConfig) -> Vec<String> {
     paths
 }
 
+fn role_claim_paths_for_source(config: &OidcConfig, source: RolesSource) -> Vec<String> {
+    if config.roles.source == source {
+        role_claim_paths(config)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Quarkus-compatible JWT signature algorithm restriction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TokenSignatureAlgorithm {
@@ -1102,7 +1110,10 @@ impl JwtValidator {
         Self {
             keys: JwtKeys::Single(Arc::new(DecodingKey::from_secret(secret.as_ref()))),
             validation,
-            role_claim_paths: Arc::from(role_claim_paths(config)),
+            role_claim_paths: Arc::from(role_claim_paths_for_source(
+                config,
+                RolesSource::AccessToken,
+            )),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
@@ -1127,7 +1138,10 @@ impl JwtValidator {
         Self {
             keys: JwtKeys::Set(Arc::new(jwks)),
             validation,
-            role_claim_paths: Arc::from(role_claim_paths(config)),
+            role_claim_paths: Arc::from(role_claim_paths_for_source(
+                config,
+                RolesSource::AccessToken,
+            )),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
@@ -1148,7 +1162,10 @@ impl JwtValidator {
         Ok(Self {
             keys: JwtKeys::Single(Arc::new(key)),
             validation,
-            role_claim_paths: Arc::from(role_claim_paths(config)),
+            role_claim_paths: Arc::from(role_claim_paths_for_source(
+                config,
+                RolesSource::AccessToken,
+            )),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
@@ -1180,7 +1197,10 @@ impl JwtValidator {
                 forced_refresh_interval: config.token.forced_jwk_refresh_interval,
             }),
             validation,
-            role_claim_paths: Arc::from(role_claim_paths(config)),
+            role_claim_paths: Arc::from(role_claim_paths_for_source(
+                config,
+                RolesSource::AccessToken,
+            )),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
@@ -1333,7 +1353,10 @@ impl IntrospectionValidator {
             expected_issuer,
             audiences: Arc::from(audiences.into_boxed_slice()),
             accepts_any_audience: config.token.accepts_any_audience(),
-            role_claim_paths: Arc::from(role_claim_paths(config)),
+            role_claim_paths: Arc::from(role_claim_paths_for_source(
+                config,
+                RolesSource::AccessToken,
+            )),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
@@ -1472,7 +1495,7 @@ impl UserInfoValidator {
     {
         Self {
             provider: Arc::new(provider),
-            role_claim_paths: Arc::from(role_claim_paths(config)),
+            role_claim_paths: Arc::from(role_claim_paths_for_source(config, RolesSource::UserInfo)),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             subject_required: config.token.subject_required,
             required_claims: Arc::new(config.token.required_claims.clone()),
@@ -3838,6 +3861,10 @@ dQIDAQAB
                 principal_claim: Some("preferred_username".to_owned()),
                 ..OidcTokenConfig::default()
             },
+            roles: OidcRolesConfig {
+                source: RolesSource::UserInfo,
+                ..OidcRolesConfig::default()
+            },
             ..OidcConfig::default()
         };
         let validator = UserInfoValidator::new(
@@ -3873,6 +3900,29 @@ dQIDAQAB
             principal.groups().collect::<Vec<_>>(),
             vec!["orders-user", "realm-admin", "orders-admin"]
         );
+    }
+
+    #[tokio::test]
+    async fn user_info_validator_skips_roles_when_source_is_access_token() {
+        let validator = UserInfoValidator::new(
+            |_token: Arc<str>| async move {
+                Ok(UserInfoResponse::from_json(
+                    r#"{
+                        "sub": "alice",
+                        "groups": ["orders-admin"]
+                    }"#,
+                )
+                .expect("UserInfo response should parse"))
+            },
+            &OidcConfig::default(),
+        );
+
+        let principal = validator
+            .validate(Arc::from("opaque-token"))
+            .await
+            .expect("UserInfo response should validate");
+
+        assert_eq!(principal.groups().collect::<Vec<_>>(), Vec::<&str>::new());
     }
 
     #[tokio::test]
@@ -4169,6 +4219,41 @@ dQIDAQAB
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_skips_roles_when_source_is_user_info() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: None,
+                ..OidcTokenConfig::default()
+            },
+            roles: OidcRolesConfig {
+                source: RolesSource::UserInfo,
+                ..OidcRolesConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec!["orders-admin"],
+            realm_access: RealmAccessClaims {
+                roles: vec!["realm-admin"],
+            },
+        });
+
+        let principal = JwtValidator::hs256("secret", &config)
+            .validate(Arc::from(token))
+            .await
+            .expect("JWT should validate");
+
+        assert_eq!(principal.groups().collect::<Vec<_>>(), Vec::<&str>::new());
     }
 
     #[tokio::test]
