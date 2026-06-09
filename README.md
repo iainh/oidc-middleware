@@ -37,7 +37,8 @@ This crate is in early development. The current implementation includes:
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths`, quoted tenant
   aliases, tenant IDs, static first-path-segment tenant selection, and optional
   header-based or issuer-based tenant selection.
-- Refreshable provider JWKS validation when a token references an unknown `kid`.
+- Refreshable provider JWKS validation when a token references an unknown `kid`,
+  with `quarkus.oidc.token.forced-jwk-refresh-interval` throttling.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
 - Configurable role extraction with `quarkus.oidc.roles.role-claim-path`,

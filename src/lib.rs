@@ -179,6 +179,8 @@ pub struct OidcTokenConfig {
     pub lifespan_grace: Option<u64>,
     /// Maximum age allowed since the token `iat` claim.
     pub age: Option<Duration>,
+    /// Minimum interval between forced JWKS refreshes after an unknown `kid`.
+    pub forced_jwk_refresh_interval: Duration,
 }
 
 impl Default for OidcTokenConfig {
@@ -196,6 +198,7 @@ impl Default for OidcTokenConfig {
             authorization_scheme: "Bearer".to_owned(),
             lifespan_grace: None,
             age: None,
+            forced_jwk_refresh_interval: Duration::from_secs(600),
         }
     }
 }
@@ -233,6 +236,9 @@ impl ConfigProperties for OidcTokenConfig {
                 .unwrap_or_else(|| "Bearer".to_owned()),
             lifespan_grace: config.get_optional(&key("lifespan-grace"))?,
             age: config.get_optional(&key("age"))?,
+            forced_jwk_refresh_interval: config
+                .get_optional(&key("forced-jwk-refresh-interval"))?
+                .unwrap_or_else(|| Duration::from_secs(600)),
         })
     }
 }
@@ -1065,6 +1071,8 @@ impl JwtValidator {
             keys: JwtKeys::Refreshing(RefreshingJwks {
                 current: Arc::new(Mutex::new(jwks)),
                 provider: Arc::new(provider),
+                last_forced_refresh: Arc::new(Mutex::new(None)),
+                forced_refresh_interval: config.token.forced_jwk_refresh_interval,
             }),
             validation,
             role_claim_paths: Arc::from(role_claim_paths(config)),
@@ -1168,6 +1176,8 @@ enum JwtKeys {
 struct RefreshingJwks {
     current: Arc<Mutex<JwkSet>>,
     provider: Arc<dyn JwksProvider>,
+    last_forced_refresh: Arc<Mutex<Option<SystemTime>>>,
+    forced_refresh_interval: Duration,
 }
 
 impl JwtKeys {
@@ -1187,6 +1197,9 @@ impl JwtKeys {
                 match key_result {
                     Ok(key) => Ok(key),
                     Err(error) if should_refresh_jwks(&error) => {
+                        if !jwks.should_force_refresh()? {
+                            return Err(error);
+                        }
                         let refreshed =
                             jwks.provider.fetch().await.map_err(Error::TokenRejected)?;
                         let key = decoding_key_from_jwks(&refreshed, token)?;
@@ -1200,6 +1213,25 @@ impl JwtKeys {
                 }
             }
         }
+    }
+}
+
+impl RefreshingJwks {
+    fn should_force_refresh(&self) -> Result<bool> {
+        let mut last_forced_refresh = self
+            .last_forced_refresh
+            .lock()
+            .map_err(|_| Error::TokenRejected("JWKS refresh lock was poisoned".into()))?;
+        let now = SystemTime::now();
+        if last_forced_refresh
+            .and_then(|last| now.duration_since(last).ok())
+            .is_some_and(|elapsed| elapsed < self.forced_refresh_interval)
+        {
+            return Ok(false);
+        }
+
+        *last_forced_refresh = Some(now);
+        Ok(true)
     }
 }
 
@@ -2684,6 +2716,7 @@ dQIDAQAB
                     .with("quarkus.oidc.token.authorization-scheme", "Token")
                     .with("quarkus.oidc.token.lifespan-grace", "5")
                     .with("quarkus.oidc.token.age", "60s")
+                    .with("quarkus.oidc.token.forced-jwk-refresh-interval", "30s")
                     .with(
                         "quarkus.oidc.roles.role-claim-path",
                         "resource_access.api.roles",
@@ -2732,6 +2765,7 @@ dQIDAQAB
                     authorization_scheme: "Token".to_owned(),
                     lifespan_grace: Some(5),
                     age: Some(Duration::from_secs(60)),
+                    forced_jwk_refresh_interval: Duration::from_secs(30),
                 },
                 roles: OidcRolesConfig {
                     role_claim_path: "resource_access.api.roles".to_owned(),
@@ -4361,6 +4395,67 @@ dQIDAQAB
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn refreshable_jwks_throttles_forced_refreshes() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: None,
+                forced_jwk_refresh_interval: Duration::from_secs(600),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let refreshes = Arc::new(Mutex::new(0usize));
+        let refreshed = rotated_jwks();
+        let provider_refreshes = refreshes.clone();
+        let validator = JwtValidator::refreshable_jwks(
+            test_jwks(),
+            move || {
+                let refreshed = refreshed.clone();
+                let provider_refreshes = provider_refreshes.clone();
+                async move {
+                    let mut refreshes = provider_refreshes
+                        .lock()
+                        .expect("refresh counter should not be poisoned");
+                    *refreshes += 1;
+                    Ok(refreshed)
+                }
+            },
+            &config,
+        );
+        let token = jwt_with_kid(
+            "missing-key",
+            TestClaims {
+                sub: "alice",
+                iss: "https://issuer.example/realms/app",
+                aud: "orders-api",
+                exp: 4_102_444_800,
+                groups: Vec::new(),
+                realm_access: RealmAccessClaims { roles: Vec::new() },
+            },
+        );
+
+        for _ in 0..2 {
+            let response = app(Oidc::builder(config.clone())
+                .validator(validator.clone())
+                .build())
+            .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+            .await
+            .expect("request should complete");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        assert_eq!(
+            *refreshes
+                .lock()
+                .expect("refresh counter should not be poisoned"),
+            1
+        );
     }
 
     #[test]
