@@ -2928,10 +2928,19 @@ fn load_role_policies(config: &Config) -> mp_config::Result<HashMap<String, Role
             .strip_prefix("quarkus.http.auth.policy.")
             .and_then(|suffix| suffix.strip_suffix(".roles-allowed"))
         {
+            let value = config.get::<String>(&key)?;
+            let roles_allowed = split_csv(&value);
+            if roles_allowed.is_empty() {
+                return Err(mp_config::ConfigError::Conversion {
+                    name: key,
+                    value,
+                    message: "roles-allowed must include at least one role".to_owned(),
+                });
+            }
             policies
                 .entry(name.to_owned())
                 .or_insert_with(RolePolicy::default)
-                .roles_allowed = split_csv(&config.get::<String>(&key)?);
+                .roles_allowed = roles_allowed;
             continue;
         }
 
@@ -6873,6 +6882,34 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("authorization policy `missing` is not defined"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn authorization_rejects_empty_roles_allowed_policy() {
+        let error = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-empty-roles", 100)
+                        .with("quarkus.http.auth.policy.empty.roles-allowed", " , ")
+                        .with("quarkus.http.auth.permission.secured.paths", "/resource")
+                        .with("quarkus.http.auth.permission.secured.policy", "empty"),
+                )
+                .build(),
+        )
+        .expect_err("empty roles-allowed should be rejected");
+
+        assert!(
+            error.to_string().contains(
+                "failed to convert config property `quarkus.http.auth.policy.empty.roles-allowed`"
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("roles-allowed must include at least one role"),
             "{error}"
         );
     }
