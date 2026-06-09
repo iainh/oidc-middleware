@@ -44,6 +44,9 @@ This crate is in early development. The current implementation includes:
   with `quarkus.oidc.token.forced-jwk-refresh-interval` throttling.
 - Quarkus token introspection configuration flags for JWT, opaque-token, and
   UserInfo validation modes.
+- OAuth2 token introspection through `IntrospectionValidator`, custom
+  `TokenIntrospector` implementations, or explicit HTTP introspection endpoint
+  builder methods.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
 - Configurable role extraction with `quarkus.oidc.roles.role-claim-path`,

@@ -75,6 +75,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Boxed error type used by extension points.
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 type ValidationFuture = Pin<Box<dyn Future<Output = Result<Principal>> + Send>>;
+/// Future returned by [`TokenIntrospector`].
+pub type IntrospectionFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<IntrospectionResponse, BoxError>> + Send>>;
 /// Future returned by [`JwksProvider`].
 pub type JwksRefreshFuture =
     Pin<Box<dyn Future<Output = std::result::Result<JwkSet, BoxError>> + Send>>;
@@ -1214,6 +1217,190 @@ impl TokenValidator for JwtValidator {
     }
 }
 
+/// OAuth2 token introspection response.
+///
+/// The standard `active` member controls whether the token is accepted. Common
+/// JWT-style members are modelled directly and remaining claims are preserved
+/// for role, principal, and required-claim extraction.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct IntrospectionResponse {
+    /// Whether the token is currently active.
+    #[serde(default)]
+    pub active: bool,
+    /// Token subject.
+    #[serde(default)]
+    pub sub: Option<String>,
+    /// Token issuer.
+    #[serde(default)]
+    pub iss: Option<String>,
+    /// Token audience.
+    #[serde(default, deserialize_with = "deserialize_audience")]
+    pub aud: Vec<String>,
+    /// Token type.
+    #[serde(default)]
+    pub typ: Option<String>,
+    /// Issued-at timestamp.
+    #[serde(default)]
+    pub iat: Option<u64>,
+    /// Additional introspection claims.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl IntrospectionResponse {
+    /// Parses an introspection response from JSON.
+    pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    fn into_claims(self) -> TokenClaims {
+        TokenClaims {
+            sub: self.sub,
+            iss: self.iss,
+            aud: self.aud,
+            typ: self.typ,
+            iat: self.iat,
+            extra: Value::Object(self.extra),
+        }
+    }
+}
+
+/// Source used to introspect opaque or remote-validated bearer tokens.
+pub trait TokenIntrospector: Send + Sync + 'static {
+    /// Introspects a raw bearer token.
+    fn introspect(&self, token: Arc<str>) -> IntrospectionFuture;
+}
+
+impl<F, Fut> TokenIntrospector for F
+where
+    F: Fn(Arc<str>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<IntrospectionResponse, BoxError>> + Send + 'static,
+{
+    fn introspect(&self, token: Arc<str>) -> IntrospectionFuture {
+        Box::pin(self(token))
+    }
+}
+
+/// Token validator backed by OAuth2 token introspection.
+#[derive(Clone)]
+pub struct IntrospectionValidator {
+    introspector: Arc<dyn TokenIntrospector>,
+    expected_issuer: Option<Arc<str>>,
+    audiences: Arc<[String]>,
+    accepts_any_audience: bool,
+    role_claim_paths: Arc<[String]>,
+    role_claim_separator: Arc<str>,
+    token_type: Option<Arc<str>>,
+    subject_required: bool,
+    issued_at_required: bool,
+    required_claims: Arc<HashMap<String, Vec<String>>>,
+    principal_claim: Option<Arc<str>>,
+    token_age: Option<Duration>,
+    leeway: u64,
+}
+
+impl IntrospectionValidator {
+    /// Builds a token introspection validator.
+    pub fn new<I>(introspector: I, config: &OidcConfig) -> Self
+    where
+        I: TokenIntrospector,
+    {
+        let expected_issuer = config
+            .token
+            .issuer
+            .as_deref()
+            .or(config.auth_server_url.as_deref())
+            .filter(|issuer| *issuer != "any")
+            .map(|issuer| Arc::from(issuer.to_owned()));
+        let audiences = config.token.audiences();
+
+        Self {
+            introspector: Arc::new(introspector),
+            expected_issuer,
+            audiences: Arc::from(audiences.into_boxed_slice()),
+            accepts_any_audience: config.token.accepts_any_audience(),
+            role_claim_paths: Arc::from(role_claim_paths(config)),
+            role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
+            token_type: config.token.token_type.clone().map(Arc::from),
+            subject_required: config.token.subject_required,
+            issued_at_required: config.token.issued_at_required,
+            required_claims: Arc::new(config.token.required_claims.clone()),
+            principal_claim: config.token.principal_claim.clone().map(Arc::from),
+            token_age: config.token.age,
+            leeway: config.token.lifespan_grace.unwrap_or_default(),
+        }
+    }
+}
+
+impl TokenValidator for IntrospectionValidator {
+    fn validate(&self, token: Arc<str>) -> ValidationFuture {
+        let introspector = self.introspector.clone();
+        let expected_issuer = self.expected_issuer.clone();
+        let audiences = self.audiences.clone();
+        let accepts_any_audience = self.accepts_any_audience;
+        let role_claim_paths = self.role_claim_paths.clone();
+        let role_claim_separator = self.role_claim_separator.clone();
+        let token_type = self.token_type.clone();
+        let subject_required = self.subject_required;
+        let issued_at_required = self.issued_at_required;
+        let required_claims = self.required_claims.clone();
+        let principal_claim = self.principal_claim.clone();
+        let token_age = self.token_age;
+        let leeway = self.leeway;
+
+        Box::pin(async move {
+            let response = introspector
+                .introspect(token)
+                .await
+                .map_err(Error::TokenRejected)?;
+            if !response.active {
+                return Err(Error::TokenRejected(
+                    "token introspection is not active".into(),
+                ));
+            }
+
+            let claims = response.into_claims();
+            validate_introspection_issuer(&claims, expected_issuer.as_deref())?;
+            validate_introspection_audience(&claims, &audiences, accepts_any_audience)?;
+            validate_token_type(None, &claims, token_type.as_deref())?;
+            validate_subject(&claims, subject_required)?;
+            validate_issued_at(&claims, issued_at_required, leeway)?;
+            validate_required_claims(&claims, &required_claims)?;
+            validate_token_age(&claims, token_age, leeway)?;
+            Principal::from_claims(
+                claims,
+                &role_claim_paths,
+                &role_claim_separator,
+                principal_claim.as_deref(),
+            )
+        })
+    }
+}
+
+#[derive(Clone)]
+struct HttpTokenIntrospector {
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl TokenIntrospector for HttpTokenIntrospector {
+    fn introspect(&self, token: Arc<str>) -> IntrospectionFuture {
+        let client = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        Box::pin(async move {
+            client
+                .post(endpoint)
+                .form(&[("token", token.as_ref())])
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<IntrospectionResponse>()
+                .await
+                .map_err(|error| Box::new(error) as BoxError)
+        })
+    }
+}
+
 /// Source used to refresh a provider JSON Web Key Set.
 pub trait JwksProvider: Send + Sync + 'static {
     /// Fetches the current JSON Web Key Set.
@@ -1342,6 +1529,44 @@ fn decoding_key_from_jwks(jwks: &JwkSet, token: &str) -> Result<DecodingKey> {
 
 fn should_refresh_jwks(error: &Error) -> bool {
     matches!(error, Error::TokenRejected(source) if source.is::<UnknownKid>())
+}
+
+fn validate_introspection_issuer(claims: &TokenClaims, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+
+    match claims.iss.as_deref() {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(Error::TokenRejected(
+            format!("introspection issuer `{actual}` did not match expected `{expected}`").into(),
+        )),
+        None => Err(Error::TokenRejected(
+            "introspection issuer claim is required".into(),
+        )),
+    }
+}
+
+fn validate_introspection_audience(
+    claims: &TokenClaims,
+    audiences: &[String],
+    accepts_any_audience: bool,
+) -> Result<()> {
+    if accepts_any_audience || audiences.is_empty() {
+        return Ok(());
+    }
+
+    if claims
+        .aud
+        .iter()
+        .any(|actual| audiences.iter().any(|expected| actual == expected))
+    {
+        return Ok(());
+    }
+
+    Err(Error::TokenRejected(
+        "introspection audience did not include a configured audience".into(),
+    ))
 }
 
 fn validate_token_type(
@@ -1694,6 +1919,43 @@ impl OidcBuilder {
             public_key,
             &self.config,
         )?));
+        Ok(self)
+    }
+
+    /// Installs a custom token introspection validator.
+    pub fn token_introspector<I>(mut self, introspector: I) -> Self
+    where
+        I: TokenIntrospector,
+    {
+        self.validator = Some(Arc::new(IntrospectionValidator::new(
+            introspector,
+            &self.config,
+        )));
+        self
+    }
+
+    /// Installs an HTTP token introspection validator.
+    pub fn introspection_endpoint(self, endpoint: &str) -> BuildResult<Self> {
+        self.introspection_endpoint_with_client(endpoint, reqwest::Client::new())
+    }
+
+    /// Installs an HTTP token introspection validator using a caller-supplied client.
+    pub fn introspection_endpoint_with_client(
+        mut self,
+        endpoint: &str,
+        client: reqwest::Client,
+    ) -> BuildResult<Self> {
+        reqwest::Url::parse(endpoint).map_err(|error| BuildError::InvalidUrl {
+            url: endpoint.to_owned(),
+            message: error.to_string(),
+        })?;
+        self.validator = Some(Arc::new(IntrospectionValidator::new(
+            HttpTokenIntrospector {
+                client,
+                endpoint: endpoint.to_owned(),
+            },
+            &self.config,
+        )));
         Ok(self)
     }
 
@@ -3168,6 +3430,115 @@ dQIDAQAB
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn introspection_validator_accepts_active_token_and_extracts_roles() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            client_id: Some("orders-service".to_owned()),
+            token: OidcTokenConfig {
+                audience: Some("orders-api".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let validator = IntrospectionValidator::new(
+            |token: Arc<str>| async move {
+                assert_eq!(token.as_ref(), "opaque-token");
+                Ok(IntrospectionResponse::from_json(
+                    r#"{
+                        "active": true,
+                        "sub": "alice",
+                        "iss": "https://issuer.example/realms/app",
+                        "aud": ["orders-api"],
+                        "iat": 1700000000,
+                        "groups": ["orders-user"],
+                        "realm_access": {
+                            "roles": ["realm-admin"]
+                        },
+                        "resource_access": {
+                            "orders-service": {
+                                "roles": ["orders-admin"]
+                            }
+                        }
+                    }"#,
+                )
+                .expect("introspection response should parse"))
+            },
+            &config,
+        );
+
+        let principal = validator
+            .validate(Arc::from("opaque-token"))
+            .await
+            .expect("active token should validate");
+
+        assert_eq!(principal.subject(), "alice");
+        assert_eq!(
+            principal.issuer(),
+            Some("https://issuer.example/realms/app")
+        );
+        assert_eq!(principal.audience().collect::<Vec<_>>(), vec!["orders-api"]);
+        assert_eq!(
+            principal.groups().collect::<Vec<_>>(),
+            vec!["orders-user", "realm-admin", "orders-admin"]
+        );
+    }
+
+    #[tokio::test]
+    async fn introspection_validator_rejects_inactive_token() {
+        let validator = IntrospectionValidator::new(
+            |_token: Arc<str>| async move { Ok(IntrospectionResponse::default()) },
+            &OidcConfig::default(),
+        );
+
+        let error = validator
+            .validate(Arc::from("opaque-token"))
+            .await
+            .expect_err("inactive token should be rejected");
+
+        assert!(
+            error.to_string().contains("introspection is not active"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn introspection_validator_applies_configured_audience() {
+        let config = OidcConfig {
+            token: OidcTokenConfig {
+                audience: Some("orders-api".to_owned()),
+                issued_at_required: false,
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let validator = IntrospectionValidator::new(
+            |_token: Arc<str>| async move {
+                Ok(IntrospectionResponse::from_json(
+                    r#"{
+                        "active": true,
+                        "sub": "alice",
+                        "aud": "inventory-api"
+                    }"#,
+                )
+                .expect("introspection response should parse"))
+            },
+            &config,
+        );
+
+        let error = validator
+            .validate(Arc::from("opaque-token"))
+            .await
+            .expect_err("wrong audience should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("introspection audience did not include"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
