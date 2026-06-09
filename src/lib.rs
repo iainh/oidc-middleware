@@ -651,6 +651,9 @@ impl Authorization {
     pub fn from_config(config: &Config) -> mp_config::Result<Self> {
         let role_policies = load_role_policies(config)?;
         let role_mappings = load_role_mappings(config, "quarkus.http.auth.roles-mapping")?;
+        let root_path = config
+            .get_optional::<String>("quarkus.http.root-path")?
+            .unwrap_or_else(|| "/".to_owned());
         let mut permissions = Vec::new();
 
         for name in permission_names(config) {
@@ -662,7 +665,10 @@ impl Authorization {
                 continue;
             }
 
-            let paths = split_csv(&config.get::<String>(&format!("{prefix}.paths"))?);
+            let paths = normalize_permission_paths(
+                split_csv(&config.get::<String>(&format!("{prefix}.paths"))?),
+                &root_path,
+            );
             let methods = config
                 .get_optional::<String>(&format!("{prefix}.methods"))?
                 .map(|methods| {
@@ -2119,6 +2125,31 @@ fn split_csv(value: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn normalize_permission_paths(paths: Vec<String>, root_path: &str) -> Vec<String> {
+    let root_path = normalize_root_path(root_path);
+    paths
+        .into_iter()
+        .map(|path| {
+            if path.starts_with('/') {
+                path
+            } else if root_path == "/" {
+                format!("/{path}")
+            } else {
+                format!("{root_path}/{path}")
+            }
+        })
+        .collect()
+}
+
+fn normalize_root_path(root_path: &str) -> String {
+    let root_path = root_path.trim();
+    if root_path.is_empty() || root_path == "/" {
+        return "/".to_owned();
+    }
+
+    format!("/{}", root_path.trim_matches('/'))
 }
 
 fn path_match_score(pattern: &str, request_path: &str) -> Option<usize> {
@@ -4717,6 +4748,64 @@ dQIDAQAB
     }
 
     #[tokio::test]
+    async fn authorization_prepends_root_path_to_relative_permission_paths() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-root-path-relative", 100)
+                        .with("quarkus.http.root-path", "/api")
+                        .with("quarkus.http.auth.permission.deny.paths", "admin/*")
+                        .with("quarkus.http.auth.permission.deny.policy", "deny"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/admin/users", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(request("/api/admin/users", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorization_keeps_absolute_permission_paths_with_root_path() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-root-path-absolute", 100)
+                        .with("quarkus.http.root-path", "/api")
+                        .with("quarkus.http.auth.permission.deny.paths", "/admin/*")
+                        .with("quarkus.http.auth.permission.deny.policy", "deny"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/admin/users", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(request("/admin/users", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn authorization_prefers_method_specific_permission_for_same_path() {
         let authorization = Authorization::from_config(
             &Config::builder()
@@ -4894,6 +4983,14 @@ dQIDAQAB
         assert!(path_match_score("/public*", "/public").is_some());
         assert!(path_match_score("/public*", "/public/css/site.css").is_some());
         assert_eq!(path_match_score("/public*", "/public-info"), None);
+    }
+
+    #[test]
+    fn relative_permission_paths_are_normalized_with_root_path() {
+        assert_eq!(
+            normalize_permission_paths(vec!["public/*".to_owned(), "/fixed/*".to_owned()], "/api/"),
+            vec!["/api/public/*".to_owned(), "/fixed/*".to_owned()]
+        );
     }
 
     #[test]
