@@ -793,7 +793,12 @@ fn policies_requirement(
             HttpPolicy::Authenticated => authenticated = true,
             HttpPolicy::Roles(role_policy) => {
                 authenticated = true;
-                if !role_policy.roles_allowed.is_empty() {
+                if !role_policy.roles_allowed.is_empty()
+                    && !role_policy
+                        .roles_allowed
+                        .iter()
+                        .any(|role| role.as_str() == "**")
+                {
                     let mut roles = role_policy.roles_allowed.clone();
                     roles.sort();
                     roles.dedup();
@@ -5216,6 +5221,35 @@ dQIDAQAB
 
         let response = app
             .oneshot(request("/api/orders", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authorization_double_star_role_requires_authentication_only() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-policy-double-star", 100)
+                        .with("quarkus.http.auth.policy.any.roles-allowed", "**")
+                        .with("quarkus.http.auth.permission.any.paths", "/authenticated")
+                        .with("quarkus.http.auth.permission.any.policy", "any"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app_with_principal(authorization, Principal::new("test"));
+
+        let response = app
+            .clone()
+            .oneshot(request("/authenticated", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request("/authenticated", Some("Bearer test-token")))
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::OK);

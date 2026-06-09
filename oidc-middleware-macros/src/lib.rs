@@ -92,13 +92,16 @@ fn expand_roles_allowed(roles: RolesAllowedArgs, function: &mut ItemFn) -> Token
         };
     }
 
-    let role_values = roles.roles.iter();
-    let check = quote! {
-        if !principal.has_any_group([#(#role_values),*]) {
-            return ::std::result::Result::Err(::oidc_middleware::Error::Forbidden);
-        }
-    };
-    function.block.stmts.insert(0, syn::parse_quote!(#check));
+    let authenticated_only = roles.roles.iter().any(|role| role.value() == "**");
+    if !authenticated_only {
+        let role_values = roles.roles.iter();
+        let check = quote! {
+            if !principal.has_any_group([#(#role_values),*]) {
+                return ::std::result::Result::Err(::oidc_middleware::Error::Forbidden);
+            }
+        };
+        function.block.stmts.insert(0, syn::parse_quote!(#check));
+    }
 
     quote! {
         #function

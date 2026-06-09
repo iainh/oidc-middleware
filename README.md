@@ -42,13 +42,13 @@ This crate is in early development. The current implementation includes:
   including quoted namespace paths, and
   `quarkus.oidc.roles.role-claim-separator`.
 - Quarkus-style `quarkus.http.auth.permission.*` path policies for `permit`,
-  `deny`, `authenticated`, named `roles-allowed` policies, method-specific
-  matches, `quarkus.http.root-path` relative path handling, exact
-  trailing-slash matching, segment wildcards, method-mismatch rejection,
-  simultaneous winning role policies, disabled or shared permission entries,
-  and global or policy-local role mappings.
+  `deny`, `authenticated`, named `roles-allowed` policies including the `**`
+  authenticated role, method-specific matches, `quarkus.http.root-path`
+  relative path handling, exact trailing-slash matching, segment wildcards,
+  method-mismatch rejection, simultaneous winning role policies, disabled or
+  shared permission entries, and global or policy-local role mappings.
 - `#[roles_allowed(...)]` handler macro for Quarkus-style role checks with the
-  `OidcPrincipal` extractor.
+  `OidcPrincipal` extractor, including `**` for any authenticated principal.
 - Quarkus-style handling for disabled OIDC and disabled tenants.
 
 ```rust

@@ -13,6 +13,12 @@ async fn admin(principal: OidcPrincipal) -> Result<&'static str, Error> {
     Ok("admin")
 }
 
+#[roles_allowed("**")]
+async fn authenticated(principal: OidcPrincipal) -> Result<&'static str, Error> {
+    assert_eq!(principal.subject(), "alice");
+    Ok("authenticated")
+}
+
 #[tokio::test]
 async fn roles_allowed_macro_accepts_matching_group() {
     let response = app(["admin"])
@@ -43,20 +49,47 @@ async fn roles_allowed_macro_requires_authentication() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn roles_allowed_macro_double_star_accepts_authenticated_without_group() {
+    let response = app(["user"])
+        .oneshot(request_to("/authenticated", Some("Bearer test-token")))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn roles_allowed_macro_double_star_requires_authentication() {
+    let response = app(["admin"])
+        .oneshot(request_to("/authenticated", None))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
 fn app(groups: impl IntoIterator<Item = &'static str>) -> Router {
-    Router::new().route("/admin", get(admin)).layer(
-        Oidc::builder(OidcConfig::default())
-            .validator(StaticTokenValidator::principal(
-                "test-token",
-                Principal::with_groups("alice", groups),
-            ))
-            .build()
-            .layer(),
-    )
+    Router::new()
+        .route("/admin", get(admin))
+        .route("/authenticated", get(authenticated))
+        .layer(
+            Oidc::builder(OidcConfig::default())
+                .validator(StaticTokenValidator::principal(
+                    "test-token",
+                    Principal::with_groups("alice", groups),
+                ))
+                .build()
+                .layer(),
+        )
 }
 
 fn request(authorization: Option<&str>) -> Request<Body> {
-    let mut builder = Request::builder().uri("/admin");
+    request_to("/admin", authorization)
+}
+
+fn request_to(uri: &str, authorization: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(uri);
     if let Some(authorization) = authorization {
         builder = builder.header(AUTHORIZATION, authorization);
     }
