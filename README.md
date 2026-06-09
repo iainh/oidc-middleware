@@ -18,6 +18,7 @@ This crate is in early development. The current implementation includes:
 - JWT string claim enforcement with `quarkus.oidc.token.required-claims.*`.
 - JWT lifespan grace and age checks with `quarkus.oidc.token.lifespan-grace`
   and `quarkus.oidc.token.age`.
+- Principal-name selection with `quarkus.oidc.token.principal-claim`.
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths` and optional
   header-based tenant selection.
 - Refreshable provider JWKS validation when a token references an unknown `kid`.
