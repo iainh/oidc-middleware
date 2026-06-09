@@ -15,6 +15,7 @@ This crate is in early development. The current implementation includes:
 - Audience validation from `quarkus.oidc.token.audience`, defaulting to
   `quarkus.oidc.client-id` when present.
 - JWT `typ` claim enforcement with `quarkus.oidc.token.token-type`.
+- JWT string claim enforcement with `quarkus.oidc.token.required-claims.*`.
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths` and optional
   header-based tenant selection.
 - Refreshable provider JWKS validation when a token references an unknown `kid`.

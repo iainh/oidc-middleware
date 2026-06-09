@@ -127,8 +127,7 @@ impl Default for OidcConfig {
 }
 
 /// Token validation configuration loaded from `quarkus.oidc.token.*`.
-#[derive(Clone, Debug, ConfigProperties, Default, Eq, PartialEq)]
-#[config(rename_all = "kebab-case")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OidcTokenConfig {
     /// Expected token issuer. Defaults to `auth-server-url` when unset.
     pub issuer: Option<String>,
@@ -136,6 +135,31 @@ pub struct OidcTokenConfig {
     pub audience: Option<String>,
     /// Expected JWT `typ` claim value.
     pub token_type: Option<String>,
+    /// Required claims and their expected string values.
+    pub required_claims: HashMap<String, Vec<String>>,
+}
+
+impl ConfigProperties for OidcTokenConfig {
+    fn from_config(config: &Config) -> mp_config::Result<Self> {
+        Self::from_config_prefix(config, "")
+    }
+
+    fn from_config_prefix(config: &Config, prefix: &str) -> mp_config::Result<Self> {
+        let key = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+
+        Ok(Self {
+            issuer: config.get_optional(&key("issuer"))?,
+            audience: config.get_optional(&key("audience"))?,
+            token_type: config.get_optional(&key("token-type"))?,
+            required_claims: load_required_claims(config, &key("required-claims"))?,
+        })
+    }
 }
 
 /// Role extraction configuration loaded from `quarkus.oidc.roles.*`.
@@ -631,6 +655,7 @@ pub struct JwtValidator {
     validation: Validation,
     role_claim_paths: Arc<[String]>,
     token_type: Option<Arc<str>>,
+    required_claims: Arc<HashMap<String, Vec<String>>>,
 }
 
 impl JwtValidator {
@@ -648,6 +673,7 @@ impl JwtValidator {
             validation,
             role_claim_paths: Arc::from(config.roles.claim_paths()),
             token_type: config.token.token_type.clone().map(Arc::from),
+            required_claims: Arc::new(config.token.required_claims.clone()),
         }
     }
 
@@ -671,6 +697,7 @@ impl JwtValidator {
             validation,
             role_claim_paths: Arc::from(config.roles.claim_paths()),
             token_type: config.token.token_type.clone().map(Arc::from),
+            required_claims: Arc::new(config.token.required_claims.clone()),
         }
     }
 
@@ -699,6 +726,7 @@ impl JwtValidator {
             validation,
             role_claim_paths: Arc::from(config.roles.claim_paths()),
             token_type: config.token.token_type.clone().map(Arc::from),
+            required_claims: Arc::new(config.token.required_claims.clone()),
         }
     }
 }
@@ -709,6 +737,7 @@ impl TokenValidator for JwtValidator {
         let validation = self.validation.clone();
         let role_claim_paths = self.role_claim_paths.clone();
         let token_type = self.token_type.clone();
+        let required_claims = self.required_claims.clone();
 
         Box::pin(async move {
             let key = keys.decoding_key(&token).await?;
@@ -716,6 +745,7 @@ impl TokenValidator for JwtValidator {
                 .map_err(|error| Error::TokenRejected(Box::new(error)))
                 .and_then(|data| {
                     validate_token_type(&data.claims, token_type.as_deref())?;
+                    validate_required_claims(&data.claims, &required_claims)?;
                     Ok(Principal::from_claims(data.claims, &role_claim_paths))
                 })
         })
@@ -841,6 +871,49 @@ fn validate_token_type(claims: &TokenClaims, expected: Option<&str>) -> Result<(
         None => Err(Error::TokenRejected(
             format!("JWT typ claim is required to be `{expected}`").into(),
         )),
+    }
+}
+
+fn validate_required_claims(
+    claims: &TokenClaims,
+    required_claims: &HashMap<String, Vec<String>>,
+) -> Result<()> {
+    for (claim_name, expected_values) in required_claims {
+        let actual_values = claim_string_values(claims, claim_name).ok_or_else(|| {
+            Error::TokenRejected(format!("JWT claim `{claim_name}` is required").into())
+        })?;
+
+        for expected in expected_values {
+            if !actual_values.iter().any(|actual| actual == expected) {
+                return Err(Error::TokenRejected(
+                    format!("JWT claim `{claim_name}` did not include required value `{expected}`")
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn claim_string_values(claims: &TokenClaims, claim_name: &str) -> Option<Vec<String>> {
+    match claim_name {
+        "sub" => Some(vec![claims.sub.clone()]),
+        "iss" => claims.iss.clone().map(|issuer| vec![issuer]),
+        "aud" => Some(claims.aud.clone()),
+        "typ" => claims.typ.clone().map(|token_type| vec![token_type]),
+        _ => json_string_values(claims.extra.get(claim_name)?),
+    }
+}
+
+fn json_string_values(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::String(value) => Some(vec![value.clone()]),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect(),
+        _ => None,
     }
 }
 
@@ -1334,6 +1407,30 @@ fn load_role_policies(config: &Config) -> mp_config::Result<HashMap<String, Vec<
     Ok(policies)
 }
 
+fn load_required_claims(
+    config: &Config,
+    prefix: &str,
+) -> mp_config::Result<HashMap<String, Vec<String>>> {
+    let mut claims = HashMap::new();
+    let property_prefix = format!("{prefix}.");
+
+    for key in config.property_names() {
+        let Some(claim_name) = key.strip_prefix(&property_prefix) else {
+            continue;
+        };
+        if claim_name.is_empty() || claim_name.contains('.') {
+            continue;
+        }
+
+        claims.insert(
+            claim_name.to_owned(),
+            split_csv(&config.get::<String>(&key)?),
+        );
+    }
+
+    Ok(claims)
+}
+
 fn has_default_tenant_config(config: &Config) -> bool {
     config.property_names().into_iter().any(|key| {
         key == "quarkus.oidc.enabled"
@@ -1342,6 +1439,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.client-id"
             || key == "quarkus.oidc.tenant-paths"
             || key == "quarkus.oidc.application-type"
+            || key.starts_with("quarkus.oidc.token.")
     })
 }
 
@@ -1364,6 +1462,7 @@ fn named_tenant_names(config: &Config) -> Vec<String> {
                     | "tenant-paths"
                     | "application-type"
             )
+            || property.starts_with("token.")
         {
             names.insert(name.to_owned());
         }
@@ -1570,6 +1669,8 @@ mod tests {
                     .with("quarkus.oidc.application-type", "hybrid")
                     .with("quarkus.oidc.token.audience", "orders-api")
                     .with("quarkus.oidc.token.token-type", "bearer")
+                    .with("quarkus.oidc.token.required-claims.org_id", "org_xyz")
+                    .with("quarkus.oidc.token.required-claims.scope", "read,write")
                     .with(
                         "quarkus.oidc.roles.role-claim-path",
                         "resource_access.api.roles",
@@ -1592,6 +1693,13 @@ mod tests {
                     issuer: None,
                     audience: Some("orders-api".to_owned()),
                     token_type: Some("bearer".to_owned()),
+                    required_claims: HashMap::from([
+                        ("org_id".to_owned(), vec!["org_xyz".to_owned()]),
+                        (
+                            "scope".to_owned(),
+                            vec!["read".to_owned(), "write".to_owned()],
+                        ),
+                    ]),
                 },
                 roles: OidcRolesConfig {
                     role_claim_path: "resource_access.api.roles".to_owned(),
@@ -1677,6 +1785,7 @@ mod tests {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
                 token_type: None,
+                ..OidcTokenConfig::default()
             },
             ..OidcConfig::default()
         };
@@ -1711,6 +1820,7 @@ mod tests {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
                 token_type: None,
+                ..OidcTokenConfig::default()
             },
             roles: OidcRolesConfig {
                 role_claim_path: "resource_access.orders.roles".to_owned(),
@@ -1803,6 +1913,7 @@ mod tests {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
                 token_type: Some("bearer".to_owned()),
+                ..OidcTokenConfig::default()
             },
             ..OidcConfig::default()
         };
@@ -1834,6 +1945,7 @@ mod tests {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
                 token_type: Some("bearer".to_owned()),
+                ..OidcTokenConfig::default()
             },
             ..OidcConfig::default()
         };
@@ -1863,6 +1975,7 @@ mod tests {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
                 token_type: Some("bearer".to_owned()),
+                ..OidcTokenConfig::default()
             },
             ..OidcConfig::default()
         };
@@ -1873,6 +1986,110 @@ mod tests {
             exp: 4_102_444_800,
             groups: Vec::new(),
             realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_accepts_required_claim_values() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                required_claims: HashMap::from([
+                    ("org_id".to_owned(), vec!["org_xyz".to_owned()]),
+                    (
+                        "scope".to_owned(),
+                        vec!["read".to_owned(), "write".to_owned()],
+                    ),
+                ]),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(RequiredClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            org_id: "org_xyz",
+            scope: vec!["read", "write", "delete"],
+            exp: 4_102_444_800,
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_missing_required_claim() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                required_claims: HashMap::from([("org_id".to_owned(), vec!["org_xyz".to_owned()])]),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_missing_required_claim_value() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                required_claims: HashMap::from([(
+                    "scope".to_owned(),
+                    vec!["read".to_owned(), "write".to_owned()],
+                )]),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(RequiredClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            org_id: "org_xyz",
+            scope: vec!["read"],
+            exp: 4_102_444_800,
         });
 
         let response = app(Oidc::builder(config.clone())
@@ -1922,6 +2139,7 @@ mod tests {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
                 token_type: None,
+                ..OidcTokenConfig::default()
             },
             ..OidcConfig::default()
         };
@@ -1988,6 +2206,7 @@ mod tests {
                 issuer: None,
                 audience: Some("orders-api".to_owned()),
                 token_type: None,
+                ..OidcTokenConfig::default()
             },
             ..OidcConfig::default()
         };
@@ -2084,6 +2303,7 @@ mod tests {
                     issuer: None,
                     audience: Some("orders-api".to_owned()),
                     token_type: None,
+                    ..OidcTokenConfig::default()
                 },
                 ..OidcConfig::default()
             })
@@ -2575,6 +2795,16 @@ mod tests {
         iss: &'a str,
         aud: &'a str,
         typ: &'a str,
+        exp: u64,
+    }
+
+    #[derive(Serialize)]
+    struct RequiredClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        org_id: &'a str,
+        scope: Vec<&'a str>,
         exp: u64,
     }
 
