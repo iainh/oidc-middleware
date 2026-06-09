@@ -1883,23 +1883,84 @@ fn split_csv(value: &str) -> Vec<String> {
 
 fn path_match_score(pattern: &str, request_path: &str) -> Option<usize> {
     if pattern == request_path {
-        return Some(10_000 + pattern.len());
+        return Some(1_000_000 + pattern.len());
     }
 
     if pattern == "/*" {
         return Some(1);
     }
 
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        let prefix = format!("{prefix}/");
-        return request_path.starts_with(&prefix).then_some(prefix.len());
-    }
-
     if let Some(prefix) = pattern.strip_suffix('*') {
-        return request_path.starts_with(prefix).then_some(prefix.len());
+        if let Some(score) = trailing_wildcard_match_score(prefix, request_path) {
+            return Some(score);
+        }
     }
 
-    None
+    segment_wildcard_match_score(pattern, request_path)
+}
+
+fn trailing_wildcard_match_score(prefix: &str, request_path: &str) -> Option<usize> {
+    let prefix = prefix.trim_end_matches('/');
+    if request_path != prefix
+        && !request_path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+    {
+        return None;
+    }
+
+    let literal_chars = path_literal_chars(prefix);
+    Some(wildcard_score(literal_chars, literal_chars))
+}
+
+fn segment_wildcard_match_score(pattern: &str, request_path: &str) -> Option<usize> {
+    let pattern_segments = split_path_segments(pattern);
+    let wildcard_index = pattern_segments
+        .iter()
+        .position(|segment| *segment == "*")?;
+    let request_segments = split_path_segments(request_path);
+    if pattern_segments.len() != request_segments.len() {
+        return None;
+    }
+
+    let mut total_literal_chars = 0;
+    for (pattern_segment, request_segment) in pattern_segments.iter().zip(request_segments) {
+        if *pattern_segment == "*" {
+            continue;
+        }
+        if pattern_segment.contains('*') {
+            return None;
+        }
+        if *pattern_segment != request_segment {
+            return None;
+        }
+        total_literal_chars += pattern_segment.len();
+    }
+
+    let leading_literal_chars = pattern_segments
+        .iter()
+        .take(wildcard_index)
+        .map(|segment| segment.len())
+        .sum();
+    Some(wildcard_score(leading_literal_chars, total_literal_chars))
+}
+
+fn wildcard_score(leading_literal_chars: usize, total_literal_chars: usize) -> usize {
+    100 + leading_literal_chars * 1_000 + total_literal_chars
+}
+
+fn path_literal_chars(path: &str) -> usize {
+    split_path_segments(path)
+        .into_iter()
+        .map(|segment| segment.len())
+        .sum()
+}
+
+fn split_path_segments(path: &str) -> Vec<&str> {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc<str>> {
@@ -3684,6 +3745,86 @@ mod tests {
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authorization_matches_single_segment_wildcards() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-segment-wildcard", 100)
+                        .with(
+                            "quarkus.http.auth.permission.secured.paths",
+                            "/api/*/detail",
+                        )
+                        .with(
+                            "quarkus.http.auth.permission.secured.policy",
+                            "authenticated",
+                        )
+                        .with(
+                            "quarkus.http.auth.permission.public.paths",
+                            "/api/public-product/detail",
+                        )
+                        .with("quarkus.http.auth.permission.public.policy", "permit"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/product/detail", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/product/detail", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/product/other", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(request("/api/public-product/detail", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn path_match_scores_single_segment_wildcards_by_specificity() {
+        let exact = path_match_score("/one/two/three/four/five", "/one/two/three/four/five")
+            .expect("exact path should match");
+        let trailing = path_match_score("/one/two/three/four/*", "/one/two/three/four/five")
+            .expect("trailing wildcard path should match");
+        let middle = path_match_score("/one/two/three/*/five", "/one/two/three/four/five")
+            .expect("middle wildcard path should match");
+        let root = path_match_score("/*", "/one/two/three/four/five")
+            .expect("root wildcard path should match");
+
+        assert!(exact > trailing);
+        assert!(trailing > middle);
+        assert!(middle > root);
+        assert_eq!(
+            path_match_score("/one/two/*/five", "/one/two/three/four/five"),
+            None
+        );
+        assert_eq!(
+            path_match_score("/one/two/*four/five", "/one/two/three/four/five"),
+            None
+        );
+        assert!(path_match_score("/public*", "/public").is_some());
+        assert!(path_match_score("/public*", "/public/css/site.css").is_some());
+        assert_eq!(path_match_score("/public*", "/public-info"), None);
     }
 
     #[tokio::test]
