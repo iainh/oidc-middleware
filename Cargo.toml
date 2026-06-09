@@ -1,0 +1,22 @@
+[package]
+name = "oidc-middleware"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Quarkus-inspired OIDC middleware for Axum."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["axum", "oidc", "oauth2", "microprofile"]
+categories = ["web-programming::http-server", "authentication"]
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["json"] }
+http = "1"
+mp-config = { path = "../mp-config" }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+tower-layer = "0.3"
+tower-service = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
