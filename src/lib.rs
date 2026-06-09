@@ -722,6 +722,7 @@ struct HttpPermission {
 
 impl HttpPermission {
     fn matches(&self, method: &http::Method, request_path: &str) -> Option<usize> {
+        let method_score = if self.methods.is_empty() { 0 } else { 1 };
         if !self.methods.is_empty()
             && !self
                 .methods
@@ -734,6 +735,7 @@ impl HttpPermission {
         self.paths
             .iter()
             .filter_map(|path| path_match_score(path, request_path))
+            .map(|path_score| path_score * 2 + method_score)
             .max()
     }
 }
@@ -3449,6 +3451,48 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authorization_prefers_method_specific_permission_for_same_path() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-method-specific-permission", 100)
+                        .with("quarkus.http.auth.permission.deny.paths", "/resource")
+                        .with("quarkus.http.auth.permission.deny.policy", "deny")
+                        .with("quarkus.http.auth.permission.permit-get.paths", "/resource")
+                        .with("quarkus.http.auth.permission.permit-get.methods", "GET")
+                        .with("quarkus.http.auth.permission.permit-get.policy", "permit"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/resource", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_method(http::Method::POST, "/resource", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request_with_method(
+                http::Method::POST,
+                "/resource",
+                Some("Bearer test-token"),
+            ))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
