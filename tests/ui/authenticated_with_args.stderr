@@ -1,0 +1,13 @@
+error: #[authenticated] does not accept arguments
+ --> tests/ui/authenticated_with_args.rs:3:17
+  |
+3 | #[authenticated("admin")]
+  |                 ^^^^^^^
+
+warning: unused imports: `Error` and `OidcPrincipal`
+ --> tests/ui/authenticated_with_args.rs:1:23
+  |
+1 | use oidc_middleware::{Error, OidcPrincipal, authenticated};
+  |                       ^^^^^  ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

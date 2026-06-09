@@ -69,8 +69,9 @@ This crate is in early development. The current implementation includes:
   relative path handling, exact trailing-slash matching, segment wildcards,
   method-mismatch rejection, simultaneous winning role policies, disabled or
   shared permission entries, and global or policy-local role mappings.
-- `#[roles_allowed(...)]` handler macro for Quarkus-style role checks with the
-  `OidcPrincipal` extractor, including `**` for any authenticated principal.
+- `#[roles_allowed(...)]` and `#[authenticated]` handler macros for
+  Quarkus-style authorization checks with the `OidcPrincipal` extractor,
+  including `**` for any authenticated principal.
 - Quarkus-style handling for disabled OIDC and disabled tenants.
 
 ```rust

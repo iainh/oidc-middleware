@@ -38,7 +38,7 @@
 //! - `quarkus.oidc.enabled=false` disables authentication for the layer.
 //! - `quarkus.oidc.tenant-enabled=false` rejects requests as tenant-disabled.
 
-pub use oidc_middleware_macros::roles_allowed;
+pub use oidc_middleware_macros::{authenticated, roles_allowed};
 
 use axum::body::Body;
 use axum::extract::FromRequestParts;
