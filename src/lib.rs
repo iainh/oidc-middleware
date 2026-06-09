@@ -676,6 +676,8 @@ pub enum BuildError {
     MissingAuthServerUrl,
     /// Direct JWKS loading requires `quarkus.oidc.jwks-path`.
     MissingJwksPath,
+    /// Remote token introspection requires a configured or discovered endpoint.
+    MissingIntrospectionEndpoint,
     /// The configured public key could not be parsed.
     InvalidPublicKey(BoxError),
     /// A configured provider or metadata URL could not be parsed.
@@ -694,6 +696,10 @@ impl fmt::Display for BuildError {
             Self::MissingJwksPath => write!(
                 f,
                 "OIDC JWKS loading requires `quarkus.oidc.jwks-path` when discovery is disabled"
+            ),
+            Self::MissingIntrospectionEndpoint => write!(
+                f,
+                "OIDC token introspection requires an introspection endpoint"
             ),
             Self::InvalidPublicKey(source) => write!(f, "invalid OIDC public key: {source}"),
             Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
@@ -1976,6 +1982,18 @@ impl OidcBuilder {
             .clone()
             .ok_or(BuildError::MissingAuthServerUrl)?;
         if !self.config.discovery_enabled {
+            if self.config.token.require_jwt_introspection_only {
+                let introspection_path = self
+                    .config
+                    .introspection_path
+                    .clone()
+                    .ok_or(BuildError::MissingIntrospectionEndpoint)?;
+                let endpoint = provider_endpoint_url(&auth_server_url, &introspection_path)?;
+                return self
+                    .introspection_endpoint_with_client(endpoint.as_str(), client)
+                    .map(OidcBuilder::build);
+            }
+
             let jwks_path = self
                 .config
                 .jwks_path
@@ -2002,6 +2020,17 @@ impl OidcBuilder {
             .error_for_status()?
             .json()
             .await?;
+
+        if self.config.token.require_jwt_introspection_only {
+            let endpoint = metadata
+                .introspection_endpoint
+                .as_deref()
+                .ok_or(BuildError::MissingIntrospectionEndpoint)?;
+            return self
+                .introspection_endpoint_with_client(endpoint, client)
+                .map(OidcBuilder::build);
+        }
+
         let jwks: JwkSet = client
             .get(&metadata.jwks_uri)
             .send()
@@ -2015,11 +2044,12 @@ impl OidcBuilder {
 
     /// Installs provider metadata and a JWKS-backed JWT validator.
     pub fn provider_metadata(mut self, metadata: ProviderMetadata, jwks: JwkSet) -> Oidc {
-        let mut validation_config = self.config.clone();
-        if validation_config.token.issuer.is_none() {
-            validation_config.token.issuer = metadata.issuer;
+        if self.config.token.require_jwt_introspection_only {
+            self.install_metadata_introspection(metadata, reqwest::Client::new());
+            return self.build();
         }
 
+        let validation_config = provider_validation_config(&self.config, &metadata);
         self.validator = Some(Arc::new(JwtValidator::jwks(jwks, &validation_config)));
         self.build()
     }
@@ -2031,11 +2061,12 @@ impl OidcBuilder {
         jwks: JwkSet,
         client: reqwest::Client,
     ) -> Oidc {
-        let mut validation_config = self.config.clone();
-        if validation_config.token.issuer.is_none() {
-            validation_config.token.issuer = metadata.issuer;
+        if self.config.token.require_jwt_introspection_only {
+            self.install_metadata_introspection(metadata, client);
+            return self.build();
         }
 
+        let validation_config = provider_validation_config(&self.config, &metadata);
         self.validator = Some(Arc::new(JwtValidator::refreshable_jwks(
             jwks,
             HttpJwksProvider {
@@ -2045,6 +2076,21 @@ impl OidcBuilder {
             &validation_config,
         )));
         self.build()
+    }
+
+    fn install_metadata_introspection(
+        &mut self,
+        metadata: ProviderMetadata,
+        client: reqwest::Client,
+    ) {
+        let Some(endpoint) = metadata.introspection_endpoint.clone() else {
+            return;
+        };
+        let validation_config = provider_validation_config(&self.config, &metadata);
+        self.validator = Some(Arc::new(IntrospectionValidator::new(
+            HttpTokenIntrospector { client, endpoint },
+            &validation_config,
+        )));
     }
 
     /// Finishes the OIDC middleware.
@@ -2781,6 +2827,14 @@ fn provider_endpoint_url(auth_server_url: &str, path: &str) -> BuildResult<reqwe
         url,
         message: error.to_string(),
     })
+}
+
+fn provider_validation_config(config: &OidcConfig, metadata: &ProviderMetadata) -> OidcConfig {
+    let mut validation_config = config.clone();
+    if validation_config.token.issuer.is_none() {
+        validation_config.token.issuer = metadata.issuer.clone();
+    }
+    validation_config
 }
 
 fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
@@ -5059,6 +5113,26 @@ dQIDAQAB
         assert!(matches!(error, BuildError::MissingJwksPath));
     }
 
+    #[tokio::test]
+    async fn discovery_disabled_requires_introspection_path_for_introspection_only() {
+        let result = Oidc::builder(OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            discovery_enabled: false,
+            token: OidcTokenConfig {
+                require_jwt_introspection_only: true,
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .discover()
+        .await;
+        let Err(error) = result else {
+            panic!("introspection-only discovery requires introspection-path");
+        };
+
+        assert!(matches!(error, BuildError::MissingIntrospectionEndpoint));
+    }
+
     #[test]
     fn provider_metadata_parses_oidc_discovery_document() {
         let metadata = ProviderMetadata::from_json(
@@ -5142,6 +5216,42 @@ dQIDAQAB
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn provider_metadata_uses_introspection_when_required() {
+        let token = jwt_with_kid(
+            "test-key",
+            TestClaims {
+                sub: "alice",
+                iss: "https://issuer.example/realms/app",
+                aud: "orders-api",
+                exp: 4_102_444_800,
+                groups: vec!["admin"],
+                realm_access: RealmAccessClaims {
+                    roles: vec!["user"],
+                },
+            },
+        );
+
+        let response = claims_app(
+            Oidc::builder(OidcConfig {
+                token: OidcTokenConfig {
+                    issuer: None,
+                    audience: Some("orders-api".to_owned()),
+                    token_type: None,
+                    require_jwt_introspection_only: true,
+                    ..OidcTokenConfig::default()
+                },
+                ..OidcConfig::default()
+            })
+            .provider_metadata(test_introspection_metadata(), test_jwks()),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
@@ -6470,6 +6580,13 @@ dQIDAQAB
             introspection_endpoint: None,
             userinfo_endpoint: None,
             end_session_endpoint: None,
+        }
+    }
+
+    fn test_introspection_metadata() -> ProviderMetadata {
+        ProviderMetadata {
+            introspection_endpoint: Some("http://127.0.0.1:1/introspect".to_owned()),
+            ..test_metadata()
         }
     }
 
