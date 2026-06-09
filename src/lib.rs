@@ -136,6 +136,8 @@ pub struct OidcTokenConfig {
     pub audience: Option<String>,
     /// Expected JWT `typ` claim value.
     pub token_type: Option<String>,
+    /// Required JWT signature algorithm.
+    pub signature_algorithm: Option<TokenSignatureAlgorithm>,
     /// Require the token to include a `sub` claim.
     pub subject_required: bool,
     /// Required claims and their expected string values.
@@ -158,6 +160,7 @@ impl Default for OidcTokenConfig {
             issuer: None,
             audience: None,
             token_type: None,
+            signature_algorithm: None,
             subject_required: false,
             required_claims: HashMap::new(),
             principal_claim: None,
@@ -187,6 +190,7 @@ impl ConfigProperties for OidcTokenConfig {
             issuer: config.get_optional(&key("issuer"))?,
             audience: config.get_optional(&key("audience"))?,
             token_type: config.get_optional(&key("token-type"))?,
+            signature_algorithm: config.get_optional(&key("signature-algorithm"))?,
             subject_required: config
                 .get_optional(&key("subject-required"))?
                 .unwrap_or_default(),
@@ -238,6 +242,64 @@ impl Default for OidcRolesConfig {
 impl OidcRolesConfig {
     fn claim_paths(&self) -> Vec<String> {
         split_csv(&self.role_claim_path)
+    }
+}
+
+/// Quarkus-compatible JWT signature algorithm restriction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TokenSignatureAlgorithm {
+    /// RSA using SHA-256.
+    Rs256,
+    /// RSA using SHA-384.
+    Rs384,
+    /// RSA using SHA-512.
+    Rs512,
+    /// RSASSA-PSS using SHA-256.
+    Ps256,
+    /// RSASSA-PSS using SHA-384.
+    Ps384,
+    /// RSASSA-PSS using SHA-512.
+    Ps512,
+    /// ECDSA using SHA-256.
+    Es256,
+    /// ECDSA using SHA-384.
+    Es384,
+    /// EdDSA.
+    Eddsa,
+}
+
+impl TokenSignatureAlgorithm {
+    fn algorithm(self) -> Algorithm {
+        match self {
+            Self::Rs256 => Algorithm::RS256,
+            Self::Rs384 => Algorithm::RS384,
+            Self::Rs512 => Algorithm::RS512,
+            Self::Ps256 => Algorithm::PS256,
+            Self::Ps384 => Algorithm::PS384,
+            Self::Ps512 => Algorithm::PS512,
+            Self::Es256 => Algorithm::ES256,
+            Self::Es384 => Algorithm::ES384,
+            Self::Eddsa => Algorithm::EdDSA,
+        }
+    }
+}
+
+impl mp_config::FromConfigValue for TokenSignatureAlgorithm {
+    fn from_config_value(value: &str) -> std::result::Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "rs256" => Ok(Self::Rs256),
+            "rs384" => Ok(Self::Rs384),
+            "rs512" => Ok(Self::Rs512),
+            "ps256" => Ok(Self::Ps256),
+            "ps384" => Ok(Self::Ps384),
+            "ps512" => Ok(Self::Ps512),
+            "es256" => Ok(Self::Es256),
+            "es384" => Ok(Self::Es384),
+            "eddsa" => Ok(Self::Eddsa),
+            other => Err(format!(
+                "expected one of `rs256`, `rs384`, `rs512`, `ps256`, `ps384`, `ps512`, `es256`, `es384`, or `eddsa`, got `{other}`"
+            )),
+        }
     }
 }
 
@@ -731,6 +793,7 @@ impl JwtValidator {
     pub fn hs256(secret: impl AsRef<[u8]>, config: &OidcConfig) -> Self {
         let mut validation = Validation::new(Algorithm::HS256);
         apply_validation_config(&mut validation, config);
+        apply_signature_algorithm_config(&mut validation, config);
 
         Self {
             keys: JwtKeys::Single(Arc::new(DecodingKey::from_secret(secret.as_ref()))),
@@ -754,11 +817,7 @@ impl JwtValidator {
     pub fn jwks(jwks: JwkSet, config: &OidcConfig) -> Self {
         let mut validation = Validation::new(Algorithm::RS256);
         apply_validation_config(&mut validation, config);
-
-        let algorithms = supported_algorithms(&jwks);
-        if !algorithms.is_empty() {
-            validation.algorithms = algorithms;
-        }
+        apply_jwks_algorithm_config(&mut validation, &jwks, config);
 
         Self {
             keys: JwtKeys::Set(Arc::new(jwks)),
@@ -784,11 +843,7 @@ impl JwtValidator {
     {
         let mut validation = Validation::new(Algorithm::RS256);
         apply_validation_config(&mut validation, config);
-
-        let algorithms = supported_algorithms(&jwks);
-        if !algorithms.is_empty() {
-            validation.algorithms = algorithms;
-        }
+        apply_jwks_algorithm_config(&mut validation, &jwks, config);
 
         Self {
             keys: JwtKeys::Refreshing(RefreshingJwks {
@@ -1765,6 +1820,24 @@ fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
     }
 }
 
+fn apply_signature_algorithm_config(validation: &mut Validation, config: &OidcConfig) {
+    if let Some(algorithm) = config.token.signature_algorithm {
+        validation.algorithms = vec![algorithm.algorithm()];
+    }
+}
+
+fn apply_jwks_algorithm_config(validation: &mut Validation, jwks: &JwkSet, config: &OidcConfig) {
+    if config.token.signature_algorithm.is_some() {
+        apply_signature_algorithm_config(validation, config);
+        return;
+    }
+
+    let algorithms = supported_algorithms(jwks);
+    if !algorithms.is_empty() {
+        validation.algorithms = algorithms;
+    }
+}
+
 fn supported_algorithms(jwks: &JwkSet) -> Vec<Algorithm> {
     let mut algorithms = Vec::new();
     for algorithm in jwks
@@ -1881,6 +1954,7 @@ mod tests {
                     .with("quarkus.oidc.application-type", "hybrid")
                     .with("quarkus.oidc.token.audience", "orders-api")
                     .with("quarkus.oidc.token.token-type", "bearer")
+                    .with("quarkus.oidc.token.signature-algorithm", "rs256")
                     .with("quarkus.oidc.token.subject-required", "true")
                     .with("quarkus.oidc.token.required-claims.org_id", "org_xyz")
                     .with("quarkus.oidc.token.required-claims.scope", "read,write")
@@ -1912,6 +1986,7 @@ mod tests {
                     issuer: None,
                     audience: Some("orders-api".to_owned()),
                     token_type: Some("bearer".to_owned()),
+                    signature_algorithm: Some(TokenSignatureAlgorithm::Rs256),
                     subject_required: true,
                     required_claims: HashMap::from([
                         ("org_id".to_owned(), vec!["org_xyz".to_owned()]),
@@ -2640,6 +2715,55 @@ mod tests {
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_unexpected_signature_algorithm() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                signature_algorithm: Some(TokenSignatureAlgorithm::Rs256),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn config_rejects_unknown_signature_algorithm() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("test", 100).with("quarkus.oidc.token.signature-algorithm", "hs256"),
+            )
+            .build();
+
+        let error = OidcConfig::from_config(&config).expect_err("config should reject hs256");
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected one of `rs256`, `rs384`, `rs512`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
