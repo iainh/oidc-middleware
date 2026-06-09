@@ -2169,7 +2169,7 @@ impl Oidc {
         }
     }
 
-    /// Loads configuration from `quarkus.oidc.*` and starts building.
+    /// Loads `quarkus.oidc.*` and `quarkus.http.auth.permission.*` configuration.
     pub fn from_config(config: &Config) -> mp_config::Result<OidcBuilder> {
         oidc_builder_from_config(OidcConfig::from_config(config)?, "quarkus.oidc.public-key")?
             .authorization_from_config(config)
@@ -2676,7 +2676,8 @@ impl Tenants {
     ///
     /// The default tenant uses `quarkus.oidc.*`; named tenants use
     /// `quarkus.oidc.<tenant>.*`. Tenant selection uses each tenant's
-    /// `tenant-paths` property.
+    /// `tenant-paths` property, and configured `quarkus.http.auth.permission.*`
+    /// policies are applied to each tenant.
     pub fn from_config(config: &Config) -> mp_config::Result<TenantsBuilder> {
         let mut builder = Tenants::builder().resolve_with_issuer(
             config

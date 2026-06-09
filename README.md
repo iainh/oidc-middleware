@@ -2,12 +2,13 @@
 
 `oidc-middleware` is an axum OIDC middleware crate inspired by the Quarkus OIDC
 extension. It uses `mp-config` to load Quarkus-style `quarkus.oidc.*`
-configuration and exposes a tower layer that protects axum routes with bearer
-token authentication.
+configuration, can load Quarkus-style HTTP authorization policies, and exposes
+a tower layer that protects axum routes with bearer-token authentication.
 
 This crate is in early development. The current implementation includes:
 
-- `OidcConfig` loaded from `quarkus.oidc.*` properties.
+- `OidcConfig` loaded from `quarkus.oidc.*` properties, with `Oidc::from_config`
+  also applying configured `quarkus.http.auth.permission.*` policies.
 - `Oidc::layer()` for protecting axum routers.
 - request `Principal` extensions after successful authentication.
 - pluggable bearer-token validation through `TokenValidator`.
@@ -40,7 +41,8 @@ This crate is in early development. The current implementation includes:
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths`, quoted tenant
   aliases, tenant IDs, static first-path-segment tenant selection, and optional
   header-based (`quarkus.oidc.tenant-id-header`) or issuer-based tenant
-  selection.
+  selection. `Tenants::from_config` applies the same configured HTTP
+  authorization policies to each configured tenant.
 - Refreshable provider JWKS validation when a token references an unknown `kid`,
   with `quarkus.oidc.token.forced-jwk-refresh-interval` throttling.
 - Quarkus token introspection configuration flags for JWT, opaque-token, and
