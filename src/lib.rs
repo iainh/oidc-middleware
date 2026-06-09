@@ -620,11 +620,15 @@ impl Authorization {
                 .unwrap_or_default();
             let policy_name = config.get::<String>(&format!("{prefix}.policy"))?;
             let policy = policy_from_config(&policy_name, &role_policies);
+            let shared = config
+                .get_optional::<bool>(&format!("{prefix}.shared"))?
+                .unwrap_or_default();
 
             permissions.push(HttpPermission {
                 paths,
                 methods,
                 policy,
+                shared,
             });
         }
 
@@ -644,44 +648,67 @@ impl Authorization {
             })
             .collect::<Vec<_>>();
 
-        let Some(max_score) = matches.iter().map(|(score, _)| *score).max() else {
-            return AuthRequirement::Permit;
-        };
-
-        let policies = matches
-            .into_iter()
-            .filter(|(score, _)| *score == max_score)
+        let shared_policies = matches
+            .iter()
+            .filter(|(_, permission)| permission.shared)
             .map(|(_, permission)| &permission.policy)
             .collect::<Vec<_>>();
-
-        if policies
+        let unshared_matches = matches
             .iter()
-            .any(|policy| matches!(policy, HttpPolicy::Deny))
-        {
-            return AuthRequirement::Deny;
-        }
+            .filter(|(_, permission)| !permission.shared)
+            .collect::<Vec<_>>();
 
-        let mut roles = Vec::new();
-        let mut authenticated = false;
-        for policy in policies {
-            match policy {
-                HttpPolicy::Authenticated => authenticated = true,
-                HttpPolicy::Roles(allowed) => roles.extend(allowed.iter().cloned()),
-                HttpPolicy::Permit | HttpPolicy::Deny => {}
+        let Some(max_score) = unshared_matches.iter().map(|(score, _)| *score).max() else {
+            if shared_policies.is_empty() {
+                return AuthRequirement::Permit;
             }
-        }
+            return policies_requirement(shared_policies);
+        };
 
-        if !roles.is_empty() {
-            roles.sort();
-            roles.dedup();
-            return AuthRequirement::Roles(roles);
-        }
+        let mut policies = shared_policies;
+        policies.extend(
+            unshared_matches
+                .into_iter()
+                .filter(|(score, _)| *score == max_score)
+                .map(|(_, permission)| &permission.policy),
+        );
 
-        if authenticated {
-            AuthRequirement::Authenticated
-        } else {
-            AuthRequirement::Permit
+        policies_requirement(policies)
+    }
+}
+
+fn policies_requirement(policies: Vec<&HttpPolicy>) -> AuthRequirement {
+    if policies.is_empty() {
+        return AuthRequirement::Permit;
+    }
+
+    if policies
+        .iter()
+        .any(|policy| matches!(policy, HttpPolicy::Deny))
+    {
+        return AuthRequirement::Deny;
+    }
+
+    let mut roles = Vec::new();
+    let mut authenticated = false;
+    for policy in policies {
+        match policy {
+            HttpPolicy::Authenticated => authenticated = true,
+            HttpPolicy::Roles(allowed) => roles.extend(allowed.iter().cloned()),
+            HttpPolicy::Permit | HttpPolicy::Deny => {}
         }
+    }
+
+    if !roles.is_empty() {
+        roles.sort();
+        roles.dedup();
+        return AuthRequirement::Roles(roles);
+    }
+
+    if authenticated {
+        AuthRequirement::Authenticated
+    } else {
+        AuthRequirement::Permit
     }
 }
 
@@ -690,6 +717,7 @@ struct HttpPermission {
     paths: Vec<String>,
     methods: Vec<String>,
     policy: HttpPolicy,
+    shared: bool,
 }
 
 impl HttpPermission {
@@ -3420,6 +3448,54 @@ mod tests {
             .await
             .expect("request should complete");
 
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authorization_applies_shared_permissions_with_most_specific_match() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-shared-permission", 100)
+                        .with("quarkus.http.auth.permission.shared.paths", "/api/*")
+                        .with(
+                            "quarkus.http.auth.permission.shared.policy",
+                            "authenticated",
+                        )
+                        .with("quarkus.http.auth.permission.shared.shared", "true")
+                        .with("quarkus.http.auth.permission.permit.paths", "/api/public")
+                        .with("quarkus.http.auth.permission.permit.policy", "permit"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/public", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/public", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request("/api/other", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request("/outside", None))
+            .await
+            .expect("request should complete");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
