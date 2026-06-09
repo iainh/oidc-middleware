@@ -48,6 +48,9 @@ This crate is in early development. The current implementation includes:
   `TokenIntrospector` implementations, or explicit HTTP introspection endpoint
   builder methods, plus provider-backed installation for
   `quarkus.oidc.token.require-jwt-introspection-only`.
+- UserInfo-backed opaque-token validation through `UserInfoValidator`, custom
+  `UserInfoProvider` implementations, or provider-backed installation for
+  `quarkus.oidc.token.verify-access-token-with-user-info`.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
 - Configurable role extraction with `quarkus.oidc.roles.role-claim-path`,

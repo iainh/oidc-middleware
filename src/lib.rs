@@ -78,6 +78,9 @@ type ValidationFuture = Pin<Box<dyn Future<Output = Result<Principal>> + Send>>;
 /// Future returned by [`TokenIntrospector`].
 pub type IntrospectionFuture =
     Pin<Box<dyn Future<Output = std::result::Result<IntrospectionResponse, BoxError>> + Send>>;
+/// Future returned by [`UserInfoProvider`].
+pub type UserInfoFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<UserInfoResponse, BoxError>> + Send>>;
 /// Future returned by [`JwksProvider`].
 pub type JwksRefreshFuture =
     Pin<Box<dyn Future<Output = std::result::Result<JwkSet, BoxError>> + Send>>;
@@ -678,6 +681,8 @@ pub enum BuildError {
     MissingJwksPath,
     /// Remote token introspection requires a configured or discovered endpoint.
     MissingIntrospectionEndpoint,
+    /// UserInfo token validation requires a configured or discovered endpoint.
+    MissingUserInfoEndpoint,
     /// The configured public key could not be parsed.
     InvalidPublicKey(BoxError),
     /// A configured provider or metadata URL could not be parsed.
@@ -701,6 +706,9 @@ impl fmt::Display for BuildError {
                 f,
                 "OIDC token introspection requires an introspection endpoint"
             ),
+            Self::MissingUserInfoEndpoint => {
+                write!(f, "OIDC UserInfo validation requires a UserInfo endpoint")
+            }
             Self::InvalidPublicKey(source) => write!(f, "invalid OIDC public key: {source}"),
             Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
             Self::Http(source) => write!(f, "OIDC provider request failed: {source}"),
@@ -1383,6 +1391,156 @@ impl TokenValidator for IntrospectionValidator {
     }
 }
 
+/// OIDC UserInfo response.
+///
+/// Standard token-like fields are modelled directly and the remaining claims
+/// are available for principal, required-claim, and role extraction.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct UserInfoResponse {
+    /// Subject identifier.
+    #[serde(default)]
+    pub sub: Option<String>,
+    /// Issuer, when returned by the provider.
+    #[serde(default)]
+    pub iss: Option<String>,
+    /// Audience, when returned by the provider.
+    #[serde(default, deserialize_with = "deserialize_audience")]
+    pub aud: Vec<String>,
+    /// Token or response type, when returned by the provider.
+    #[serde(default)]
+    pub typ: Option<String>,
+    /// Issued-at timestamp, when returned by the provider.
+    #[serde(default)]
+    pub iat: Option<u64>,
+    /// Additional UserInfo claims.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl UserInfoResponse {
+    /// Parses a UserInfo response from JSON.
+    pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    fn into_claims(self) -> TokenClaims {
+        TokenClaims {
+            sub: self.sub,
+            iss: self.iss,
+            aud: self.aud,
+            typ: self.typ,
+            iat: self.iat,
+            extra: Value::Object(self.extra),
+        }
+    }
+}
+
+/// Source used to fetch OIDC UserInfo for an access token.
+pub trait UserInfoProvider: Send + Sync + 'static {
+    /// Fetches UserInfo for a raw bearer token.
+    fn user_info(&self, token: Arc<str>) -> UserInfoFuture;
+}
+
+impl<F, Fut> UserInfoProvider for F
+where
+    F: Fn(Arc<str>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<UserInfoResponse, BoxError>> + Send + 'static,
+{
+    fn user_info(&self, token: Arc<str>) -> UserInfoFuture {
+        Box::pin(self(token))
+    }
+}
+
+/// Token validator backed by the OIDC UserInfo endpoint.
+#[derive(Clone)]
+pub struct UserInfoValidator {
+    provider: Arc<dyn UserInfoProvider>,
+    role_claim_paths: Arc<[String]>,
+    role_claim_separator: Arc<str>,
+    subject_required: bool,
+    required_claims: Arc<HashMap<String, Vec<String>>>,
+    principal_claim: Option<Arc<str>>,
+    token_age: Option<Duration>,
+    leeway: u64,
+}
+
+impl UserInfoValidator {
+    /// Builds a UserInfo-backed token validator.
+    pub fn new<P>(provider: P, config: &OidcConfig) -> Self
+    where
+        P: UserInfoProvider,
+    {
+        Self {
+            provider: Arc::new(provider),
+            role_claim_paths: Arc::from(role_claim_paths(config)),
+            role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
+            subject_required: config.token.subject_required,
+            required_claims: Arc::new(config.token.required_claims.clone()),
+            principal_claim: config.token.principal_claim.clone().map(Arc::from),
+            token_age: config.token.age,
+            leeway: config.token.lifespan_grace.unwrap_or_default(),
+        }
+    }
+}
+
+impl TokenValidator for UserInfoValidator {
+    fn validate(&self, token: Arc<str>) -> ValidationFuture {
+        let provider = self.provider.clone();
+        let role_claim_paths = self.role_claim_paths.clone();
+        let role_claim_separator = self.role_claim_separator.clone();
+        let subject_required = self.subject_required;
+        let required_claims = self.required_claims.clone();
+        let principal_claim = self.principal_claim.clone();
+        let token_age = self.token_age;
+        let leeway = self.leeway;
+
+        Box::pin(async move {
+            let claims = provider
+                .user_info(token)
+                .await
+                .map_err(Error::TokenRejected)?
+                .into_claims();
+            validate_subject(&claims, subject_required)?;
+            validate_required_claims(&claims, &required_claims)?;
+            if claims.iat.is_some() {
+                validate_token_age(&claims, token_age, leeway)?;
+            }
+            Principal::from_claims(
+                claims,
+                &role_claim_paths,
+                &role_claim_separator,
+                principal_claim.as_deref(),
+            )
+        })
+    }
+}
+
+#[derive(Clone)]
+struct HttpUserInfoProvider {
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl UserInfoProvider for HttpUserInfoProvider {
+    fn user_info(&self, token: Arc<str>) -> UserInfoFuture {
+        let client = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        Box::pin(async move {
+            let authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|error| Box::new(error) as BoxError)?;
+            client
+                .get(endpoint)
+                .header(AUTHORIZATION, authorization)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<UserInfoResponse>()
+                .await
+                .map_err(|error| Box::new(error) as BoxError)
+        })
+    }
+}
+
 #[derive(Clone)]
 struct HttpTokenIntrospector {
     client: reqwest::Client,
@@ -1965,6 +2123,40 @@ impl OidcBuilder {
         Ok(self)
     }
 
+    /// Installs a custom UserInfo-backed token validator.
+    pub fn user_info_provider<P>(mut self, provider: P) -> Self
+    where
+        P: UserInfoProvider,
+    {
+        self.validator = Some(Arc::new(UserInfoValidator::new(provider, &self.config)));
+        self
+    }
+
+    /// Installs an HTTP UserInfo-backed token validator.
+    pub fn user_info_endpoint(self, endpoint: &str) -> BuildResult<Self> {
+        self.user_info_endpoint_with_client(endpoint, reqwest::Client::new())
+    }
+
+    /// Installs an HTTP UserInfo-backed token validator using a caller-supplied client.
+    pub fn user_info_endpoint_with_client(
+        mut self,
+        endpoint: &str,
+        client: reqwest::Client,
+    ) -> BuildResult<Self> {
+        reqwest::Url::parse(endpoint).map_err(|error| BuildError::InvalidUrl {
+            url: endpoint.to_owned(),
+            message: error.to_string(),
+        })?;
+        self.validator = Some(Arc::new(UserInfoValidator::new(
+            HttpUserInfoProvider {
+                client,
+                endpoint: endpoint.to_owned(),
+            },
+            &self.config,
+        )));
+        Ok(self)
+    }
+
     /// Discovers provider metadata and installs a JWKS-backed JWT validator.
     pub async fn discover(self) -> BuildResult<Oidc> {
         self.discover_with_client(reqwest::Client::new()).await
@@ -1991,6 +2183,18 @@ impl OidcBuilder {
                 let endpoint = provider_endpoint_url(&auth_server_url, &introspection_path)?;
                 return self
                     .introspection_endpoint_with_client(endpoint.as_str(), client)
+                    .map(OidcBuilder::build);
+            }
+
+            if self.config.token.verify_access_token_with_user_info {
+                let user_info_path = self
+                    .config
+                    .user_info_path
+                    .clone()
+                    .ok_or(BuildError::MissingUserInfoEndpoint)?;
+                let endpoint = provider_endpoint_url(&auth_server_url, &user_info_path)?;
+                return self
+                    .user_info_endpoint_with_client(endpoint.as_str(), client)
                     .map(OidcBuilder::build);
             }
 
@@ -2031,6 +2235,16 @@ impl OidcBuilder {
                 .map(OidcBuilder::build);
         }
 
+        if self.config.token.verify_access_token_with_user_info {
+            let endpoint = metadata
+                .userinfo_endpoint
+                .as_deref()
+                .ok_or(BuildError::MissingUserInfoEndpoint)?;
+            return self
+                .user_info_endpoint_with_client(endpoint, client)
+                .map(OidcBuilder::build);
+        }
+
         let jwks: JwkSet = client
             .get(&metadata.jwks_uri)
             .send()
@@ -2049,6 +2263,11 @@ impl OidcBuilder {
             return self.build();
         }
 
+        if self.config.token.verify_access_token_with_user_info {
+            self.install_metadata_user_info(metadata, reqwest::Client::new());
+            return self.build();
+        }
+
         let validation_config = provider_validation_config(&self.config, &metadata);
         self.validator = Some(Arc::new(JwtValidator::jwks(jwks, &validation_config)));
         self.build()
@@ -2063,6 +2282,11 @@ impl OidcBuilder {
     ) -> Oidc {
         if self.config.token.require_jwt_introspection_only {
             self.install_metadata_introspection(metadata, client);
+            return self.build();
+        }
+
+        if self.config.token.verify_access_token_with_user_info {
+            self.install_metadata_user_info(metadata, client);
             return self.build();
         }
 
@@ -2089,6 +2313,17 @@ impl OidcBuilder {
         let validation_config = provider_validation_config(&self.config, &metadata);
         self.validator = Some(Arc::new(IntrospectionValidator::new(
             HttpTokenIntrospector { client, endpoint },
+            &validation_config,
+        )));
+    }
+
+    fn install_metadata_user_info(&mut self, metadata: ProviderMetadata, client: reqwest::Client) {
+        let Some(endpoint) = metadata.userinfo_endpoint.clone() else {
+            return;
+        };
+        let validation_config = provider_validation_config(&self.config, &metadata);
+        self.validator = Some(Arc::new(UserInfoValidator::new(
+            HttpUserInfoProvider { client, endpoint },
             &validation_config,
         )));
     }
@@ -3591,6 +3826,89 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("introspection audience did not include"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_info_validator_accepts_response_and_extracts_roles() {
+        let config = OidcConfig {
+            client_id: Some("orders-service".to_owned()),
+            token: OidcTokenConfig {
+                principal_claim: Some("preferred_username".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let validator = UserInfoValidator::new(
+            |token: Arc<str>| async move {
+                assert_eq!(token.as_ref(), "opaque-token");
+                Ok(UserInfoResponse::from_json(
+                    r#"{
+                        "sub": "alice-subject",
+                        "preferred_username": "alice",
+                        "groups": ["orders-user"],
+                        "realm_access": {
+                            "roles": ["realm-admin"]
+                        },
+                        "resource_access": {
+                            "orders-service": {
+                                "roles": ["orders-admin"]
+                            }
+                        }
+                    }"#,
+                )
+                .expect("UserInfo response should parse"))
+            },
+            &config,
+        );
+
+        let principal = validator
+            .validate(Arc::from("opaque-token"))
+            .await
+            .expect("UserInfo response should validate");
+
+        assert_eq!(principal.subject(), "alice");
+        assert_eq!(
+            principal.groups().collect::<Vec<_>>(),
+            vec!["orders-user", "realm-admin", "orders-admin"]
+        );
+    }
+
+    #[tokio::test]
+    async fn user_info_validator_applies_required_claims() {
+        let config = OidcConfig {
+            token: OidcTokenConfig {
+                required_claims: HashMap::from([(
+                    "scope".to_owned(),
+                    vec!["orders:read".to_owned()],
+                )]),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let validator = UserInfoValidator::new(
+            |_token: Arc<str>| async move {
+                Ok(UserInfoResponse::from_json(
+                    r#"{
+                        "sub": "alice",
+                        "scope": "orders:write"
+                    }"#,
+                )
+                .expect("UserInfo response should parse"))
+            },
+            &config,
+        );
+
+        let error = validator
+            .validate(Arc::from("opaque-token"))
+            .await
+            .expect_err("missing required claim should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("claim `scope` did not include required value"),
             "{error}"
         );
     }
@@ -5133,6 +5451,26 @@ dQIDAQAB
         assert!(matches!(error, BuildError::MissingIntrospectionEndpoint));
     }
 
+    #[tokio::test]
+    async fn discovery_disabled_requires_user_info_path_for_user_info_validation() {
+        let result = Oidc::builder(OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            discovery_enabled: false,
+            token: OidcTokenConfig {
+                verify_access_token_with_user_info: true,
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .discover()
+        .await;
+        let Err(error) = result else {
+            panic!("UserInfo validation requires user-info-path");
+        };
+
+        assert!(matches!(error, BuildError::MissingUserInfoEndpoint));
+    }
+
     #[test]
     fn provider_metadata_parses_oidc_discovery_document() {
         let metadata = ProviderMetadata::from_json(
@@ -5246,6 +5584,42 @@ dQIDAQAB
                 ..OidcConfig::default()
             })
             .provider_metadata(test_introspection_metadata(), test_jwks()),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn provider_metadata_uses_user_info_when_configured() {
+        let token = jwt_with_kid(
+            "test-key",
+            TestClaims {
+                sub: "alice",
+                iss: "https://issuer.example/realms/app",
+                aud: "orders-api",
+                exp: 4_102_444_800,
+                groups: vec!["admin"],
+                realm_access: RealmAccessClaims {
+                    roles: vec!["user"],
+                },
+            },
+        );
+
+        let response = claims_app(
+            Oidc::builder(OidcConfig {
+                token: OidcTokenConfig {
+                    issuer: None,
+                    audience: Some("orders-api".to_owned()),
+                    token_type: None,
+                    verify_access_token_with_user_info: true,
+                    ..OidcTokenConfig::default()
+                },
+                ..OidcConfig::default()
+            })
+            .provider_metadata(test_user_info_metadata(), test_jwks()),
         )
         .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
         .await
@@ -6586,6 +6960,13 @@ dQIDAQAB
     fn test_introspection_metadata() -> ProviderMetadata {
         ProviderMetadata {
             introspection_endpoint: Some("http://127.0.0.1:1/introspect".to_owned()),
+            ..test_metadata()
+        }
+    }
+
+    fn test_user_info_metadata() -> ProviderMetadata {
+        ProviderMetadata {
+            userinfo_endpoint: Some("http://127.0.0.1:1/userinfo".to_owned()),
             ..test_metadata()
         }
     }
