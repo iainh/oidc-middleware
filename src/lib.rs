@@ -67,6 +67,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_layer::Layer;
 use tower_service::Service;
 
+const DEFAULT_ROLE_CLAIM_PATH: &str = "groups,realm_access.roles";
+
 /// Result type returned by token validators.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -262,7 +264,7 @@ pub struct OidcRolesConfig {
 impl Default for OidcRolesConfig {
     fn default() -> Self {
         Self {
-            role_claim_path: "groups,realm_access.roles".to_owned(),
+            role_claim_path: DEFAULT_ROLE_CLAIM_PATH.to_owned(),
             role_claim_separator: " ".to_owned(),
         }
     }
@@ -272,6 +274,20 @@ impl OidcRolesConfig {
     fn claim_paths(&self) -> Vec<String> {
         split_csv(&self.role_claim_path)
     }
+}
+
+fn role_claim_paths(config: &OidcConfig) -> Vec<String> {
+    let mut paths = config.roles.claim_paths();
+    if config.roles.role_claim_path == DEFAULT_ROLE_CLAIM_PATH {
+        if let Some(client_id) = config
+            .client_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            paths.push(format!(r#"resource_access."{client_id}".roles"#));
+        }
+    }
+    paths
 }
 
 /// Quarkus-compatible JWT signature algorithm restriction.
@@ -975,7 +991,7 @@ impl JwtValidator {
         Self {
             keys: JwtKeys::Single(Arc::new(DecodingKey::from_secret(secret.as_ref()))),
             validation,
-            role_claim_paths: Arc::from(config.roles.claim_paths()),
+            role_claim_paths: Arc::from(role_claim_paths(config)),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
@@ -1000,7 +1016,7 @@ impl JwtValidator {
         Self {
             keys: JwtKeys::Set(Arc::new(jwks)),
             validation,
-            role_claim_paths: Arc::from(config.roles.claim_paths()),
+            role_claim_paths: Arc::from(role_claim_paths(config)),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
@@ -1021,7 +1037,7 @@ impl JwtValidator {
         Ok(Self {
             keys: JwtKeys::Single(Arc::new(key)),
             validation,
-            role_claim_paths: Arc::from(config.roles.claim_paths()),
+            role_claim_paths: Arc::from(role_claim_paths(config)),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
@@ -1051,7 +1067,7 @@ impl JwtValidator {
                 provider: Arc::new(provider),
             }),
             validation,
-            role_claim_paths: Arc::from(config.roles.claim_paths()),
+            role_claim_paths: Arc::from(role_claim_paths(config)),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
@@ -3003,6 +3019,43 @@ dQIDAQAB
             exp: 4_102_444_800,
             resource_access: ResourceAccessClaims {
                 orders: ResourceRolesClaims {
+                    roles: vec!["orders-admin", "orders-user"],
+                },
+            },
+        });
+
+        let response = custom_roles_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_extracts_default_client_resource_roles() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            client_id: Some("orders-service".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: None,
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(ClientResourceRoleClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            resource_access: ClientResourceAccessClaims {
+                orders_service: ResourceRolesClaims {
                     roles: vec!["orders-admin", "orders-user"],
                 },
             },
@@ -5709,6 +5762,15 @@ dQIDAQAB
     }
 
     #[derive(Serialize)]
+    struct ClientResourceRoleClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        exp: u64,
+        resource_access: ClientResourceAccessClaims<'a>,
+    }
+
+    #[derive(Serialize)]
     struct NamespacedRoleClaims<'a> {
         sub: &'a str,
         iss: &'a str,
@@ -5730,6 +5792,12 @@ dQIDAQAB
     #[derive(Serialize)]
     struct ResourceAccessClaims<'a> {
         orders: ResourceRolesClaims<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct ClientResourceAccessClaims<'a> {
+        #[serde(rename = "orders-service")]
+        orders_service: ResourceRolesClaims<'a>,
     }
 
     #[derive(Serialize)]
