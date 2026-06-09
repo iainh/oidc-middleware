@@ -521,6 +521,7 @@ dependencies = [
  "http",
  "jsonwebtoken",
  "mp-config",
+ "oidc-middleware-macros",
  "reqwest",
  "serde",
  "serde_json",
@@ -528,6 +529,15 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "oidc-middleware-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

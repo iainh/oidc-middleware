@@ -16,6 +16,8 @@ This crate is in early development. The current implementation includes:
   realm roles.
 - Quarkus-style `quarkus.http.auth.permission.*` path policies for `permit`,
   `deny`, `authenticated`, and named `roles-allowed` policies.
+- `#[roles_allowed(...)]` handler macro for Quarkus-style role checks with the
+  `OidcPrincipal` extractor.
 - Quarkus-style handling for disabled OIDC and disabled tenants.
 
 ```rust

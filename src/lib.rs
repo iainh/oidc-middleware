@@ -38,9 +38,13 @@
 //! - `quarkus.oidc.enabled=false` disables authentication for the layer.
 //! - `quarkus.oidc.tenant-enabled=false` rejects requests as tenant-disabled.
 
+pub use oidc_middleware_macros::roles_allowed;
+
 use axum::body::Body;
+use axum::extract::FromRequestParts;
 use axum::response::{IntoResponse, Response};
 use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use http::request::Parts;
 use http::{HeaderValue, Request, StatusCode};
 use jsonwebtoken::jwk::{JwkSet, KeyAlgorithm};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
@@ -201,6 +205,18 @@ impl Principal {
         self.groups.iter().map(AsRef::as_ref)
     }
 
+    /// Returns true when this principal has `group`.
+    pub fn has_group(&self, group: &str) -> bool {
+        self.groups
+            .iter()
+            .any(|candidate| candidate.as_ref() == group)
+    }
+
+    /// Returns true when this principal has at least one of `groups`.
+    pub fn has_any_group<'a>(&self, groups: impl IntoIterator<Item = &'a str>) -> bool {
+        groups.into_iter().any(|group| self.has_group(group))
+    }
+
     fn from_claims(claims: TokenClaims) -> Self {
         Self {
             subject: Arc::from(claims.sub),
@@ -208,6 +224,47 @@ impl Principal {
             audience: claims.aud.into_iter().map(Arc::from).collect(),
             groups: claims.groups.into_iter().map(Arc::from).collect(),
         }
+    }
+}
+
+/// Axum extractor for the authenticated OIDC principal.
+///
+/// This is intended for handlers protected by [`Oidc::layer`]. It is also the
+/// expected principal argument for [`roles_allowed`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcPrincipal(Principal);
+
+impl OidcPrincipal {
+    /// Consumes the extractor wrapper and returns the principal.
+    pub fn into_inner(self) -> Principal {
+        self.0
+    }
+}
+
+impl std::ops::Deref for OidcPrincipal {
+    type Target = Principal;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<S> FromRequestParts<S> for OidcPrincipal
+where
+    S: Send + Sync,
+{
+    type Rejection = Error;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Principal>()
+            .cloned()
+            .map(Self)
+            .ok_or(Error::Forbidden)
     }
 }
 
