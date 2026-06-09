@@ -202,6 +202,14 @@ pub struct OidcTokenConfig {
     pub age: Option<Duration>,
     /// Minimum interval between forced JWKS refreshes after an unknown `kid`.
     pub forced_jwk_refresh_interval: Duration,
+    /// Allow remote introspection of JWT tokens when no matching JWK is available.
+    pub allow_jwt_introspection: bool,
+    /// Require JWT tokens to be validated by remote introspection only.
+    pub require_jwt_introspection_only: bool,
+    /// Allow remote introspection of opaque bearer tokens.
+    pub allow_opaque_token_introspection: bool,
+    /// Verify opaque access tokens by calling the UserInfo endpoint.
+    pub verify_access_token_with_user_info: bool,
 }
 
 impl Default for OidcTokenConfig {
@@ -220,6 +228,10 @@ impl Default for OidcTokenConfig {
             lifespan_grace: None,
             age: None,
             forced_jwk_refresh_interval: Duration::from_secs(600),
+            allow_jwt_introspection: true,
+            require_jwt_introspection_only: false,
+            allow_opaque_token_introspection: true,
+            verify_access_token_with_user_info: false,
         }
     }
 }
@@ -260,6 +272,18 @@ impl ConfigProperties for OidcTokenConfig {
             forced_jwk_refresh_interval: config
                 .get_optional(&key("forced-jwk-refresh-interval"))?
                 .unwrap_or_else(|| Duration::from_secs(600)),
+            allow_jwt_introspection: config
+                .get_optional(&key("allow-jwt-introspection"))?
+                .unwrap_or(true),
+            require_jwt_introspection_only: config
+                .get_optional(&key("require-jwt-introspection-only"))?
+                .unwrap_or_default(),
+            allow_opaque_token_introspection: config
+                .get_optional(&key("allow-opaque-token-introspection"))?
+                .unwrap_or(true),
+            verify_access_token_with_user_info: config
+                .get_optional(&key("verify-access-token-with-user-info"))?
+                .unwrap_or_default(),
         })
     }
 }
@@ -2786,6 +2810,16 @@ dQIDAQAB
                     .with("quarkus.oidc.token.lifespan-grace", "5")
                     .with("quarkus.oidc.token.age", "60s")
                     .with("quarkus.oidc.token.forced-jwk-refresh-interval", "30s")
+                    .with("quarkus.oidc.token.allow-jwt-introspection", "false")
+                    .with("quarkus.oidc.token.require-jwt-introspection-only", "true")
+                    .with(
+                        "quarkus.oidc.token.allow-opaque-token-introspection",
+                        "false",
+                    )
+                    .with(
+                        "quarkus.oidc.token.verify-access-token-with-user-info",
+                        "true",
+                    )
                     .with(
                         "quarkus.oidc.roles.role-claim-path",
                         "resource_access.api.roles",
@@ -2842,6 +2876,10 @@ dQIDAQAB
                     lifespan_grace: Some(5),
                     age: Some(Duration::from_secs(60)),
                     forced_jwk_refresh_interval: Duration::from_secs(30),
+                    allow_jwt_introspection: false,
+                    require_jwt_introspection_only: true,
+                    allow_opaque_token_introspection: false,
+                    verify_access_token_with_user_info: true,
                 },
                 roles: OidcRolesConfig {
                     role_claim_path: "resource_access.api.roles".to_owned(),

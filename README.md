@@ -42,6 +42,8 @@ This crate is in early development. The current implementation includes:
   header-based or issuer-based tenant selection.
 - Refreshable provider JWKS validation when a token references an unknown `kid`,
   with `quarkus.oidc.token.forced-jwk-refresh-interval` throttling.
+- Quarkus token introspection configuration flags for JWT, opaque-token, and
+  UserInfo validation modes.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
 - Configurable role extraction with `quarkus.oidc.roles.role-claim-path`,
