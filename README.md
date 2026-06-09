@@ -30,7 +30,7 @@ This crate is in early development. The current implementation includes:
   `quarkus.oidc.token.issued-at-required`.
 - Principal-name selection with `quarkus.oidc.token.principal-claim`,
   including nested claim paths.
-- Token extraction with `quarkus.oidc.token.header` and
+- Token extraction with `quarkus.oidc.token.header` and case-insensitive
   `quarkus.oidc.token.authorization-scheme`.
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths`, tenant IDs,
   and optional header-based or issuer-based tenant selection.

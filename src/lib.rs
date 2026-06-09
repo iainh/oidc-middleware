@@ -2196,7 +2196,12 @@ fn bearer_token_from_authorization_value(value: &str) -> Option<&str> {
 }
 
 fn token_with_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
-    value.strip_prefix(&format!("{scheme} "))
+    let (actual_scheme, token) = value.split_once(char::is_whitespace)?;
+    if !actual_scheme.eq_ignore_ascii_case(scheme) {
+        return None;
+    }
+
+    Some(token.trim_start())
 }
 
 fn unverified_token_issuer(token: &str) -> Option<String> {
@@ -2607,6 +2612,34 @@ dQIDAQAB
         .validator(StaticTokenValidator::bearer("test-token", "alice"))
         .build())
         .oneshot(request("/protected", Some("Token test-token")))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn default_authorization_scheme_is_case_insensitive() {
+        let response = app(oidc())
+            .oneshot(request("/protected", Some("bearer test-token")))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_authorization_scheme_is_case_insensitive() {
+        let response = app(Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                authorization_scheme: "Token".to_owned(),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer("test-token", "alice"))
+        .build())
+        .oneshot(request("/protected", Some("token test-token")))
         .await
         .expect("request should complete");
 
