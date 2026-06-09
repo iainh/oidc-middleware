@@ -1968,11 +1968,15 @@ fn load_role_policies(config: &Config) -> mp_config::Result<HashMap<String, Role
             continue;
         };
 
+        let Some(role) = config_map_entry_name(role) else {
+            continue;
+        };
+
         policies
             .entry(name.to_owned())
             .or_insert_with(RolePolicy::default)
             .role_mappings
-            .insert(role.to_owned(), split_csv(&config.get::<String>(&key)?));
+            .insert(role, split_csv(&config.get::<String>(&key)?));
     }
 
     Ok(policies)
@@ -1989,11 +1993,11 @@ fn load_role_mappings(
         let Some(role) = key.strip_prefix(&property_prefix) else {
             continue;
         };
-        if role.is_empty() || role.contains('.') {
+        let Some(role) = config_map_entry_name(role) else {
             continue;
-        }
+        };
 
-        mappings.insert(role.to_owned(), split_csv(&config.get::<String>(&key)?));
+        mappings.insert(role, split_csv(&config.get::<String>(&key)?));
     }
 
     Ok(mappings)
@@ -2010,17 +2014,29 @@ fn load_required_claims(
         let Some(claim_name) = key.strip_prefix(&property_prefix) else {
             continue;
         };
-        if claim_name.is_empty() || claim_name.contains('.') {
+        let Some(claim_name) = config_map_entry_name(claim_name) else {
             continue;
-        }
+        };
 
-        claims.insert(
-            claim_name.to_owned(),
-            split_csv(&config.get::<String>(&key)?),
-        );
+        claims.insert(claim_name, split_csv(&config.get::<String>(&key)?));
     }
 
     Ok(claims)
+}
+
+fn config_map_entry_name(name: &str) -> Option<String> {
+    if let Some(quoted) = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+    {
+        return (!quoted.is_empty()).then(|| quoted.to_owned());
+    }
+
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+
+    Some(name.to_owned())
 }
 
 fn has_default_tenant_config(config: &Config) -> bool {
@@ -2525,6 +2541,10 @@ dQIDAQAB
                     .with("quarkus.oidc.token.issued-at-required", "false")
                     .with("quarkus.oidc.token.required-claims.org_id", "org_xyz")
                     .with("quarkus.oidc.token.required-claims.scope", "read,write")
+                    .with(
+                        "quarkus.oidc.token.required-claims.\"resource_access.orders.roles\"",
+                        "orders-admin",
+                    )
                     .with("quarkus.oidc.token.principal-claim", "email")
                     .with("quarkus.oidc.token.header", "x-access-token")
                     .with("quarkus.oidc.token.authorization-scheme", "Token")
@@ -2567,6 +2587,10 @@ dQIDAQAB
                         (
                             "scope".to_owned(),
                             vec!["read".to_owned(), "write".to_owned()],
+                        ),
+                        (
+                            "resource_access.orders.roles".to_owned(),
+                            vec!["orders-admin".to_owned()],
                         ),
                     ]),
                     principal_claim: Some("email".to_owned()),
@@ -3605,6 +3629,47 @@ dQIDAQAB
             },
             ..OidcConfig::default()
         };
+        let token = jwt(CustomRoleClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            resource_access: ResourceAccessClaims {
+                orders: ResourceRolesClaims {
+                    roles: vec!["orders-admin", "orders-user"],
+                },
+            },
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_loads_quoted_nested_required_claims_from_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("quoted-required-claims", 100)
+                    .with(
+                        "quarkus.oidc.auth-server-url",
+                        "https://issuer.example/realms/app",
+                    )
+                    .with("quarkus.oidc.token.audience", "orders-api")
+                    .with(
+                        "quarkus.oidc.token.required-claims.\"resource_access.orders.roles\"",
+                        "orders-admin",
+                    ),
+            )
+            .build();
+        let config = OidcConfig::from_config(&config).expect("OIDC config should load");
         let token = jwt(CustomRoleClaims {
             sub: "alice",
             iss: "https://issuer.example/realms/app",
