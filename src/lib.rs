@@ -47,7 +47,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use mp_config::{Config, ConfigProperties};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::fmt;
@@ -165,6 +165,22 @@ impl Principal {
         }
     }
 
+    /// Creates a principal with group memberships.
+    pub fn with_groups(
+        subject: impl Into<String>,
+        groups: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            subject: Arc::from(subject.into()),
+            issuer: None,
+            audience: Vec::new(),
+            groups: groups
+                .into_iter()
+                .map(|group| Arc::from(group.into()))
+                .collect(),
+        }
+    }
+
     /// Returns the token subject.
     pub fn subject(&self) -> &str {
         &self.subject
@@ -204,6 +220,8 @@ pub enum Error {
     InvalidAuthorizationHeader,
     /// The selected tenant is disabled.
     TenantDisabled,
+    /// The authenticated principal is not allowed to access the route.
+    Forbidden,
     /// The validator rejected the token.
     TokenRejected(BoxError),
 }
@@ -212,6 +230,7 @@ impl Error {
     fn status(&self) -> StatusCode {
         match self {
             Self::TenantDisabled => StatusCode::NOT_FOUND,
+            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::MissingBearerToken
             | Self::InvalidAuthorizationHeader
             | Self::TokenRejected(_) => StatusCode::UNAUTHORIZED,
@@ -225,7 +244,7 @@ impl Error {
                 HeaderValue::from_static(r#"Bearer error="invalid_request""#)
             }
             Self::TokenRejected(_) => HeaderValue::from_static(r#"Bearer error="invalid_token""#),
-            Self::TenantDisabled => HeaderValue::from_static("Bearer"),
+            Self::TenantDisabled | Self::Forbidden => HeaderValue::from_static("Bearer"),
         }
     }
 }
@@ -236,6 +255,7 @@ impl fmt::Display for Error {
             Self::MissingBearerToken => write!(f, "missing bearer token"),
             Self::InvalidAuthorizationHeader => write!(f, "invalid authorization header"),
             Self::TenantDisabled => write!(f, "OIDC tenant is disabled"),
+            Self::Forbidden => write!(f, "authenticated principal is not allowed"),
             Self::TokenRejected(source) => write!(f, "token rejected: {source}"),
         }
     }
@@ -253,9 +273,12 @@ impl StdError for Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = self.status();
-        let challenge = self.challenge();
         let mut response = status.into_response();
-        response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
+        if status == StatusCode::UNAUTHORIZED {
+            response
+                .headers_mut()
+                .insert(WWW_AUTHENTICATE, self.challenge());
+        }
         response
     }
 }
@@ -315,6 +338,141 @@ impl ProviderMetadata {
     }
 }
 
+/// Quarkus-style HTTP authorization policies.
+///
+/// Load this from `quarkus.http.auth.permission.*` and
+/// `quarkus.http.auth.policy.*` properties with [`Authorization::from_config`],
+/// then attach it with [`OidcBuilder::authorization`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Authorization {
+    permissions: Arc<[HttpPermission]>,
+}
+
+impl Authorization {
+    /// Loads Quarkus-style HTTP authorization configuration.
+    pub fn from_config(config: &Config) -> mp_config::Result<Self> {
+        let role_policies = load_role_policies(config)?;
+        let mut permissions = Vec::new();
+
+        for name in permission_names(config) {
+            let prefix = format!("quarkus.http.auth.permission.{name}");
+            let paths = split_csv(&config.get::<String>(&format!("{prefix}.paths"))?);
+            let methods = config
+                .get_optional::<String>(&format!("{prefix}.methods"))?
+                .map(|methods| {
+                    split_csv(&methods)
+                        .into_iter()
+                        .map(|method| method.to_ascii_uppercase())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let policy_name = config.get::<String>(&format!("{prefix}.policy"))?;
+            let policy = policy_from_config(&policy_name, &role_policies);
+
+            permissions.push(HttpPermission {
+                paths,
+                methods,
+                policy,
+            });
+        }
+
+        Ok(Self {
+            permissions: Arc::from(permissions),
+        })
+    }
+
+    fn requirement(&self, method: &http::Method, path: &str) -> AuthRequirement {
+        let matches = self
+            .permissions
+            .iter()
+            .filter_map(|permission| {
+                permission
+                    .matches(method, path)
+                    .map(|score| (score, permission))
+            })
+            .collect::<Vec<_>>();
+
+        let Some(max_score) = matches.iter().map(|(score, _)| *score).max() else {
+            return AuthRequirement::Permit;
+        };
+
+        let policies = matches
+            .into_iter()
+            .filter(|(score, _)| *score == max_score)
+            .map(|(_, permission)| &permission.policy)
+            .collect::<Vec<_>>();
+
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, HttpPolicy::Deny))
+        {
+            return AuthRequirement::Deny;
+        }
+
+        let mut roles = Vec::new();
+        let mut authenticated = false;
+        for policy in policies {
+            match policy {
+                HttpPolicy::Authenticated => authenticated = true,
+                HttpPolicy::Roles(allowed) => roles.extend(allowed.iter().cloned()),
+                HttpPolicy::Permit | HttpPolicy::Deny => {}
+            }
+        }
+
+        if !roles.is_empty() {
+            roles.sort();
+            roles.dedup();
+            return AuthRequirement::Roles(roles);
+        }
+
+        if authenticated {
+            AuthRequirement::Authenticated
+        } else {
+            AuthRequirement::Permit
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HttpPermission {
+    paths: Vec<String>,
+    methods: Vec<String>,
+    policy: HttpPolicy,
+}
+
+impl HttpPermission {
+    fn matches(&self, method: &http::Method, request_path: &str) -> Option<usize> {
+        if !self.methods.is_empty()
+            && !self
+                .methods
+                .iter()
+                .any(|configured| configured == method.as_str())
+        {
+            return None;
+        }
+
+        self.paths
+            .iter()
+            .filter_map(|path| path_match_score(path, request_path))
+            .max()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HttpPolicy {
+    Permit,
+    Deny,
+    Authenticated,
+    Roles(Vec<String>),
+}
+
+enum AuthRequirement {
+    Permit,
+    Deny,
+    Authenticated,
+    Roles(Vec<String>),
+}
+
 /// Validates a bearer token and returns the authenticated principal.
 pub trait TokenValidator: Send + Sync + 'static {
     /// Validates a raw bearer token.
@@ -341,9 +499,14 @@ pub struct StaticTokenValidator {
 impl StaticTokenValidator {
     /// Creates a validator that accepts `token` and maps it to `subject`.
     pub fn bearer(token: impl Into<String>, subject: impl Into<String>) -> Self {
+        Self::principal(token, Principal::new(subject))
+    }
+
+    /// Creates a validator that accepts `token` and returns `principal`.
+    pub fn principal(token: impl Into<String>, principal: Principal) -> Self {
         Self {
             token: Arc::from(token.into()),
-            principal: Principal::new(subject),
+            principal,
         }
     }
 }
@@ -502,6 +665,7 @@ impl<'de> Deserialize<'de> for TokenClaims {
 pub struct Oidc {
     config: OidcConfig,
     validator: Arc<dyn TokenValidator>,
+    authorization: Option<Authorization>,
 }
 
 impl Oidc {
@@ -510,6 +674,7 @@ impl Oidc {
         OidcBuilder {
             config,
             validator: None,
+            authorization: None,
         }
     }
 
@@ -532,10 +697,39 @@ impl Oidc {
             return Err(Error::TenantDisabled);
         }
 
+        if let Some(authorization) = &self.authorization {
+            match authorization.requirement(request.method(), request.uri().path()) {
+                AuthRequirement::Permit => return Ok(()),
+                AuthRequirement::Deny => {
+                    self.authenticate_principal(request).await?;
+                    return Err(Error::Forbidden);
+                }
+                AuthRequirement::Authenticated => {
+                    self.authenticate_principal(request).await?;
+                    return Ok(());
+                }
+                AuthRequirement::Roles(roles) => {
+                    let principal = self.authenticate_principal(request).await?;
+                    if roles
+                        .iter()
+                        .any(|role| principal.groups().any(|group| group == role))
+                    {
+                        return Ok(());
+                    }
+                    return Err(Error::Forbidden);
+                }
+            }
+        }
+
+        self.authenticate_principal(request).await?;
+        Ok(())
+    }
+
+    async fn authenticate_principal(&self, request: &mut Request<Body>) -> Result<Principal> {
         let token = bearer_token(request)?;
         let principal = self.validator.validate(token).await?;
-        request.extensions_mut().insert(principal);
-        Ok(())
+        request.extensions_mut().insert(principal.clone());
+        Ok(principal)
     }
 }
 
@@ -543,6 +737,7 @@ impl Oidc {
 pub struct OidcBuilder {
     config: OidcConfig,
     validator: Option<Arc<dyn TokenValidator>>,
+    authorization: Option<Authorization>,
 }
 
 impl OidcBuilder {
@@ -552,6 +747,12 @@ impl OidcBuilder {
         V: TokenValidator,
     {
         self.validator = Some(Arc::new(validator));
+        self
+    }
+
+    /// Sets Quarkus-style path authorization policies.
+    pub fn authorization(mut self, authorization: Authorization) -> Self {
+        self.authorization = Some(authorization);
         self
     }
 
@@ -610,6 +811,7 @@ impl OidcBuilder {
         Oidc {
             config: self.config,
             validator: self.validator.unwrap_or_else(|| Arc::new(RejectAllTokens)),
+            authorization: self.authorization,
         }
     }
 }
@@ -671,6 +873,77 @@ where
             }
         })
     }
+}
+
+fn load_role_policies(config: &Config) -> mp_config::Result<HashMap<String, Vec<String>>> {
+    let mut policies = HashMap::new();
+
+    for key in config.property_names() {
+        let Some(name) = key
+            .strip_prefix("quarkus.http.auth.policy.")
+            .and_then(|suffix| suffix.strip_suffix(".roles-allowed"))
+        else {
+            continue;
+        };
+
+        policies.insert(name.to_owned(), split_csv(&config.get::<String>(&key)?));
+    }
+
+    Ok(policies)
+}
+
+fn permission_names(config: &Config) -> Vec<String> {
+    let mut names = BTreeSet::new();
+
+    for key in config.property_names() {
+        if let Some(name) = key
+            .strip_prefix("quarkus.http.auth.permission.")
+            .and_then(|suffix| suffix.strip_suffix(".paths"))
+        {
+            names.insert(name.to_owned());
+        }
+    }
+
+    names.into_iter().collect()
+}
+
+fn policy_from_config(name: &str, role_policies: &HashMap<String, Vec<String>>) -> HttpPolicy {
+    match name {
+        "permit" => HttpPolicy::Permit,
+        "deny" => HttpPolicy::Deny,
+        "authenticated" => HttpPolicy::Authenticated,
+        name => HttpPolicy::Roles(role_policies.get(name).cloned().unwrap_or_default()),
+    }
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn path_match_score(pattern: &str, request_path: &str) -> Option<usize> {
+    if pattern == request_path {
+        return Some(10_000 + pattern.len());
+    }
+
+    if pattern == "/*" {
+        return Some(1);
+    }
+
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        let prefix = format!("{prefix}/");
+        return request_path.starts_with(&prefix).then_some(prefix.len());
+    }
+
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return request_path.starts_with(prefix).then_some(prefix.len());
+    }
+
+    None
 }
 
 fn bearer_token(request: &Request<Body>) -> Result<Arc<str>> {
@@ -1069,6 +1342,190 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn authorization_matches_quarkus_default_deny_permissions() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-default-deny", 100)
+                        .with("quarkus.http.auth.permission.default-deny.paths", "/*")
+                        .with("quarkus.http.auth.permission.default-deny.policy", "deny")
+                        .with(
+                            "quarkus.http.auth.permission.permit1.paths",
+                            "/permit,/combined",
+                        )
+                        .with("quarkus.http.auth.permission.permit1.policy", "permit")
+                        .with("quarkus.http.auth.permission.permit2.paths", "/permit-get")
+                        .with("quarkus.http.auth.permission.permit2.methods", "GET")
+                        .with("quarkus.http.auth.permission.permit2.policy", "permit")
+                        .with(
+                            "quarkus.http.auth.permission.deny1.paths",
+                            "/deny,/combined",
+                        )
+                        .with("quarkus.http.auth.permission.deny1.policy", "deny"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/unmentioned", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request("/unmentioned", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(request("/permit", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_method(http::Method::POST, "/permit", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request("/permit-get", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_method(http::Method::POST, "/permit-get", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request("/combined", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request("/combined", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorization_matches_quarkus_role_policy_permissions() {
+        let authorization = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-roles", 100)
+                        .with("quarkus.http.auth.policy.r1.roles-allowed", "test")
+                        .with("quarkus.http.auth.policy.r2.roles-allowed", "admin")
+                        .with(
+                            "quarkus.http.auth.permission.roles1.paths",
+                            "/roles1,/deny,/permit,/combined,/wildcard1/*,/wildcard2*",
+                        )
+                        .with("quarkus.http.auth.permission.roles1.policy", "r1")
+                        .with(
+                            "quarkus.http.auth.permission.roles2.paths",
+                            "/roles2,/deny,/permit/combined,/wildcard3/*",
+                        )
+                        .with("quarkus.http.auth.permission.roles2.policy", "r2")
+                        .with("quarkus.http.auth.permission.permit1.paths", "/permit")
+                        .with("quarkus.http.auth.permission.permit1.policy", "permit")
+                        .with(
+                            "quarkus.http.auth.permission.deny1.paths",
+                            "/deny,/combined",
+                        )
+                        .with("quarkus.http.auth.permission.deny1.policy", "deny"),
+                )
+                .build(),
+        )
+        .expect("authorization config should load");
+        let app = authz_app(authorization);
+
+        let response = app
+            .clone()
+            .oneshot(request("/roles1", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request("/roles1", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request("/roles2", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(request("/permit", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request("/permit", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request("/deny", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(request("/wildcard1/a", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(request("/wildcard1/a", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request("/wildcard2", Some("Bearer test-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(request("/wildcard3XXX", None))
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     fn oidc() -> Oidc {
         Oidc::builder(OidcConfig::default())
             .validator(StaticTokenValidator::bearer("test-token", "alice"))
@@ -1090,6 +1547,19 @@ mod tests {
         Router::new()
             .route("/protected", get(|| async { "ok" }))
             .layer(oidc.layer())
+    }
+
+    fn authz_app(authorization: Authorization) -> Router {
+        Router::new().fallback(|| async { "ok" }).layer(
+            Oidc::builder(OidcConfig::default())
+                .validator(StaticTokenValidator::principal(
+                    "test-token",
+                    Principal::with_groups("test", ["test"]),
+                ))
+                .authorization(authorization)
+                .build()
+                .layer(),
+        )
     }
 
     fn claims_app(oidc: Oidc) -> Router {
@@ -1114,7 +1584,16 @@ mod tests {
     }
 
     fn request(uri: &str, authorization: Option<&str>) -> Request<Body> {
+        request_with_method(http::Method::GET, uri, authorization)
+    }
+
+    fn request_with_method(
+        method: http::Method,
+        uri: &str,
+        authorization: Option<&str>,
+    ) -> Request<Body> {
         let mut builder = Request::builder().uri(uri);
+        builder = builder.method(method);
         if let Some(authorization) = authorization {
             builder = builder.header(AUTHORIZATION, authorization);
         }
