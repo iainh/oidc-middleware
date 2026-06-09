@@ -128,7 +128,7 @@ impl Default for OidcConfig {
 }
 
 /// Token validation configuration loaded from `quarkus.oidc.token.*`.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcTokenConfig {
     /// Expected token issuer. Defaults to `auth-server-url` when unset.
     pub issuer: Option<String>,
@@ -140,10 +140,30 @@ pub struct OidcTokenConfig {
     pub required_claims: HashMap<String, Vec<String>>,
     /// Claim used as the authenticated principal name.
     pub principal_claim: Option<String>,
+    /// Custom HTTP header that contains the bearer token.
+    pub header: Option<String>,
+    /// HTTP Authorization header scheme.
+    pub authorization_scheme: String,
     /// Grace period applied to token expiry and issued-at checks.
     pub lifespan_grace: Option<u64>,
     /// Maximum age allowed since the token `iat` claim.
     pub age: Option<Duration>,
+}
+
+impl Default for OidcTokenConfig {
+    fn default() -> Self {
+        Self {
+            issuer: None,
+            audience: None,
+            token_type: None,
+            required_claims: HashMap::new(),
+            principal_claim: None,
+            header: None,
+            authorization_scheme: "Bearer".to_owned(),
+            lifespan_grace: None,
+            age: None,
+        }
+    }
 }
 
 impl ConfigProperties for OidcTokenConfig {
@@ -166,6 +186,10 @@ impl ConfigProperties for OidcTokenConfig {
             token_type: config.get_optional(&key("token-type"))?,
             required_claims: load_required_claims(config, &key("required-claims"))?,
             principal_claim: config.get_optional(&key("principal-claim"))?,
+            header: config.get_optional(&key("header"))?,
+            authorization_scheme: config
+                .get_optional(&key("authorization-scheme"))?
+                .unwrap_or_else(|| "Bearer".to_owned()),
             lifespan_grace: config.get_optional(&key("lifespan-grace"))?,
             age: config.get_optional(&key("age"))?,
         })
@@ -1142,7 +1166,7 @@ impl Oidc {
     }
 
     async fn authenticate_principal(&self, request: &mut Request<Body>) -> Result<Principal> {
-        let token = bearer_token(request)?;
+        let token = bearer_token(request, &self.config.token)?;
         let principal = self.validator.validate(token).await?;
         request.extensions_mut().insert(principal.clone());
         Ok(principal)
@@ -1633,7 +1657,23 @@ fn path_match_score(pattern: &str, request_path: &str) -> Option<usize> {
     None
 }
 
-fn bearer_token(request: &Request<Body>) -> Result<Arc<str>> {
+fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc<str>> {
+    if let Some(header_name) = &config.header {
+        let header_name = http::HeaderName::from_str(header_name)
+            .map_err(|_| Error::InvalidAuthorizationHeader)?;
+        let Some(header) = request.headers().get(header_name) else {
+            return Err(Error::MissingBearerToken);
+        };
+        let token = header
+            .to_str()
+            .map_err(|_| Error::InvalidAuthorizationHeader)?
+            .trim();
+        if token.is_empty() {
+            return Err(Error::InvalidAuthorizationHeader);
+        }
+        return Ok(Arc::from(token));
+    }
+
     let Some(header) = request.headers().get(AUTHORIZATION) else {
         return Err(Error::MissingBearerToken);
     };
@@ -1641,8 +1681,9 @@ fn bearer_token(request: &Request<Body>) -> Result<Arc<str>> {
     let value = header
         .to_str()
         .map_err(|_| Error::InvalidAuthorizationHeader)?;
+    let prefix = format!("{} ", config.authorization_scheme);
     let token = value
-        .strip_prefix("Bearer ")
+        .strip_prefix(&prefix)
         .filter(|token| !token.is_empty())
         .ok_or(Error::InvalidAuthorizationHeader)?;
 
@@ -1801,6 +1842,8 @@ mod tests {
                     .with("quarkus.oidc.token.required-claims.org_id", "org_xyz")
                     .with("quarkus.oidc.token.required-claims.scope", "read,write")
                     .with("quarkus.oidc.token.principal-claim", "email")
+                    .with("quarkus.oidc.token.header", "x-access-token")
+                    .with("quarkus.oidc.token.authorization-scheme", "Token")
                     .with("quarkus.oidc.token.lifespan-grace", "5")
                     .with("quarkus.oidc.token.age", "60s")
                     .with(
@@ -1834,6 +1877,8 @@ mod tests {
                         ),
                     ]),
                     principal_claim: Some("email".to_owned()),
+                    header: Some("x-access-token".to_owned()),
+                    authorization_scheme: "Token".to_owned(),
                     lifespan_grace: Some(5),
                     age: Some(Duration::from_secs(60)),
                 },
@@ -1887,6 +1932,64 @@ mod tests {
             response.headers().get(WWW_AUTHENTICATE).unwrap(),
             HeaderValue::from_static(r#"Bearer error="invalid_token""#)
         );
+    }
+
+    #[tokio::test]
+    async fn configured_authorization_scheme_is_accepted() {
+        let response = app(Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                authorization_scheme: "Token".to_owned(),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer("test-token", "alice"))
+        .build())
+        .oneshot(request("/protected", Some("Token test-token")))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_authorization_scheme_rejects_default_scheme() {
+        let response = app(Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                authorization_scheme: "Token".to_owned(),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer("test-token", "alice"))
+        .build())
+        .oneshot(request("/protected", Some("Bearer test-token")))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn configured_token_header_is_accepted() {
+        let response = app(Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                header: Some("x-access-token".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .validator(StaticTokenValidator::bearer("test-token", "alice"))
+        .build())
+        .oneshot(request_with_header(
+            "/protected",
+            "x-access-token",
+            "test-token",
+        ))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3142,6 +3245,14 @@ mod tests {
             builder = builder.header(AUTHORIZATION, authorization);
         }
         builder
+            .body(Body::empty())
+            .expect("request should be valid")
+    }
+
+    fn request_with_header(uri: &str, header_name: &str, header_value: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header(header_name, header_value)
             .body(Body::empty())
             .expect("request should be valid")
     }
