@@ -859,10 +859,17 @@ impl Authorization {
                 continue;
             }
 
-            let paths = normalize_permission_paths(
-                split_csv(&config.get::<String>(&format!("{prefix}.paths"))?),
-                &root_path,
-            );
+            let paths_key = format!("{prefix}.paths");
+            let paths_value = config.get::<String>(&paths_key)?;
+            let paths = split_csv(&paths_value);
+            if paths.is_empty() {
+                return Err(mp_config::ConfigError::Conversion {
+                    name: paths_key,
+                    value: paths_value,
+                    message: "permission paths must include at least one path".to_owned(),
+                });
+            }
+            let paths = normalize_permission_paths(paths, &root_path);
             let methods_key = format!("{prefix}.methods");
             let methods = config
                 .get_optional::<String>(&methods_key)?
@@ -6910,6 +6917,36 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("roles-allowed must include at least one role"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn authorization_rejects_empty_permission_paths() {
+        let error = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-empty-paths", 100)
+                        .with("quarkus.http.auth.permission.secured.paths", " , ")
+                        .with(
+                            "quarkus.http.auth.permission.secured.policy",
+                            "authenticated",
+                        ),
+                )
+                .build(),
+        )
+        .expect_err("empty permission paths should be rejected");
+
+        assert!(
+            error.to_string().contains(
+                "failed to convert config property `quarkus.http.auth.permission.secured.paths`"
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("permission paths must include at least one path"),
             "{error}"
         );
     }
