@@ -24,7 +24,8 @@ This crate is in early development. The current implementation includes:
 - Refreshable provider JWKS validation when a token references an unknown `kid`.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
-- Configurable role extraction with `quarkus.oidc.roles.role-claim-path`.
+- Configurable role extraction with `quarkus.oidc.roles.role-claim-path` and
+  `quarkus.oidc.roles.role-claim-separator`.
 - Quarkus-style `quarkus.http.auth.permission.*` path policies for `permit`,
   `deny`, `authenticated`, and named `roles-allowed` policies.
 - `#[roles_allowed(...)]` handler macro for Quarkus-style role checks with the

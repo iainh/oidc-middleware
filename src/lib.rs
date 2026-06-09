@@ -181,12 +181,16 @@ pub struct OidcRolesConfig {
     /// The default covers standard `groups` claims and Keycloak realm roles.
     #[config(default = "groups,realm_access.roles")]
     pub role_claim_path: String,
+    /// Separator used when a role claim is a string containing multiple roles.
+    #[config(default = " ")]
+    pub role_claim_separator: String,
 }
 
 impl Default for OidcRolesConfig {
     fn default() -> Self {
         Self {
             role_claim_path: "groups,realm_access.roles".to_owned(),
+            role_claim_separator: " ".to_owned(),
         }
     }
 }
@@ -293,6 +297,7 @@ impl Principal {
     fn from_claims(
         claims: TokenClaims,
         role_claim_paths: &[String],
+        role_claim_separator: &str,
         principal_claim: Option<&str>,
     ) -> Result<Self> {
         let subject = principal_name(&claims, principal_claim)?;
@@ -300,7 +305,7 @@ impl Principal {
             subject: Arc::from(subject),
             issuer: claims.iss.map(Arc::from),
             audience: claims.aud.into_iter().map(Arc::from).collect(),
-            groups: extract_roles(&claims.extra, role_claim_paths)
+            groups: extract_roles(&claims.extra, role_claim_paths, role_claim_separator)
                 .into_iter()
                 .map(Arc::from)
                 .collect(),
@@ -669,6 +674,7 @@ pub struct JwtValidator {
     keys: JwtKeys,
     validation: Validation,
     role_claim_paths: Arc<[String]>,
+    role_claim_separator: Arc<str>,
     token_type: Option<Arc<str>>,
     required_claims: Arc<HashMap<String, Vec<String>>>,
     principal_claim: Option<Arc<str>>,
@@ -689,6 +695,7 @@ impl JwtValidator {
             keys: JwtKeys::Single(Arc::new(DecodingKey::from_secret(secret.as_ref()))),
             validation,
             role_claim_paths: Arc::from(config.roles.claim_paths()),
+            role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             required_claims: Arc::new(config.token.required_claims.clone()),
             principal_claim: config.token.principal_claim.clone().map(Arc::from),
@@ -715,6 +722,7 @@ impl JwtValidator {
             keys: JwtKeys::Set(Arc::new(jwks)),
             validation,
             role_claim_paths: Arc::from(config.roles.claim_paths()),
+            role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             required_claims: Arc::new(config.token.required_claims.clone()),
             principal_claim: config.token.principal_claim.clone().map(Arc::from),
@@ -746,6 +754,7 @@ impl JwtValidator {
             }),
             validation,
             role_claim_paths: Arc::from(config.roles.claim_paths()),
+            role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             required_claims: Arc::new(config.token.required_claims.clone()),
             principal_claim: config.token.principal_claim.clone().map(Arc::from),
@@ -759,6 +768,7 @@ impl TokenValidator for JwtValidator {
         let keys = self.keys.clone();
         let validation = self.validation.clone();
         let role_claim_paths = self.role_claim_paths.clone();
+        let role_claim_separator = self.role_claim_separator.clone();
         let token_type = self.token_type.clone();
         let required_claims = self.required_claims.clone();
         let principal_claim = self.principal_claim.clone();
@@ -776,6 +786,7 @@ impl TokenValidator for JwtValidator {
                     Principal::from_claims(
                         data.claims,
                         &role_claim_paths,
+                        &role_claim_separator,
                         principal_claim.as_deref(),
                     )
                 })
@@ -1689,11 +1700,11 @@ fn jwk_algorithm(algorithm: Option<KeyAlgorithm>) -> Option<Algorithm> {
     Algorithm::from_str(&algorithm?.to_string()).ok()
 }
 
-fn extract_roles(claims: &Value, paths: &[String]) -> Vec<String> {
+fn extract_roles(claims: &Value, paths: &[String], separator: &str) -> Vec<String> {
     let mut roles = Vec::new();
     for path in paths {
         if let Some(value) = claim_path_value(claims, path) {
-            collect_roles(value, &mut roles);
+            collect_roles(value, &mut roles, separator);
         }
     }
     deduplicate(&mut roles);
@@ -1701,21 +1712,39 @@ fn extract_roles(claims: &Value, paths: &[String]) -> Vec<String> {
 }
 
 fn claim_path_value<'a>(claims: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
+    path.split(['.', '/'])
         .filter(|part| !part.is_empty())
         .try_fold(claims, |value, part| value.get(part))
 }
 
-fn collect_roles(value: &Value, roles: &mut Vec<String>) {
+fn collect_roles(value: &Value, roles: &mut Vec<String>, separator: &str) {
     match value {
-        Value::String(role) => roles.push(role.clone()),
+        Value::String(role) => split_roles(role, separator, roles),
         Value::Array(values) => {
             for value in values {
-                collect_roles(value, roles);
+                collect_roles(value, roles, separator);
             }
         }
         _ => {}
     }
+}
+
+fn split_roles(value: &str, separator: &str, roles: &mut Vec<String>) {
+    if separator.is_empty() {
+        let role = value.trim();
+        if !role.is_empty() {
+            roles.push(role.to_owned());
+        }
+        return;
+    }
+
+    roles.extend(
+        value
+            .split(separator)
+            .map(str::trim)
+            .filter(|role| !role.is_empty())
+            .map(ToOwned::to_owned),
+    );
 }
 
 fn deserialize_audience<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
@@ -1777,7 +1806,8 @@ mod tests {
                     .with(
                         "quarkus.oidc.roles.role-claim-path",
                         "resource_access.api.roles",
-                    ),
+                    )
+                    .with("quarkus.oidc.roles.role-claim-separator", "|"),
             )
             .build();
 
@@ -1809,6 +1839,7 @@ mod tests {
                 },
                 roles: OidcRolesConfig {
                     role_claim_path: "resource_access.api.roles".to_owned(),
+                    role_claim_separator: "|".to_owned(),
                 },
             }
         );
@@ -1930,6 +1961,7 @@ mod tests {
             },
             roles: OidcRolesConfig {
                 role_claim_path: "resource_access.orders.roles".to_owned(),
+                ..OidcRolesConfig::default()
             },
             ..OidcConfig::default()
         };
@@ -1943,6 +1975,82 @@ mod tests {
                     roles: vec!["orders-admin", "orders-user"],
                 },
             },
+        });
+
+        let response = custom_roles_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_extracts_slash_separated_role_claim_path() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: None,
+                ..OidcTokenConfig::default()
+            },
+            roles: OidcRolesConfig {
+                role_claim_path: "resource_access/orders/roles".to_owned(),
+                ..OidcRolesConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(CustomRoleClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            resource_access: ResourceAccessClaims {
+                orders: ResourceRolesClaims {
+                    roles: vec!["orders-admin", "orders-user"],
+                },
+            },
+        });
+
+        let response = custom_roles_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_splits_string_role_claims_with_configured_separator() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: None,
+                ..OidcTokenConfig::default()
+            },
+            roles: OidcRolesConfig {
+                role_claim_path: "permissions".to_owned(),
+                role_claim_separator: "|".to_owned(),
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(StringRoleClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            permissions: "orders-admin|orders-user",
         });
 
         let response = custom_roles_app(
@@ -3158,6 +3266,15 @@ mod tests {
         aud: &'a str,
         exp: u64,
         resource_access: ResourceAccessClaims<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct StringRoleClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        exp: u64,
+        permissions: &'a str,
     }
 
     #[derive(Serialize)]
