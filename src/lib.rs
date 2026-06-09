@@ -1766,11 +1766,11 @@ impl Tenants {
             );
         }
 
-        for name in named_tenant_names(config) {
-            let prefix = format!("quarkus.oidc.{name}");
+        for tenant in named_tenant_configs(config) {
+            let prefix = format!("quarkus.oidc.{}", tenant.prefix_segment);
             let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
             builder = builder.tenant(
-                name,
+                tenant.name,
                 oidc_builder_from_config(tenant_config, &format!("{prefix}.public-key"))?.build(),
             );
         }
@@ -2093,36 +2093,70 @@ fn has_default_tenant_config(config: &Config) -> bool {
     })
 }
 
+#[cfg(test)]
 fn named_tenant_names(config: &Config) -> Vec<String> {
+    named_tenant_configs(config)
+        .into_iter()
+        .map(|tenant| tenant.name)
+        .collect()
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct NamedTenantConfig {
+    name: String,
+    prefix_segment: String,
+}
+
+fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
     let mut names = BTreeSet::new();
     for key in config.property_names() {
         let Some(rest) = key.strip_prefix("quarkus.oidc.") else {
             continue;
         };
-        let Some((name, property)) = rest.split_once('.') else {
+        let Some((name, prefix_segment, property)) = named_tenant_key_parts(rest) else {
             continue;
         };
-        if !matches!(name, "token" | "roles")
-            && matches!(
-                property,
-                "enabled"
-                    | "tenant-enabled"
-                    | "auth-server-url"
-                    | "discovery-enabled"
-                    | "discovery-path"
-                    | "jwks-path"
-                    | "client-id"
-                    | "tenant-id"
-                    | "tenant-paths"
-                    | "public-key"
-                    | "application-type"
-            )
-            || property.starts_with("token.")
-        {
-            names.insert(name.to_owned());
+        let tenant_property = matches!(
+            property,
+            "enabled"
+                | "tenant-enabled"
+                | "auth-server-url"
+                | "discovery-enabled"
+                | "discovery-path"
+                | "jwks-path"
+                | "client-id"
+                | "tenant-id"
+                | "tenant-paths"
+                | "public-key"
+                | "application-type"
+        ) || property.starts_with("token.")
+            || property.starts_with("roles.");
+        if !matches!(name.as_str(), "token" | "roles") && tenant_property {
+            names.insert(NamedTenantConfig {
+                name,
+                prefix_segment,
+            });
         }
     }
     names.into_iter().collect()
+}
+
+fn named_tenant_key_parts(rest: &str) -> Option<(String, String, &str)> {
+    if let Some(rest) = rest.strip_prefix('"') {
+        let end = rest.find('"')?;
+        let name = &rest[..end];
+        if name.is_empty() {
+            return None;
+        }
+        let property = rest[end + 1..].strip_prefix('.')?;
+        return Some((name.to_owned(), format!(r#""{name}""#), property));
+    }
+
+    let (name, property) = rest.split_once('.')?;
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_owned(), name.to_owned(), property))
 }
 
 fn permission_names(config: &Config) -> Vec<String> {
@@ -4432,6 +4466,42 @@ dQIDAQAB
         assert_eq!(tenant_a.tenant_paths, Some("/api/a/*".to_owned()));
         assert_eq!(tenant_a.client_id, Some("tenant-a-client".to_owned()));
         assert_eq!(tenant_a.tenant_id, Some("orders".to_owned()));
+    }
+
+    #[test]
+    fn tenants_load_quoted_named_tenant_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("quoted-tenants", 100)
+                    .with(
+                        r#"quarkus.oidc."tenant.with.dot".tenant-paths"#,
+                        "/api/quoted/*",
+                    )
+                    .with(
+                        r#"quarkus.oidc."tenant.with.dot".client-id"#,
+                        "quoted-client",
+                    )
+                    .with(
+                        r#"quarkus.oidc."tenant.with.dot".roles.role-claim-path"#,
+                        "permissions",
+                    ),
+            )
+            .build();
+
+        assert_eq!(
+            named_tenant_names(&config),
+            vec!["tenant.with.dot".to_owned()]
+        );
+
+        let tenant =
+            OidcConfig::from_config_prefix(&config, r#"quarkus.oidc."tenant.with.dot""#).unwrap();
+        assert_eq!(tenant.tenant_paths, Some("/api/quoted/*".to_owned()));
+        assert_eq!(tenant.client_id, Some("quoted-client".to_owned()));
+        assert_eq!(tenant.roles.role_claim_path, "permissions");
+
+        let _tenants = Tenants::from_config(&config)
+            .expect("quoted tenant config should load")
+            .build();
     }
 
     #[tokio::test]
