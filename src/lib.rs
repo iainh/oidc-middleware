@@ -1850,12 +1850,15 @@ impl TenantsBuilder {
                 .unwrap_or(name.as_ref())
                 .to_owned(),
         );
-        let tenant_paths = oidc
+        let mut tenant_paths = oidc
             .config
             .tenant_paths
             .as_deref()
             .map(split_csv)
             .unwrap_or_default();
+        if tenant_paths.is_empty() {
+            tenant_paths.push(default_tenant_path(name.as_ref()));
+        }
         self.tenants.push(RegisteredTenant {
             name,
             id,
@@ -1918,6 +1921,10 @@ impl RegisteredTenant {
             .or(self.oidc.config.auth_server_url.as_deref())
             .is_some_and(|expected| expected == issuer)
     }
+}
+
+fn default_tenant_path(name: &str) -> String {
+    format!("/{name}/*")
 }
 
 /// Tower layer produced by [`Tenants::layer`].
@@ -4443,6 +4450,22 @@ dQIDAQAB
                 .build(),
         )
         .oneshot(request("/api/a/special", Some("Bearer b-token")))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tenants_select_named_tenant_from_first_path_segment() {
+        let response = tenant_app(
+            Tenants::builder()
+                .default_tenant(static_tenant("default-token", "default"))
+                .tenant("tenant-a", static_tenant("a-token", "tenant-a"))
+                .tenant("tenant-b", static_tenant("b-token", "tenant-b"))
+                .build(),
+        )
+        .oneshot(request("/tenant-b/bearer", Some("Bearer b-token")))
         .await
         .expect("request should complete");
 

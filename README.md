@@ -34,7 +34,8 @@ This crate is in early development. The current implementation includes:
   `quarkus.oidc.token.authorization-scheme`, including matching challenge
   responses.
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths`, tenant IDs,
-  and optional header-based or issuer-based tenant selection.
+  static first-path-segment tenant selection, and optional header-based or
+  issuer-based tenant selection.
 - Refreshable provider JWKS validation when a token references an unknown `kid`.
 - HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
   realm roles.
