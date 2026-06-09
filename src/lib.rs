@@ -127,6 +127,8 @@ pub struct OidcConfig {
     pub end_session_path: Option<String>,
     /// Client identifier expected by the provider.
     pub client_id: Option<String>,
+    /// Human-readable client name.
+    pub client_name: Option<String>,
     /// Stable tenant identifier used for tenant selection.
     pub tenant_id: Option<String>,
     /// Paths that should select this tenant.
@@ -175,6 +177,7 @@ impl Default for OidcConfig {
             user_info_path: None,
             end_session_path: None,
             client_id: None,
+            client_name: None,
             tenant_id: None,
             tenant_paths: None,
             public_key: None,
@@ -3162,6 +3165,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.user-info-path"
             || key == "quarkus.oidc.end-session-path"
             || key == "quarkus.oidc.client-id"
+            || key == "quarkus.oidc.client-name"
             || key == "quarkus.oidc.tenant-id"
             || key == "quarkus.oidc.tenant-id-header"
             || key == "quarkus.oidc.tenant-paths"
@@ -3213,6 +3217,7 @@ fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
                 | "user-info-path"
                 | "end-session-path"
                 | "client-id"
+                | "client-name"
                 | "tenant-id"
                 | "tenant-paths"
                 | "public-key"
@@ -3826,6 +3831,7 @@ dQIDAQAB
                         "protocol/openid-connect/logout",
                     )
                     .with("quarkus.oidc.client-id", "orders-service")
+                    .with("quarkus.oidc.client-name", "Orders Service")
                     .with("quarkus.oidc.credentials.secret", "orders-secret")
                     .with("quarkus.oidc.credentials.client-secret.method", "post")
                     .with("quarkus.oidc.introspection-credentials.name", "introspect")
@@ -3896,6 +3902,7 @@ dQIDAQAB
                 user_info_path: Some("protocol/openid-connect/userinfo".to_owned()),
                 end_session_path: Some("protocol/openid-connect/logout".to_owned()),
                 client_id: Some("orders-service".to_owned()),
+                client_name: Some("Orders Service".to_owned()),
                 tenant_id: Some("orders-tenant".to_owned()),
                 tenant_paths: None,
                 public_key: Some("configured-public-key".to_owned()),
@@ -6696,6 +6703,7 @@ dQIDAQAB
                     .with("quarkus.oidc.tenant-paths", "/api/default")
                     .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
                     .with("quarkus.oidc.tenant-a.client-id", "tenant-a-client")
+                    .with("quarkus.oidc.tenant-a.client-name", "Tenant A")
                     .with("quarkus.oidc.tenant-a.tenant-id", "orders")
                     .with("quarkus.oidc.tenant-b.tenant-enabled", "false")
                     .with("quarkus.oidc.tenant-b.tenant-paths", "/api/b/*"),
@@ -6710,6 +6718,7 @@ dQIDAQAB
         let tenant_a = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a").unwrap();
         assert_eq!(tenant_a.tenant_paths, Some("/api/a/*".to_owned()));
         assert_eq!(tenant_a.client_id, Some("tenant-a-client".to_owned()));
+        assert_eq!(tenant_a.client_name, Some("Tenant A".to_owned()));
         assert_eq!(tenant_a.tenant_id, Some("orders".to_owned()));
     }
 
