@@ -105,6 +105,14 @@ pub struct OidcConfig {
     pub discovery_path: String,
     /// Relative or absolute JWKS endpoint used when discovery is disabled.
     pub jwks_path: Option<String>,
+    /// Relative or absolute token endpoint path.
+    pub token_path: Option<String>,
+    /// Relative or absolute token introspection endpoint path.
+    pub introspection_path: Option<String>,
+    /// Relative or absolute user info endpoint path.
+    pub user_info_path: Option<String>,
+    /// Relative or absolute end-session endpoint path.
+    pub end_session_path: Option<String>,
     /// Client identifier expected by the provider.
     pub client_id: Option<String>,
     /// Stable tenant identifier used for tenant selection.
@@ -141,6 +149,10 @@ impl Default for OidcConfig {
             discovery_enabled: true,
             discovery_path: ".well-known/openid-configuration".to_owned(),
             jwks_path: None,
+            token_path: None,
+            introspection_path: None,
+            user_info_path: None,
+            end_session_path: None,
             client_id: None,
             tenant_id: None,
             tenant_paths: None,
@@ -648,6 +660,16 @@ pub struct ProviderMetadata {
     pub issuer: Option<String>,
     /// JSON Web Key Set URL returned by the provider.
     pub jwks_uri: String,
+    /// OAuth2 authorization endpoint returned by the provider.
+    pub authorization_endpoint: Option<String>,
+    /// OAuth2 token endpoint returned by the provider.
+    pub token_endpoint: Option<String>,
+    /// OAuth2 token introspection endpoint returned by the provider.
+    pub introspection_endpoint: Option<String>,
+    /// OIDC user info endpoint returned by the provider.
+    pub userinfo_endpoint: Option<String>,
+    /// OIDC end-session endpoint returned by the provider.
+    pub end_session_endpoint: Option<String>,
 }
 
 impl ProviderMetadata {
@@ -2122,6 +2144,10 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.discovery-enabled"
             || key == "quarkus.oidc.discovery-path"
             || key == "quarkus.oidc.jwks-path"
+            || key == "quarkus.oidc.token-path"
+            || key == "quarkus.oidc.introspection-path"
+            || key == "quarkus.oidc.user-info-path"
+            || key == "quarkus.oidc.end-session-path"
             || key == "quarkus.oidc.client-id"
             || key == "quarkus.oidc.tenant-id"
             || key == "quarkus.oidc.tenant-paths"
@@ -2162,6 +2188,10 @@ fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
                 | "discovery-enabled"
                 | "discovery-path"
                 | "jwks-path"
+                | "token-path"
+                | "introspection-path"
+                | "user-info-path"
+                | "end-session-path"
                 | "client-id"
                 | "tenant-id"
                 | "tenant-paths"
@@ -2696,6 +2726,19 @@ dQIDAQAB
                     .with("quarkus.oidc.discovery-enabled", "false")
                     .with("quarkus.oidc.discovery-path", "custom-discovery")
                     .with("quarkus.oidc.jwks-path", "protocol/openid-connect/certs")
+                    .with("quarkus.oidc.token-path", "protocol/openid-connect/token")
+                    .with(
+                        "quarkus.oidc.introspection-path",
+                        "protocol/openid-connect/token/introspect",
+                    )
+                    .with(
+                        "quarkus.oidc.user-info-path",
+                        "protocol/openid-connect/userinfo",
+                    )
+                    .with(
+                        "quarkus.oidc.end-session-path",
+                        "protocol/openid-connect/logout",
+                    )
                     .with("quarkus.oidc.client-id", "orders-service")
                     .with("quarkus.oidc.tenant-id", "orders-tenant")
                     .with("quarkus.oidc.public-key", "configured-public-key")
@@ -2737,6 +2780,10 @@ dQIDAQAB
                 discovery_enabled: false,
                 discovery_path: "custom-discovery".to_owned(),
                 jwks_path: Some("protocol/openid-connect/certs".to_owned()),
+                token_path: Some("protocol/openid-connect/token".to_owned()),
+                introspection_path: Some("protocol/openid-connect/token/introspect".to_owned()),
+                user_info_path: Some("protocol/openid-connect/userinfo".to_owned()),
+                end_session_path: Some("protocol/openid-connect/logout".to_owned()),
                 client_id: Some("orders-service".to_owned()),
                 tenant_id: Some("orders-tenant".to_owned()),
                 tenant_paths: None,
@@ -4529,7 +4576,12 @@ dQIDAQAB
         let metadata = ProviderMetadata::from_json(
             r#"{
                 "issuer": "https://issuer.example/realms/app",
-                "jwks_uri": "https://issuer.example/realms/app/protocol/openid-connect/certs"
+                "jwks_uri": "https://issuer.example/realms/app/protocol/openid-connect/certs",
+                "authorization_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/auth",
+                "token_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/token",
+                "introspection_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
+                "userinfo_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/userinfo",
+                "end_session_endpoint": "https://issuer.example/realms/app/protocol/openid-connect/logout"
             }"#,
         )
         .expect("provider metadata should parse");
@@ -4540,6 +4592,22 @@ dQIDAQAB
                 issuer: Some("https://issuer.example/realms/app".to_owned()),
                 jwks_uri: "https://issuer.example/realms/app/protocol/openid-connect/certs"
                     .to_owned(),
+                authorization_endpoint: Some(
+                    "https://issuer.example/realms/app/protocol/openid-connect/auth".to_owned(),
+                ),
+                token_endpoint: Some(
+                    "https://issuer.example/realms/app/protocol/openid-connect/token".to_owned(),
+                ),
+                introspection_endpoint: Some(
+                    "https://issuer.example/realms/app/protocol/openid-connect/token/introspect"
+                        .to_owned(),
+                ),
+                userinfo_endpoint: Some(
+                    "https://issuer.example/realms/app/protocol/openid-connect/userinfo".to_owned(),
+                ),
+                end_session_endpoint: Some(
+                    "https://issuer.example/realms/app/protocol/openid-connect/logout".to_owned(),
+                ),
             }
         );
     }
@@ -5898,6 +5966,11 @@ dQIDAQAB
         ProviderMetadata {
             issuer: Some("https://issuer.example/realms/app".to_owned()),
             jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: None,
+            token_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
         }
     }
 
