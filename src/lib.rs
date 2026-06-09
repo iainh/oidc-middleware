@@ -160,6 +160,8 @@ pub struct OidcTokenConfig {
     pub signature_algorithm: Option<TokenSignatureAlgorithm>,
     /// Require the token to include a `sub` claim.
     pub subject_required: bool,
+    /// Require the token to include an `iat` claim.
+    pub issued_at_required: bool,
     /// Required claims and their expected string values.
     pub required_claims: HashMap<String, Vec<String>>,
     /// Claim used as the authenticated principal name.
@@ -182,6 +184,7 @@ impl Default for OidcTokenConfig {
             token_type: None,
             signature_algorithm: None,
             subject_required: false,
+            issued_at_required: true,
             required_claims: HashMap::new(),
             principal_claim: None,
             header: None,
@@ -214,6 +217,9 @@ impl ConfigProperties for OidcTokenConfig {
             subject_required: config
                 .get_optional(&key("subject-required"))?
                 .unwrap_or_default(),
+            issued_at_required: config
+                .get_optional(&key("issued-at-required"))?
+                .unwrap_or(true),
             required_claims: load_required_claims(config, &key("required-claims"))?,
             principal_claim: config.get_optional(&key("principal-claim"))?,
             header: config.get_optional(&key("header"))?,
@@ -919,6 +925,7 @@ pub struct JwtValidator {
     role_claim_separator: Arc<str>,
     token_type: Option<Arc<str>>,
     subject_required: bool,
+    issued_at_required: bool,
     required_claims: Arc<HashMap<String, Vec<String>>>,
     principal_claim: Option<Arc<str>>,
     token_age: Option<Duration>,
@@ -942,6 +949,7 @@ impl JwtValidator {
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
+            issued_at_required: config.token.issued_at_required,
             required_claims: Arc::new(config.token.required_claims.clone()),
             principal_claim: config.token.principal_claim.clone().map(Arc::from),
             token_age: config.token.age,
@@ -966,6 +974,7 @@ impl JwtValidator {
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
+            issued_at_required: config.token.issued_at_required,
             required_claims: Arc::new(config.token.required_claims.clone()),
             principal_claim: config.token.principal_claim.clone().map(Arc::from),
             token_age: config.token.age,
@@ -986,6 +995,7 @@ impl JwtValidator {
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
+            issued_at_required: config.token.issued_at_required,
             required_claims: Arc::new(config.token.required_claims.clone()),
             principal_claim: config.token.principal_claim.clone().map(Arc::from),
             token_age: config.token.age,
@@ -1015,6 +1025,7 @@ impl JwtValidator {
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_type: config.token.token_type.clone().map(Arc::from),
             subject_required: config.token.subject_required,
+            issued_at_required: config.token.issued_at_required,
             required_claims: Arc::new(config.token.required_claims.clone()),
             principal_claim: config.token.principal_claim.clone().map(Arc::from),
             token_age: config.token.age,
@@ -1030,6 +1041,7 @@ impl TokenValidator for JwtValidator {
         let role_claim_separator = self.role_claim_separator.clone();
         let token_type = self.token_type.clone();
         let subject_required = self.subject_required;
+        let issued_at_required = self.issued_at_required;
         let required_claims = self.required_claims.clone();
         let principal_claim = self.principal_claim.clone();
         let token_age = self.token_age;
@@ -1042,6 +1054,7 @@ impl TokenValidator for JwtValidator {
                 .and_then(|data| {
                     validate_token_type(&data.claims, token_type.as_deref())?;
                     validate_subject(&data.claims, subject_required)?;
+                    validate_issued_at(&data.claims, issued_at_required, leeway)?;
                     validate_required_claims(&data.claims, &required_claims)?;
                     validate_token_age(&data.claims, token_age, leeway)?;
                     Principal::from_claims(
@@ -1180,6 +1193,24 @@ fn validate_token_type(claims: &TokenClaims, expected: Option<&str>) -> Result<(
 fn validate_subject(claims: &TokenClaims, subject_required: bool) -> Result<()> {
     if subject_required && claims.sub.is_none() {
         return Err(Error::TokenRejected("JWT sub claim is required".into()));
+    }
+
+    Ok(())
+}
+
+fn validate_issued_at(claims: &TokenClaims, issued_at_required: bool, leeway: u64) -> Result<()> {
+    let Some(issued_at) = claims.iat else {
+        if issued_at_required {
+            return Err(Error::TokenRejected("JWT iat claim is required".into()));
+        }
+        return Ok(());
+    };
+    let now = unix_timestamp()?;
+
+    if issued_at > now.saturating_add(leeway) {
+        return Err(Error::TokenRejected(
+            "JWT iat claim is later than the allowed lifespan grace".into(),
+        ));
     }
 
     Ok(())
@@ -2385,6 +2416,8 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
+    const TEST_IAT: u64 = 1_700_000_000;
+
     const PRIVATE_RSA_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDJETqse41HRBsc
 7cfcq3ak4oZWFCoZlcic525A3FfO4qW9BMtRO/iXiyCCHn8JhiL9y8j5JdVP2Q9Z
@@ -2444,6 +2477,7 @@ dQIDAQAB
                     .with("quarkus.oidc.token.token-type", "bearer")
                     .with("quarkus.oidc.token.signature-algorithm", "rs256")
                     .with("quarkus.oidc.token.subject-required", "true")
+                    .with("quarkus.oidc.token.issued-at-required", "false")
                     .with("quarkus.oidc.token.required-claims.org_id", "org_xyz")
                     .with("quarkus.oidc.token.required-claims.scope", "read,write")
                     .with("quarkus.oidc.token.principal-claim", "email")
@@ -2481,6 +2515,7 @@ dQIDAQAB
                     token_type: Some("bearer".to_owned()),
                     signature_algorithm: Some(TokenSignatureAlgorithm::Rs256),
                     subject_required: true,
+                    issued_at_required: false,
                     required_claims: HashMap::from([
                         ("org_id".to_owned(), vec!["org_xyz".to_owned()]),
                         (
@@ -3496,6 +3531,98 @@ dQIDAQAB
     }
 
     #[tokio::test]
+    async fn jwt_validator_rejects_missing_iat_by_default() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt_without_iat(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_accepts_missing_iat_when_not_required() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                issued_at_required: false,
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt_without_iat(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_rejects_future_iat_beyond_lifespan_grace() {
+        let now = unix_timestamp().expect("system time should be after epoch");
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                lifespan_grace: Some(5),
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TimeClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: now + 60,
+            iat: now + 10,
+        });
+
+        let response = app(Oidc::builder(config.clone())
+            .validator(JwtValidator::hs256("secret", &config))
+            .build())
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn jwt_validator_rejects_missing_iat_when_token_age_is_configured() {
         let config = OidcConfig {
             auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
@@ -3507,7 +3634,7 @@ dQIDAQAB
             },
             ..OidcConfig::default()
         };
-        let token = jwt(TestClaims {
+        let token = jwt_without_iat(TestClaims {
             sub: "alice",
             iss: "https://issuer.example/realms/app",
             aud: "orders-api",
@@ -4721,6 +4848,20 @@ dQIDAQAB
     }
 
     fn jwt(claims: impl Serialize) -> String {
+        jwt_value(claims, true)
+    }
+
+    fn jwt_without_iat(claims: impl Serialize) -> String {
+        jwt_value(claims, false)
+    }
+
+    fn jwt_value(claims: impl Serialize, include_default_iat: bool) -> String {
+        let mut claims = serde_json::to_value(claims).expect("test claims should serialize");
+        if include_default_iat {
+            if let Value::Object(claims) = &mut claims {
+                claims.entry("iat").or_insert_with(|| Value::from(TEST_IAT));
+            }
+        }
         encode(
             &Header::default(),
             &claims,
@@ -4730,6 +4871,10 @@ dQIDAQAB
     }
 
     fn jwt_rs256(claims: impl Serialize) -> String {
+        let mut claims = serde_json::to_value(claims).expect("test claims should serialize");
+        if let Value::Object(claims) = &mut claims {
+            claims.entry("iat").or_insert_with(|| Value::from(TEST_IAT));
+        }
         encode(
             &Header::new(Algorithm::RS256),
             &claims,
@@ -4746,6 +4891,10 @@ dQIDAQAB
     fn jwt_with_kid_and_secret(kid: &str, secret: &[u8], claims: impl Serialize) -> String {
         let mut header = Header::default();
         header.kid = Some(kid.to_owned());
+        let mut claims = serde_json::to_value(claims).expect("test claims should serialize");
+        if let Value::Object(claims) = &mut claims {
+            claims.entry("iat").or_insert_with(|| Value::from(TEST_IAT));
+        }
 
         encode(&header, &claims, &EncodingKey::from_secret(secret))
             .expect("test token should encode")

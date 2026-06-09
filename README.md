@@ -25,7 +25,8 @@ This crate is in early development. The current implementation includes:
 - Optional `sub` enforcement with `quarkus.oidc.token.subject-required`.
 - JWT string claim enforcement with `quarkus.oidc.token.required-claims.*`.
 - JWT lifespan grace and age checks with `quarkus.oidc.token.lifespan-grace`
-  and `quarkus.oidc.token.age`.
+  and `quarkus.oidc.token.age`, including
+  `quarkus.oidc.token.issued-at-required`.
 - Principal-name selection with `quarkus.oidc.token.principal-claim`.
 - Token extraction with `quarkus.oidc.token.header` and
   `quarkus.oidc.token.authorization-scheme`.
