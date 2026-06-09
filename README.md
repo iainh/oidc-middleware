@@ -12,6 +12,7 @@ This crate is in early development. The current implementation includes:
 - request `Principal` extensions after successful authentication.
 - pluggable bearer-token validation through `TokenValidator`.
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`.
+- Local JWT verification with `quarkus.oidc.public-key`.
 - Audience validation from one or more `quarkus.oidc.token.audience` values,
   defaulting to `quarkus.oidc.client-id` when present.
 - Quarkus `any` issuer and audience bypass values for providers with variable

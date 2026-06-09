@@ -16,7 +16,7 @@ categories = ["web-programming::http-server", "authentication"]
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["json"] }
 http = "1"
-jsonwebtoken = { version = "9", default-features = false }
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 mp-config = { path = "../mp-config" }
 oidc-middleware-macros = { version = "0.1.0", path = "oidc-middleware-macros" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

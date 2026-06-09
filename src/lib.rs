@@ -94,6 +94,8 @@ pub struct OidcConfig {
     pub client_id: Option<String>,
     /// Paths that should select this tenant.
     pub tenant_paths: Option<String>,
+    /// Public key used for local JWT verification without provider discovery.
+    pub public_key: Option<String>,
     /// Quarkus-style application type.
     #[config(default)]
     pub application_type: ApplicationType,
@@ -120,6 +122,7 @@ impl Default for OidcConfig {
             auth_server_url: None,
             client_id: None,
             tenant_paths: None,
+            public_key: None,
             application_type: ApplicationType::Service,
             token: OidcTokenConfig::default(),
             roles: OidcRolesConfig::default(),
@@ -533,6 +536,8 @@ impl IntoResponse for Error {
 pub enum BuildError {
     /// Provider discovery requires `quarkus.oidc.auth-server-url`.
     MissingAuthServerUrl,
+    /// The configured public key could not be parsed.
+    InvalidPublicKey(BoxError),
     /// A configured provider or metadata URL could not be parsed.
     InvalidUrl { url: String, message: String },
     /// Fetching provider metadata or keys failed.
@@ -546,6 +551,7 @@ impl fmt::Display for BuildError {
                 f,
                 "OIDC provider discovery requires `quarkus.oidc.auth-server-url`"
             ),
+            Self::InvalidPublicKey(source) => write!(f, "invalid OIDC public key: {source}"),
             Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
             Self::Http(source) => write!(f, "OIDC provider request failed: {source}"),
         }
@@ -555,6 +561,7 @@ impl fmt::Display for BuildError {
 impl StdError for BuildError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
+            Self::InvalidPublicKey(source) => Some(source.as_ref()),
             Self::Http(source) => Some(source),
             _ => None,
         }
@@ -942,6 +949,26 @@ impl JwtValidator {
         }
     }
 
+    /// Builds a JWT validator backed by `quarkus.oidc.public-key`.
+    pub fn public_key(public_key: &str, config: &OidcConfig) -> BuildResult<Self> {
+        let mut validation = Validation::new(public_key_algorithm(config));
+        apply_validation_config(&mut validation, config);
+        apply_signature_algorithm_config(&mut validation, config);
+        let key = public_decoding_key(public_key, &validation)?;
+
+        Ok(Self {
+            keys: JwtKeys::Single(Arc::new(key)),
+            validation,
+            role_claim_paths: Arc::from(config.roles.claim_paths()),
+            role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
+            token_type: config.token.token_type.clone().map(Arc::from),
+            subject_required: config.token.subject_required,
+            required_claims: Arc::new(config.token.required_claims.clone()),
+            principal_claim: config.token.principal_claim.clone().map(Arc::from),
+            token_age: config.token.age,
+        })
+    }
+
     /// Builds a JWT validator backed by a refreshable JSON Web Key Set.
     ///
     /// The current key set is used first. If a token contains an unknown `kid`,
@@ -1322,7 +1349,7 @@ impl Oidc {
 
     /// Loads configuration from `quarkus.oidc.*` and starts building.
     pub fn from_config(config: &Config) -> mp_config::Result<OidcBuilder> {
-        Ok(Self::builder(OidcConfig::from_config(config)?))
+        oidc_builder_from_config(OidcConfig::from_config(config)?, "quarkus.oidc.public-key")
     }
 
     /// Returns a tower layer suitable for `Router::layer`.
@@ -1382,6 +1409,27 @@ impl Oidc {
     }
 }
 
+fn oidc_builder_from_config(
+    config: OidcConfig,
+    public_key_property: &str,
+) -> mp_config::Result<OidcBuilder> {
+    let public_key = config.public_key.clone();
+    let mut builder = Oidc::builder(config);
+    if !builder.config.enabled {
+        return Ok(builder);
+    }
+    if let Some(public_key) = public_key {
+        builder = builder.public_key(&public_key).map_err(|error| {
+            mp_config::ConfigError::Conversion {
+                name: public_key_property.to_owned(),
+                value: public_key,
+                message: error.to_string(),
+            }
+        })?;
+    }
+    Ok(builder)
+}
+
 /// Builder for [`Oidc`].
 pub struct OidcBuilder {
     config: OidcConfig,
@@ -1403,6 +1451,15 @@ impl OidcBuilder {
     pub fn authorization(mut self, authorization: Authorization) -> Self {
         self.authorization = Some(authorization);
         self
+    }
+
+    /// Installs a `quarkus.oidc.public-key` backed JWT validator.
+    pub fn public_key(mut self, public_key: &str) -> BuildResult<Self> {
+        self.validator = Some(Arc::new(JwtValidator::public_key(
+            public_key,
+            &self.config,
+        )?));
+        Ok(self)
     }
 
     /// Discovers provider metadata and installs a JWKS-backed JWT validator.
@@ -1570,13 +1627,18 @@ impl Tenants {
         let mut builder = Tenants::builder();
         if has_default_tenant_config(config) {
             let default_config = OidcConfig::from_config(config)?;
-            builder = builder.default_tenant(Oidc::builder(default_config).build());
+            builder = builder.default_tenant(
+                oidc_builder_from_config(default_config, "quarkus.oidc.public-key")?.build(),
+            );
         }
 
         for name in named_tenant_names(config) {
-            let tenant_config =
-                OidcConfig::from_config_prefix(config, &format!("quarkus.oidc.{name}"))?;
-            builder = builder.tenant(name, Oidc::builder(tenant_config).build());
+            let prefix = format!("quarkus.oidc.{name}");
+            let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
+            builder = builder.tenant(
+                name,
+                oidc_builder_from_config(tenant_config, &format!("{prefix}.public-key"))?.build(),
+            );
         }
 
         Ok(builder)
@@ -1816,6 +1878,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.auth-server-url"
             || key == "quarkus.oidc.client-id"
             || key == "quarkus.oidc.tenant-paths"
+            || key == "quarkus.oidc.public-key"
             || key == "quarkus.oidc.application-type"
             || key.starts_with("quarkus.oidc.token.")
     })
@@ -1838,6 +1901,7 @@ fn named_tenant_names(config: &Config) -> Vec<String> {
                     | "auth-server-url"
                     | "client-id"
                     | "tenant-paths"
+                    | "public-key"
                     | "application-type"
             )
             || property.starts_with("token.")
@@ -2052,6 +2116,40 @@ fn apply_jwks_algorithm_config(validation: &mut Validation, jwks: &JwkSet, confi
     }
 }
 
+fn public_key_algorithm(config: &OidcConfig) -> Algorithm {
+    config
+        .token
+        .signature_algorithm
+        .map(|algorithm| algorithm.algorithm())
+        .unwrap_or(Algorithm::RS256)
+}
+
+fn public_decoding_key(public_key: &str, validation: &Validation) -> BuildResult<DecodingKey> {
+    let key = public_key.as_bytes();
+    let algorithm = validation
+        .algorithms
+        .first()
+        .copied()
+        .unwrap_or(Algorithm::RS256);
+
+    match algorithm {
+        Algorithm::ES256 | Algorithm::ES384 => DecodingKey::from_ec_pem(key),
+        Algorithm::EdDSA => DecodingKey::from_ed_pem(key),
+        Algorithm::RS256
+        | Algorithm::RS384
+        | Algorithm::RS512
+        | Algorithm::PS256
+        | Algorithm::PS384
+        | Algorithm::PS512 => DecodingKey::from_rsa_pem(key),
+        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
+            return Err(BuildError::InvalidPublicKey(
+                "public-key does not support HMAC signature algorithms".into(),
+            ));
+        }
+    }
+    .map_err(|error| BuildError::InvalidPublicKey(Box::new(error)))
+}
+
 fn supported_algorithms(jwks: &JwkSet) -> Vec<Algorithm> {
     let mut algorithms = Vec::new();
     for algorithm in jwks
@@ -2172,6 +2270,45 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
+    const PRIVATE_RSA_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDJETqse41HRBsc
+7cfcq3ak4oZWFCoZlcic525A3FfO4qW9BMtRO/iXiyCCHn8JhiL9y8j5JdVP2Q9Z
+IpfElcFd3/guS9w+5RqQGgCR+H56IVUyHZWtTJbKPcwWXQdNUX0rBFcsBzCRESJL
+eelOEdHIjG7LRkx5l/FUvlqsyHDVJEQsHwegZ8b8C0fz0EgT2MMEdn10t6Ur1rXz
+jMB/wvCg8vG8lvciXmedyo9xJ8oMOh0wUEgxziVDMMovmC+aJctcHUAYubwoGN8T
+yzcvnGqL7JSh36Pwy28iPzXZ2RLhAyJFU39vLaHdljwthUaupldlNyCfa6Ofy4qN
+ctlUPlN1AgMBAAECggEAdESTQjQ70O8QIp1ZSkCYXeZjuhj081CK7jhhp/4ChK7J
+GlFQZMwiBze7d6K84TwAtfQGZhQ7km25E1kOm+3hIDCoKdVSKch/oL54f/BK6sKl
+qlIzQEAenho4DuKCm3I4yAw9gEc0DV70DuMTR0LEpYyXcNJY3KNBOTjN5EYQAR9s
+2MeurpgK2MdJlIuZaIbzSGd+diiz2E6vkmcufJLtmYUT/k/ddWvEtz+1DnO6bRHh
+xuuDMeJA/lGB/EYloSLtdyCF6sII6C6slJJtgfb0bPy7l8VtL5iDyz46IKyzdyzW
+tKAn394dm7MYR1RlUBEfqFUyNK7C+pVMVoTwCC2V4QKBgQD64syfiQ2oeUlLYDm4
+CcKSP3RnES02bcTyEDFSuGyyS1jldI4A8GXHJ/lG5EYgiYa1RUivge4lJrlNfjyf
+dV230xgKms7+JiXqag1FI+3mqjAgg4mYiNjaao8N8O3/PD59wMPeWYImsWXNyeHS
+55rUKiHERtCcvdzKl4u35ZtTqQKBgQDNKnX2bVqOJ4WSqCgHRhOm386ugPHfy+8j
+m6cicmUR46ND6ggBB03bCnEG9OtGisxTo/TuYVRu3WP4KjoJs2LD5fwdwJqpgtHl
+yVsk45Y1Hfo+7M6lAuR8rzCi6kHHNb0HyBmZjysHWZsn79ZM+sQnLpgaYgQGRbKV
+DZWlbw7g7QKBgQCl1u+98UGXAP1jFutwbPsx40IVszP4y5ypCe0gqgon3UiY/G+1
+zTLp79GGe/SjI2VpQ7AlW7TI2A0bXXvDSDi3/5Dfya9ULnFXv9yfvH1QwWToySpW
+Kvd1gYSoiX84/WCtjZOr0e0HmLIb0vw0hqZA4szJSqoxQgvF22EfIWaIaQKBgQCf
+34+OmMYw8fEvSCPxDxVvOwW2i7pvV14hFEDYIeZKW2W1HWBhVMzBfFB5SE8yaCQy
+pRfOzj9aKOCm2FjjiErVNpkQoi6jGtLvScnhZAt/lr2TXTrl8OwVkPrIaN0bG/AS
+aUYxmBPCpXu3UjhfQiWqFq/mFyzlqlgvuCc9g95HPQKBgAscKP8mLxdKwOgX8yFW
+GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
+2pOhmquJQVDPDLuZHdrIiKiDM20dy9sMfHygWcZjQ4WSxf/J7T9canLZIXFhHAZT
+3wc9h4G8BBCtWN2TN/LsGZdB
+-----END PRIVATE KEY-----"#;
+
+    const PUBLIC_RSA_KEY: &str = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyRE6rHuNR0QbHO3H3Kt2
+pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5/CYYi/cvI+SXVT9kPWSKXxJXB
+Xd/4LkvcPuUakBoAkfh+eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHR
+yIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG/AtH89BIE9jDBHZ9dLelK9a184zAf8Lw
+oPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xq
+i+yUod+j8MtvIj812dkS4QMiRVN/by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5T
+dQIDAQAB
+-----END PUBLIC KEY-----"#;
+
     #[test]
     fn config_loads_quarkus_oidc_properties() {
         let config = Config::builder()
@@ -2182,6 +2319,7 @@ mod tests {
                         "https://issuer.example/realms/app",
                     )
                     .with("quarkus.oidc.client-id", "orders-service")
+                    .with("quarkus.oidc.public-key", "configured-public-key")
                     .with("quarkus.oidc.application-type", "hybrid")
                     .with("quarkus.oidc.token.audience", "orders-api")
                     .with("quarkus.oidc.token.token-type", "bearer")
@@ -2212,6 +2350,7 @@ mod tests {
                 auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
                 client_id: Some("orders-service".to_owned()),
                 tenant_paths: None,
+                public_key: Some("configured-public-key".to_owned()),
                 application_type: ApplicationType::Hybrid,
                 token: OidcTokenConfig {
                     issuer: None,
@@ -2400,6 +2539,74 @@ mod tests {
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oidc_from_config_uses_public_key_for_local_jwt_verification() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("public-key", 100)
+                    .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
+                    .with(
+                        "quarkus.oidc.auth-server-url",
+                        "https://issuer.example/realms/app",
+                    )
+                    .with("quarkus.oidc.token.audience", "orders-api"),
+            )
+            .build();
+        let token = jwt_rs256(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec!["admin"],
+            realm_access: RealmAccessClaims {
+                roles: vec!["user"],
+            },
+        });
+
+        let response = claims_app(
+            Oidc::from_config(&config)
+                .expect("public key config should load")
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn oidc_from_config_rejects_invalid_public_key() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("public-key", 100)
+                    .with("quarkus.oidc.public-key", "not a pem public key"),
+            )
+            .build();
+
+        let Err(error) = Oidc::from_config(&config) else {
+            panic!("invalid public key should fail");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { name, .. }
+                if name == "quarkus.oidc.public-key"
+        ));
+    }
+
+    #[test]
+    fn oidc_from_config_ignores_public_key_when_disabled() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("disabled-public-key", 100)
+                    .with("quarkus.oidc.enabled", "false")
+                    .with("quarkus.oidc.public-key", "not a pem public key"),
+            )
+            .build();
+
+        let _builder = Oidc::from_config(&config).expect("disabled OIDC should not parse key");
     }
 
     #[tokio::test]
@@ -4222,6 +4429,16 @@ mod tests {
             &Header::default(),
             &claims,
             &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("test token should encode")
+    }
+
+    fn jwt_rs256(claims: impl Serialize) -> String {
+        encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(PRIVATE_RSA_KEY.as_bytes())
+                .expect("test RSA private key should parse"),
         )
         .expect("test token should encode")
     }
