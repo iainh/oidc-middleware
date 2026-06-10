@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "oidc-middleware"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Quarkus-inspired OIDC middleware for Axum."
@@ -14,10 +14,13 @@ keywords = ["axum", "oidc", "oauth2", "microprofile"]
 categories = ["web-programming::http-server", "authentication"]
 
 [features]
-default = ["http-client", "jwt", "macros", "web-app"]
+default = ["http-client", "jwt", "macros", "rustls", "web-app"]
 http-client = ["dep:reqwest", "dep:url"]
 jwt = ["dep:jsonwebtoken"]
 macros = ["dep:oidc-middleware-macros"]
+native-tls = ["http-client", "reqwest/native-tls"]
+rustls = ["http-client", "reqwest/rustls-tls"]
+rustls-native-certs = ["http-client", "reqwest/rustls-tls-native-roots"]
 web-app = ["http-client", "jwt", "dep:getrandom", "dep:tower-sessions"]
 
 [dependencies]
@@ -27,8 +30,8 @@ getrandom = { version = "0.2", optional = true }
 http = "1"
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"], optional = true }
 mp-config = { git = "ssh://git@github.com/iainh/mp-config", tag = "v0.1.1" }
-oidc-middleware-macros = { version = "0.3.1", path = "oidc-middleware-macros", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+oidc-middleware-macros = { version = "0.4.0", path = "oidc-middleware-macros", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json"], optional = true }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = "1"
 tower-layer = "0.3"

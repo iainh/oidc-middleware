@@ -212,7 +212,7 @@ Default features preserve the full convenience API:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.3" }
+oidc-middleware = { version = "0.4" }
 ```
 
 Applications that provide their own validators can opt into a smaller dependency
@@ -220,7 +220,7 @@ surface:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.3", default-features = false }
+oidc-middleware = { version = "0.4", default-features = false }
 ```
 
 Available features:
@@ -230,6 +230,11 @@ Available features:
 - `jwt`: Enables `jsonwebtoken`, `JwtValidator`, JWKS support, and static
   public-key validation.
 - `macros`: Enables the optional handler authorization macros.
+- `native-tls`: Enables the platform-native TLS backend for `reqwest`.
+- `rustls`: Enables the rustls TLS backend for `reqwest`; this is included in
+  the default features.
+- `rustls-native-certs`: Enables the rustls TLS backend with platform-native
+  certificate roots.
 - `web-app`: Enables browser login support with `tower-sessions`; this also
   enables `http-client` and `jwt`.
 
@@ -237,6 +242,14 @@ With `default-features = false`, the crate keeps the Axum middleware, config
 model, route authorization layers, custom validator traits, introspection model,
 and UserInfo model, while avoiding the optional HTTP client, TLS, JWT, proc
 macro, session, random-state, and URL-parsing stacks.
+
+When enabling `http-client` or `web-app` without default features, also enable
+one TLS backend for HTTPS provider calls:
+
+```toml
+[dependencies]
+oidc-middleware = { version = "0.4", default-features = false, features = ["web-app", "rustls-native-certs"] }
+```
 
 ## Design guidance
 
