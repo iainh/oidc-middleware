@@ -70,7 +70,7 @@ impl Principal {
     /// Returns group or role names carried by the token.
     ///
     /// Groups are derived from configured role claim paths and are the values
-    /// checked by [`crate::RequireRolesLayer`] and [`crate::roles_allowed`].
+    /// checked by [`crate::RequireRolesLayer`] and `roles_allowed`.
     pub fn groups(&self) -> impl Iterator<Item = &str> {
         self.groups.iter().map(AsRef::as_ref)
     }
@@ -110,6 +110,7 @@ impl Principal {
         self
     }
 
+    #[cfg(feature = "web-app")]
     pub(crate) fn from_parts(
         subject: String,
         issuer: Option<String>,
@@ -129,7 +130,7 @@ impl Principal {
 ///
 /// Use this in handlers that should fail with `403 Forbidden` when called
 /// without an authenticated principal extension. It is also the expected
-/// principal argument for [`crate::roles_allowed`] and [`crate::authenticated`]
+/// principal argument for `roles_allowed` and `authenticated`
 /// handler macros.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcPrincipal(Principal);

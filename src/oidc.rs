@@ -6,6 +6,7 @@ use crate::provider::{
 use crate::token::bearer_token;
 use crate::user_info::HttpUserInfoProvider;
 use crate::validator::RejectAllTokens;
+#[cfg(feature = "web-app")]
 use crate::web_app::WebApp;
 use crate::{
     ApplicationType, BuildError, BuildResult, Error, IntrospectionFallbackValidator,
@@ -27,6 +28,7 @@ use tower_layer::Layer;
 use tower_service::Service;
 use tracing::{debug, trace};
 
+#[cfg(feature = "web-app")]
 enum WebAppPrincipal {
     Authenticated,
     Redirect(Response),
@@ -46,6 +48,7 @@ enum WebAppPrincipal {
 pub struct Oidc {
     pub(crate) config: OidcConfig,
     validator: Arc<dyn TokenValidator>,
+    #[cfg(feature = "web-app")]
     web_app: Option<Arc<WebApp>>,
 }
 
@@ -59,6 +62,7 @@ impl Oidc {
         OidcBuilder {
             config,
             validator: None,
+            #[cfg(feature = "web-app")]
             web_app: None,
         }
     }
@@ -146,6 +150,7 @@ impl Oidc {
         }
     }
 
+    #[cfg(feature = "web-app")]
     pub(crate) async fn authenticate_web_app(
         &self,
         request: &mut Request<Body>,
@@ -193,6 +198,7 @@ impl Oidc {
         }
     }
 
+    #[cfg(feature = "web-app")]
     async fn web_app_principal_or_redirect(
         &self,
         request: &mut Request<Body>,
@@ -237,9 +243,22 @@ impl Oidc {
             return Ok(None);
         }
 
-        match self.authenticate_web_app(request).await {
-            Ok(response) => Ok(response),
-            Err(error) => Err(error),
+        #[cfg(feature = "web-app")]
+        {
+            match self.authenticate_web_app(request).await {
+                Ok(response) => Ok(response),
+                Err(error) => Err(error),
+            }
+        }
+
+        #[cfg(not(feature = "web-app"))]
+        {
+            Err(Error::Session(
+                std::io::Error::other(
+                    "OIDC web-app authentication requires the `web-app` crate feature",
+                )
+                .into(),
+            ))
         }
     }
 }
@@ -358,6 +377,7 @@ fn oidc_http_client(config: &OidcConfig) -> BuildResult<reqwest::Client> {
 pub struct OidcBuilder {
     config: OidcConfig,
     validator: Option<Arc<dyn TokenValidator>>,
+    #[cfg(feature = "web-app")]
     web_app: Option<Arc<WebApp>>,
 }
 
@@ -805,6 +825,7 @@ impl OidcBuilder {
             && !self.config.token.verify_access_token_with_user_info
     }
 
+    #[cfg(feature = "web-app")]
     fn install_web_app_from_config(&mut self, client: reqwest::Client) -> BuildResult<()> {
         if self.config.application_type != ApplicationType::WebApp {
             return Ok(());
@@ -814,6 +835,15 @@ impl OidcBuilder {
         Ok(())
     }
 
+    #[cfg(not(feature = "web-app"))]
+    fn install_web_app_from_config(&mut self, _client: reqwest::Client) -> BuildResult<()> {
+        if self.config.application_type == ApplicationType::WebApp {
+            return Err(BuildError::WebAppFeatureDisabled);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "web-app")]
     fn install_web_app_from_metadata(
         &mut self,
         metadata: &ProviderMetadata,
@@ -829,6 +859,18 @@ impl OidcBuilder {
             metadata.authorization_endpoint.clone(),
             metadata.token_endpoint.clone(),
         )?));
+        Ok(())
+    }
+
+    #[cfg(not(feature = "web-app"))]
+    fn install_web_app_from_metadata(
+        &mut self,
+        _metadata: &ProviderMetadata,
+        _client: reqwest::Client,
+    ) -> BuildResult<()> {
+        if self.config.application_type == ApplicationType::WebApp {
+            return Err(BuildError::WebAppFeatureDisabled);
+        }
         Ok(())
     }
 
@@ -888,11 +930,15 @@ impl OidcBuilder {
     /// wired before a JWT/JWKS backend is added.
     pub fn build(self) -> Oidc {
         let has_validator = self.validator.is_some();
+        #[cfg(feature = "web-app")]
         let has_web_app = self.web_app.is_some();
+        #[cfg(not(feature = "web-app"))]
+        let has_web_app = false;
         debug!(has_validator, has_web_app, "building OIDC middleware");
         Oidc {
             config: self.config,
             validator: self.validator.unwrap_or_else(|| Arc::new(RejectAllTokens)),
+            #[cfg(feature = "web-app")]
             web_app: self.web_app,
         }
     }

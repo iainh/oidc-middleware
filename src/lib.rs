@@ -12,7 +12,7 @@
 //!   Quarkus-style `oidc.*` properties from [`mp_config`].
 //! - Use [`RequireRolesLayer`] or [`RequireAuthenticatedLayer`] on routes when
 //!   authorization is structural and should be visible in the router.
-//! - Use [`roles_allowed`] or [`authenticated`] when the authorization decision
+//! - Use `roles_allowed` or `authenticated` when the authorization decision
 //!   belongs directly to a handler.
 //! - Use [`Tenants`] when a single Axum app must validate tokens for multiple
 //!   issuers, realms, or client populations.
@@ -64,7 +64,7 @@
 //! - `oidc.application-type` maps to [`OidcConfig::application_type`]. Use
 //!   `service` for APIs and `web-app` for browser login.
 //! - `oidc.authentication.*` configures browser redirects for `web-app`
-//!   applications. Web-app middleware expects a [`tower_sessions::Session`]
+//!   applications. Web-app middleware expects a `tower_sessions::Session`
 //!   extension supplied by `tower-sessions`.
 //! - `oidc.enabled=false` disables authentication for the layer. This is useful
 //!   for local profiles, but it also means protected handlers must not assume a
@@ -77,6 +77,7 @@
 //!
 //! More complete runnable patterns live in the `examples/` directory.
 
+#[cfg(feature = "macros")]
 pub use oidc_middleware_macros::{authenticated, roles_allowed};
 
 mod authorization;
@@ -96,6 +97,7 @@ mod token;
 mod user_info;
 mod validation_claims;
 mod validator;
+#[cfg(feature = "web-app")]
 mod web_app;
 
 pub use authorization::{

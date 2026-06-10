@@ -65,10 +65,7 @@ impl JwtValidator {
     /// used. Supported key algorithms are inferred from JWK `alg` fields when
     /// present.
     pub fn jwks(jwks: JwkSet, config: &OidcConfig) -> Self {
-        debug!(
-            keys = jwks.keys.len(),
-            "building refreshable JWKS JWT validator"
-        );
+        debug!(keys = jwks.keys.len(), "building JWKS JWT validator");
         let mut validation = Validation::new(Algorithm::RS256);
         apply_validation_config(&mut validation, config);
         apply_jwks_algorithm_config(&mut validation, &jwks, config);

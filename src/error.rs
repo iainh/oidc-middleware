@@ -135,6 +135,8 @@ pub enum BuildError {
     MissingTokenEndpoint,
     /// Web-app authorization-code flow requires `oidc.client-id`.
     MissingClientId,
+    /// Web-app authorization-code flow requires the `web-app` crate feature.
+    WebAppFeatureDisabled,
     /// The configured public key could not be parsed.
     InvalidPublicKey(BoxError),
     /// A configured provider or metadata URL could not be parsed.
@@ -183,6 +185,10 @@ impl fmt::Display for BuildError {
             Self::MissingClientId => {
                 write!(f, "OIDC web-app authentication requires `oidc.client-id`")
             }
+            Self::WebAppFeatureDisabled => write!(
+                f,
+                "OIDC web-app authentication requires the `web-app` crate feature"
+            ),
             Self::InvalidPublicKey(source) => write!(f, "invalid OIDC public key: {source}"),
             Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
             Self::Http(source) => write!(f, "OIDC provider request failed: {source}"),

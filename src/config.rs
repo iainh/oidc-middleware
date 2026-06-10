@@ -731,7 +731,7 @@ impl mp_config::FromConfigValue for RolesSource {
 ///
 /// Role extraction turns provider-specific claims into [`crate::Principal`]
 /// groups. Those groups are what [`crate::RequireRolesLayer`] and
-/// [`crate::roles_allowed`] evaluate.
+/// `roles_allowed` evaluates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcRolesConfig {
     /// Token or response source used to extract roles.
