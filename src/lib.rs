@@ -3264,20 +3264,12 @@ impl Tenants {
         }
 
         if self.resolve_with_issuer {
-            if let Some(issuer) = request
-                .headers()
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(bearer_token_from_authorization_value)
-                .and_then(unverified_token_issuer)
-            {
-                if let Some(tenant) = self
-                    .tenants
-                    .iter()
-                    .find(|tenant| tenant.issuer_matches(&issuer))
-                {
-                    return Some(&tenant.oidc);
-                }
+            if let Some(tenant) = self.tenants.iter().find(|tenant| {
+                tenant
+                    .unverified_request_issuer(request)
+                    .is_some_and(|issuer| tenant.issuer_matches(&issuer))
+            }) {
+                return Some(&tenant.oidc);
             }
         }
 
@@ -3404,6 +3396,11 @@ impl RegisteredTenant {
             .filter(|expected| *expected != "any")
             .or(self.oidc.config.auth_server_url.as_deref())
             .is_some_and(|expected| expected == issuer)
+    }
+
+    fn unverified_request_issuer(&self, request: &Request<Body>) -> Option<String> {
+        unverified_token_from_request(request, &self.oidc.config.token)
+            .and_then(unverified_token_issuer)
     }
 }
 
@@ -3929,6 +3926,35 @@ fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc
     bearer_token_from_authorization_header(header, &config.authorization_scheme)
 }
 
+fn unverified_token_from_request<'a>(
+    request: &'a Request<Body>,
+    config: &OidcTokenConfig,
+) -> Option<&'a str> {
+    if let Some(header_name) = &config.header {
+        let header_name = http::HeaderName::from_str(header_name).ok()?;
+        let header = request.headers().get(&header_name)?;
+        if header_name == AUTHORIZATION {
+            return header
+                .to_str()
+                .ok()
+                .and_then(|value| token_with_scheme(value, &config.authorization_scheme))
+                .filter(|token| !token.is_empty());
+        }
+        return header
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|token| !token.is_empty());
+    }
+
+    request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|value| token_with_scheme(value, &config.authorization_scheme))
+        .filter(|token| !token.is_empty())
+}
+
 fn bearer_token_from_authorization_header(
     header: &HeaderValue,
     authorization_scheme: &str,
@@ -3941,10 +3967,6 @@ fn bearer_token_from_authorization_header(
         .ok_or(Error::InvalidAuthorizationHeader)?;
 
     Ok(Arc::from(token))
-}
-
-fn bearer_token_from_authorization_value(value: &str) -> Option<&str> {
-    token_with_scheme(value, "Bearer").filter(|token| !token.is_empty())
 }
 
 fn token_with_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
@@ -8177,6 +8199,107 @@ dQIDAQAB
             response_body(response).await,
             "tenant-b",
             "issuer should select tenant-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenants_select_by_token_issuer_with_configured_scheme() {
+        let tenant_a_token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/a",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec![],
+            realm_access: RealmAccessClaims { roles: vec![] },
+        });
+        let tenant_b_token = jwt(TestClaims {
+            sub: "bob",
+            iss: "https://issuer.example/realms/b",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec![],
+            realm_access: RealmAccessClaims { roles: vec![] },
+        });
+
+        let response = tenant_app(
+            Tenants::builder()
+                .resolve_with_issuer(true)
+                .tenant(
+                    "tenant-a",
+                    static_tenant_with_issuer(
+                        &tenant_a_token,
+                        "tenant-a",
+                        "https://issuer.example/realms/a",
+                    ),
+                )
+                .tenant(
+                    "tenant-b",
+                    Oidc::builder(OidcConfig {
+                        auth_server_url: Some("https://issuer.example/realms/b".to_owned()),
+                        token: OidcTokenConfig {
+                            authorization_scheme: "Token".to_owned(),
+                            ..OidcTokenConfig::default()
+                        },
+                        ..OidcConfig::default()
+                    })
+                    .validator(StaticTokenValidator::bearer(&tenant_b_token, "tenant-b"))
+                    .build(),
+                )
+                .build(),
+        )
+        .oneshot(request(
+            "/unmatched",
+            Some(&format!("Token {tenant_b_token}")),
+        ))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_body(response).await,
+            "tenant-b",
+            "configured scheme should select tenant-b by issuer"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenants_select_by_token_issuer_with_configured_header() {
+        let token = jwt(TestClaims {
+            sub: "bob",
+            iss: "https://issuer.example/realms/b",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec![],
+            realm_access: RealmAccessClaims { roles: vec![] },
+        });
+
+        let response = tenant_app(
+            Tenants::builder()
+                .resolve_with_issuer(true)
+                .tenant(
+                    "tenant-b",
+                    Oidc::builder(OidcConfig {
+                        auth_server_url: Some("https://issuer.example/realms/b".to_owned()),
+                        token: OidcTokenConfig {
+                            header: Some("x-access-token".to_owned()),
+                            ..OidcTokenConfig::default()
+                        },
+                        ..OidcConfig::default()
+                    })
+                    .validator(StaticTokenValidator::bearer(&token, "tenant-b"))
+                    .build(),
+                )
+                .build(),
+        )
+        .oneshot(request_with_header("/unmatched", "x-access-token", &token))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_body(response).await,
+            "tenant-b",
+            "configured token header should select tenant-b by issuer"
         );
     }
 
