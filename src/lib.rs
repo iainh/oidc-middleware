@@ -3141,6 +3141,7 @@ impl Tenants {
         for tenant in named_tenant_configs(config) {
             let prefix = format!("quarkus.oidc.{}", tenant.prefix_segment);
             let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
+            validate_configured_tenant_paths(&tenant_config, &format!("{prefix}.tenant-paths"))?;
             let oidc = oidc_builder_from_config(
                 tenant_config,
                 &format!("{prefix}.public-key"),
@@ -3199,6 +3200,23 @@ impl Tenants {
             .map(|(_, tenant)| &tenant.oidc)
             .or(self.default_tenant.as_ref())
     }
+}
+
+fn validate_configured_tenant_paths(
+    config: &OidcConfig,
+    property_name: &str,
+) -> mp_config::Result<()> {
+    if let Some(value) = &config.tenant_paths {
+        if split_csv(value).is_empty() {
+            return Err(mp_config::ConfigError::Conversion {
+                name: property_name.to_owned(),
+                value: value.clone(),
+                message: "tenant-paths must include at least one path".to_owned(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Builder for [`Tenants`].
@@ -7432,6 +7450,33 @@ dQIDAQAB
         assert_eq!(tenant_a.client_id, Some("tenant-a-client".to_owned()));
         assert_eq!(tenant_a.client_name, Some("Tenant A".to_owned()));
         assert_eq!(tenant_a.tenant_id, Some("orders".to_owned()));
+    }
+
+    #[test]
+    fn tenants_from_config_rejects_empty_named_tenant_paths() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-tenant-paths", 100)
+                    .with("quarkus.oidc.tenant-a.tenant-paths", " , "),
+            )
+            .build();
+
+        let Err(error) = Tenants::from_config(&config) else {
+            panic!("empty named tenant paths should be rejected");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.oidc.tenant-a.tenant-paths"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("tenant-paths must include at least one path"),
+            "{error}"
+        );
     }
 
     #[test]
