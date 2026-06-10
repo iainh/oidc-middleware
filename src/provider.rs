@@ -2,11 +2,21 @@ use crate::{BuildError, OidcConfig};
 use serde::Deserialize;
 
 /// OpenID Provider metadata used by discovery.
+///
+/// This models the provider fields this crate needs rather than the full OIDC
+/// discovery document. Unknown metadata is ignored; endpoint-specific features
+/// are enabled only when the corresponding field is present or explicitly
+/// configured.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct ProviderMetadata {
     /// Canonical issuer returned by the provider.
+    ///
+    /// When token issuer configuration is absent, this value becomes the
+    /// expected `iss` claim for JWT and introspection validation.
     pub issuer: Option<String>,
     /// JSON Web Key Set URL returned by the provider.
+    ///
+    /// This endpoint is required for provider-backed JWT validation.
     pub jwks_uri: String,
     /// OAuth2 authorization endpoint returned by the provider.
     pub authorization_endpoint: Option<String>,
@@ -26,6 +36,9 @@ pub struct ProviderMetadata {
 
 impl ProviderMetadata {
     /// Parses provider metadata from JSON.
+    ///
+    /// This is mainly useful for tests or applications that fetch and cache
+    /// discovery metadata outside the middleware builder.
     pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }

@@ -1,12 +1,22 @@
+//! Handler-level authorization macros for `oidc-middleware`.
+//!
+//! These macros are intentionally narrow. Prefer Axum route layers when
+//! authorization belongs to route structure, and use macros when the permission
+//! is inseparable from a handler's business operation. The generated code checks
+//! the `OidcPrincipal` extractor that the main crate populates after OIDC
+//! authentication.
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{FnArg, Ident, ItemFn, LitStr, Pat, ReturnType, parse_macro_input};
 
-/// Adds a Quarkus-style role check to an axum handler.
+/// Adds a Quarkus-style role check to an Axum handler.
 ///
-/// The annotated function must be async, return `Result<_, oidc_middleware::Error>`,
-/// and take an `OidcPrincipal` argument named `principal`.
+/// Use this when a role requirement is part of the handler contract rather than
+/// a router-level concern. The annotated function must be async, return
+/// `Result<_, oidc_middleware::Error>`, and take an `OidcPrincipal` argument
+/// named `principal`. The special role `"**"` means any authenticated principal.
 ///
 /// ```ignore
 /// use oidc_middleware::{Error, OidcPrincipal, roles_allowed};
@@ -23,10 +33,12 @@ pub fn roles_allowed(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expand_roles_allowed("roles_allowed", roles, &mut function))
 }
 
-/// Requires an authenticated OIDC principal for an axum handler.
+/// Requires an authenticated OIDC principal for an Axum handler.
 ///
-/// The annotated function must be async, return `Result<_, oidc_middleware::Error>`,
-/// and take an `OidcPrincipal` argument named `principal`.
+/// Use this for handler-local authentication checks that do not distinguish
+/// roles. The annotated function must be async, return
+/// `Result<_, oidc_middleware::Error>`, and take an `OidcPrincipal` argument
+/// named `principal`.
 ///
 /// ```ignore
 /// use oidc_middleware::{Error, OidcPrincipal, authenticated};

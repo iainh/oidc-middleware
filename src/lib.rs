@@ -1,15 +1,27 @@
 //! Quarkus-inspired OIDC middleware for [`axum`].
 //!
-//! `oidc-middleware` maps the pieces that make Quarkus OIDC productive onto
-//! explicit Rust types: MicroProfile-style configuration via [`mp-config`], a
-//! cloneable axum layer, bearer-token challenge responses, and request
-//! extensions for the authenticated identity.
+//! `oidc-middleware` keeps the part of Quarkus OIDC that works well for teams:
+//! provider configuration is declarative and predictable. It changes the part
+//! that does not map cleanly to Rust: authorization is expressed through normal
+//! Axum and Tower composition instead of global path-policy strings.
 //!
-//! ## Example
+//! # Choosing the right integration
+//!
+//! - Use [`Oidc::builder`] when application code owns provider configuration.
+//! - Use [`Oidc::from_config`] or [`Oidc::discover_from_config`] when you want
+//!   Quarkus-style `oidc.*` properties from [`mp_config`].
+//! - Use [`RequireRolesLayer`] or [`RequireAuthenticatedLayer`] on routes when
+//!   authorization is structural and should be visible in the router.
+//! - Use [`roles_allowed`] or [`authenticated`] when the authorization decision
+//!   belongs directly to a handler.
+//! - Use [`Tenants`] when a single Axum app must validate tokens for multiple
+//!   issuers, realms, or client populations.
+//!
+//! # Bearer-service example
 //!
 //! ```
 //! use axum::{Router, routing::get};
-//! use oidc_middleware::{Oidc, OidcConfig, StaticTokenValidator};
+//! use oidc_middleware::{Oidc, OidcConfig, RequireRolesLayer, StaticTokenValidator};
 //!
 //! # fn app() -> Router {
 //! let oidc = Oidc::builder(OidcConfig {
@@ -20,27 +32,50 @@
 //! .validator(StaticTokenValidator::bearer("dev-token", "alice"))
 //! .build();
 //!
+//! let protected = Router::new()
+//!     .route(
+//!         "/orders",
+//!         get(|| async { "ok" })
+//!             .route_layer(RequireRolesLayer::any(["orders-reader", "orders-admin"])),
+//!     )
+//!     .layer(oidc.layer());
+//!
 //! Router::new()
-//!     .route("/orders", get(|| async { "ok" }))
-//!     .layer(oidc.layer())
+//!     .route("/health", get(|| async { "ok" }))
+//!     .merge(protected)
 //! # }
 //! ```
 //!
-//! ## MicroProfile and Quarkus mapping
+//! Public routes should usually stay outside [`Oidc::layer`]. The OIDC layer is
+//! intentionally closed by default: once it wraps a route, missing or rejected
+//! bearer tokens become `401 Unauthorized` responses.
 //!
-//! Quarkus OIDC is configured under `oidc.*`. This crate follows that
-//! naming model through [`OidcConfig::from_config`], while keeping runtime
-//! behaviour explicit and testable:
+//! # MicroProfile and Quarkus mapping
+//!
+//! Quarkus OIDC is configured under `oidc.*`. This crate follows that naming
+//! model through [`OidcConfig::from_config`], while keeping runtime behaviour
+//! explicit and testable:
 //!
 //! - `oidc.auth-server-url` maps to [`OidcConfig::auth_server_url`].
-//! - `oidc.provider` maps to [`OidcConfig::provider`].
-//! - `oidc.client-id` maps to [`OidcConfig::client_id`].
-//! - `oidc.application-type` maps to [`OidcConfig::application_type`].
-//! - `oidc.authentication.*` configures browser redirects for
-//!   `web-app` applications. `web-app` middleware expects a
-//!   [`tower_sessions::Session`] extension supplied by `tower-sessions`.
-//! - `oidc.enabled=false` disables authentication for the layer.
-//! - `oidc.tenant-enabled=false` rejects requests as tenant-disabled.
+//! - `oidc.provider` maps to [`OidcConfig::provider`]. Built-in providers are
+//!   convenience defaults, not a substitute for issuer validation.
+//! - `oidc.client-id` maps to [`OidcConfig::client_id`]. It is used for
+//!   provider calls and default Keycloak resource-role extraction.
+//! - `oidc.application-type` maps to [`OidcConfig::application_type`]. Use
+//!   `service` for APIs and `web-app` for browser login.
+//! - `oidc.authentication.*` configures browser redirects for `web-app`
+//!   applications. Web-app middleware expects a [`tower_sessions::Session`]
+//!   extension supplied by `tower-sessions`.
+//! - `oidc.enabled=false` disables authentication for the layer. This is useful
+//!   for local profiles, but it also means protected handlers must not assume a
+//!   [`Principal`] extension exists.
+//! - `oidc.tenant-enabled=false` returns `404 Not Found` for the selected
+//!   tenant so disabled tenants do not advertise protected resources.
+//! - `oidc.token.audience=any` and `oidc.token.issuer=any` bypass the
+//!   corresponding validation and should be reserved for providers that cannot
+//!   emit stable claims.
+//!
+//! More complete runnable patterns live in the `examples/` directory.
 
 pub use oidc_middleware_macros::{authenticated, roles_allowed};
 

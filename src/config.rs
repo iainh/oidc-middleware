@@ -9,19 +9,54 @@ use std::time::Duration;
 const DEFAULT_ROLE_CLAIM_PATH: &str = "groups,realm_access.roles";
 
 /// OIDC configuration loaded from the MicroProfile-style config model.
+///
+/// The field names intentionally mirror Quarkus `oidc.*` properties so a team
+/// can move between Quarkus services and Axum services without relearning the
+/// provider vocabulary. The struct is also usable directly when configuration
+/// is owned by Rust code.
+///
+/// ```
+/// use oidc_middleware::{Oidc, OidcConfig};
+///
+/// let oidc = Oidc::builder(OidcConfig {
+///     auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+///     client_id: Some("orders-api".to_owned()),
+///     ..OidcConfig::default()
+/// });
+/// ```
+///
+/// Authentication and token validation settings live here; route authorization
+/// belongs in Axum layers or handler macros. Keeping those concerns separate
+/// avoids hidden global path rules and makes protected routes obvious in code.
 #[derive(Clone, Debug, ConfigProperties, Eq, PartialEq)]
 #[config(prefix = "oidc", rename_all = "kebab-case")]
 pub struct OidcConfig {
     /// Enables or disables the OIDC middleware.
+    ///
+    /// Disabled middleware allows requests through without inserting a
+    /// [`crate::Principal`]. Use it for local profiles, not for selectively
+    /// permitting public routes; public routes should usually sit outside the
+    /// OIDC layer.
     #[config(default = "true")]
     pub enabled: bool,
     /// Enables or disables the selected tenant.
+    ///
+    /// Disabled tenants return `404 Not Found`. This lets operators leave a
+    /// tenant configured while temporarily hiding its protected resources.
     #[config(default = "true")]
     pub tenant_enabled: bool,
     /// Resolve tenants by the bearer token issuer claim.
+    ///
+    /// This is useful when tenants share route shapes but tokens have stable
+    /// `iss` claims. Path or header selection is cheaper and more explicit when
+    /// route layout already identifies the tenant.
     #[config(default = "false")]
     pub resolve_tenants_with_issuer: bool,
     /// Base URL of the OpenID Connect provider or realm.
+    ///
+    /// Discovery, JWKS, introspection, UserInfo, and web-app endpoints are
+    /// resolved relative to this URL unless an endpoint property is already an
+    /// absolute URL.
     pub auth_server_url: Option<String>,
     /// Well-known OpenID Connect provider identifier.
     pub provider: Option<WellKnownProvider>,
@@ -29,6 +64,11 @@ pub struct OidcConfig {
     #[config(default = "10s")]
     pub connection_timeout: Duration,
     /// Enables OIDC provider metadata discovery.
+    ///
+    /// Discovery is the safest production default because issuer, JWKS, and
+    /// optional endpoints come from the provider. Disable it only when endpoints
+    /// are supplied out of band, such as locked-down deployments with fixed
+    /// `jwks-path` or `public-key` configuration.
     #[config(default = "true")]
     pub discovery_enabled: bool,
     /// Relative or absolute OIDC provider metadata discovery path.
@@ -59,8 +99,16 @@ pub struct OidcConfig {
     /// Paths that should select this tenant.
     pub tenant_paths: Option<String>,
     /// Public key used for local JWT verification without provider discovery.
+    ///
+    /// Prefer discovery or JWKS for rotating production keys. A static public
+    /// key is best suited for tests, demos, or tightly controlled deployments
+    /// where key rotation is handled outside the application.
     pub public_key: Option<String>,
     /// Quarkus-style application type.
+    ///
+    /// `service` validates bearer tokens on API requests. `web-app` performs
+    /// browser redirects and requires `tower-sessions`; it also needs provider
+    /// discovery or explicit authorization and token endpoints.
     #[config(default)]
     pub application_type: ApplicationType,
     /// Browser authentication settings used by `web-app` applications.
@@ -73,6 +121,10 @@ pub struct OidcConfig {
     #[config(nested)]
     pub introspection_credentials: OidcIntrospectionCredentialsConfig,
     /// Token validation settings.
+    ///
+    /// These settings decide whether a token is trusted. Keep business
+    /// authorization in route layers or handler macros after validation has
+    /// produced a [`crate::Principal`].
     #[config(nested)]
     pub token: OidcTokenConfig,
     /// Role extraction settings.
@@ -122,13 +174,24 @@ impl Default for OidcConfig {
 }
 
 /// Browser authentication settings loaded from `oidc.authentication.*`.
+///
+/// These settings apply only to [`ApplicationType::WebApp`]. Web-app mode uses
+/// the authorization-code flow, stores state in `tower-sessions`, and validates
+/// the returned ID token or access token through the configured validator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcAuthenticationConfig {
     /// Redirect URI path or absolute URI used for authorization-code callbacks.
+    ///
+    /// Relative paths are expanded from the incoming request host. Use an
+    /// absolute URI when the public callback URL differs from the internal Axum
+    /// request, for example behind a reverse proxy that rewrites hosts.
     pub redirect_path: String,
     /// Return users to their original path after completing the code flow.
     pub restore_path_after_redirect: bool,
     /// OIDC scopes requested from the provider.
+    ///
+    /// The list must include `openid`; without it the provider is not required
+    /// to issue an OIDC identity token.
     pub scopes: Vec<String>,
 }
 
@@ -190,11 +253,19 @@ impl ConfigProperties for OidcAuthenticationConfig {
 }
 
 /// Client credential configuration loaded from `oidc.credentials.*`.
+///
+/// Credentials are used for provider-side calls such as token introspection and
+/// web-app code exchange. The default is no client secret, which is appropriate
+/// for public clients but not for confidential service-to-service validation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OidcCredentialsConfig {
     /// Client secret used with `client-id` for provider authentication.
     pub secret: Option<String>,
     /// Client-secret authentication method.
+    ///
+    /// Providers differ on whether they expect Basic authentication, form
+    /// parameters, or query parameters. Prefer Basic unless the provider
+    /// explicitly requires a different method.
     pub client_secret: OidcClientSecretConfig,
 }
 
@@ -261,6 +332,10 @@ impl ConfigProperties for OidcClientSecretConfig {
 }
 
 /// Client-secret authentication method.
+///
+/// Providers differ on whether they expect Basic authentication, form
+/// parameters, or query parameters. Prefer Basic unless the provider
+/// explicitly requires a different method.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ClientSecretMethod {
     /// Send client credentials with HTTP Basic authentication.
@@ -624,6 +699,10 @@ impl OidcTokenConfig {
 }
 
 /// Token source used for role extraction.
+///
+/// Access-token roles are the usual API choice. ID-token roles are only valid
+/// for web-app flows. UserInfo roles are useful when access tokens are opaque
+/// or intentionally small.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RolesSource {
     /// Extract roles from the access token.
@@ -649,6 +728,10 @@ impl mp_config::FromConfigValue for RolesSource {
 }
 
 /// Role extraction configuration loaded from `oidc.roles.*`.
+///
+/// Role extraction turns provider-specific claims into [`crate::Principal`]
+/// groups. Those groups are what [`crate::RequireRolesLayer`] and
+/// [`crate::roles_allowed`] evaluate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcRolesConfig {
     /// Token or response source used to extract roles.
@@ -656,8 +739,13 @@ pub struct OidcRolesConfig {
     /// Token claim paths used to extract role names.
     ///
     /// The default covers standard `groups` claims and Keycloak realm roles.
+    /// Nested map keys containing dots or slashes can be quoted, for example
+    /// `resource_access."https://claims.example/roles".roles`.
     pub role_claim_path: String,
     /// Separator used when a role claim is a string containing multiple roles.
+    ///
+    /// The default space separator supports OAuth-style `scope` strings. Set it
+    /// to an empty string when a string claim should be treated as one role.
     pub role_claim_separator: String,
 }
 

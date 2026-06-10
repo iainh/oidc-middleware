@@ -6,6 +6,11 @@ use http::request::Parts;
 use std::sync::Arc;
 
 /// Authenticated identity stored in request extensions.
+///
+/// A `Principal` is the normalized identity produced after token validation.
+/// It intentionally contains only the values most applications authorize with:
+/// subject, issuer, audience, and groups. Keep provider-specific raw claims in
+/// custom validators if handlers need them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Principal {
     subject: Arc<str>,
@@ -16,6 +21,9 @@ pub struct Principal {
 
 impl Principal {
     /// Creates a principal with the supplied subject.
+    ///
+    /// This is mostly useful for tests and examples. Real request principals
+    /// normally come from JWT, introspection, or UserInfo validation.
     pub fn new(subject: impl Into<String>) -> Self {
         Self {
             subject: Arc::from(subject.into()),
@@ -26,6 +34,9 @@ impl Principal {
     }
 
     /// Creates a principal with group memberships.
+    ///
+    /// Use this in tests or local examples that exercise role authorization
+    /// without constructing provider tokens.
     pub fn with_groups(
         subject: impl Into<String>,
         groups: impl IntoIterator<Item = impl Into<String>>,
@@ -57,6 +68,9 @@ impl Principal {
     }
 
     /// Returns group or role names carried by the token.
+    ///
+    /// Groups are derived from configured role claim paths and are the values
+    /// checked by [`crate::RequireRolesLayer`] and [`crate::roles_allowed`].
     pub fn groups(&self) -> impl Iterator<Item = &str> {
         self.groups.iter().map(AsRef::as_ref)
     }
@@ -113,13 +127,18 @@ impl Principal {
 
 /// Axum extractor for the authenticated OIDC principal.
 ///
-/// This is intended for handlers protected by [`crate::Oidc::layer`]. It is also the
-/// expected principal argument for [`crate::roles_allowed`].
+/// Use this in handlers that should fail with `403 Forbidden` when called
+/// without an authenticated principal extension. It is also the expected
+/// principal argument for [`crate::roles_allowed`] and [`crate::authenticated`]
+/// handler macros.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcPrincipal(Principal);
 
 impl OidcPrincipal {
     /// Consumes the extractor wrapper and returns the principal.
+    ///
+    /// Deref is available for read-only handler logic; consume the wrapper when
+    /// a handler needs to pass ownership to another component.
     pub fn into_inner(self) -> Principal {
         self.0
     }

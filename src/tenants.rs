@@ -16,6 +16,16 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 /// Multi-tenant OIDC middleware.
+///
+/// `Tenants` selects one [`crate::Oidc`] instance for each request, then runs
+/// that tenant's normal authentication flow. Use it when tenants have different
+/// issuers, keys, client IDs, role extraction rules, or enabled state but share
+/// the same Axum application.
+///
+/// Tenant selection can be path-based, header-based, or issuer-based. Header
+/// selection is explicit and cheap; issuer selection is useful when routes do
+/// not identify the tenant but requires reading unverified token claims before
+/// validation.
 #[derive(Clone, Default)]
 pub struct Tenants {
     tenants: Arc<[RegisteredTenant]>,
@@ -26,11 +36,19 @@ pub struct Tenants {
 
 impl Tenants {
     /// Starts building a multi-tenant OIDC layer.
+    ///
+    /// Programmatic construction is best when tenants are known at compile time
+    /// or supplied by application-specific configuration.
     pub fn builder() -> TenantsBuilder {
         TenantsBuilder::default()
     }
 
     /// Loads the default tenant and named tenants from `mp-config`.
+    ///
+    /// The default tenant uses `oidc.*`; named tenants use
+    /// `oidc.<tenant>.*`. Named tenants default to matching the first path
+    /// segment, so tenant `orders` matches `/orders/*` unless
+    /// `tenant-paths` is configured.
     ///
     /// The default tenant uses `oidc.*`; named tenants use
     /// `oidc.<tenant>.*`. Tenant selection uses each tenant's
@@ -88,6 +106,10 @@ impl Tenants {
 
     /// Loads configured tenants, discovers their providers, and builds the registry.
     ///
+    /// Use this when tenants are configured through `mp-config` and should be
+    /// provider-backed at startup. Local `public-key` tenants do not need
+    /// network discovery; provider-backed tenants fetch metadata and keys.
+    ///
     /// The default tenant uses `oidc.*`; named tenants use
     /// `oidc.<tenant>.*`. Local `public-key` tenants are built without
     /// network access, while provider-backed tenants fetch discovery metadata
@@ -104,7 +126,12 @@ impl Tenants {
         discover_tenants_from_config(config, Some(client)).await
     }
 
-    /// Returns a tower layer suitable for `Router::layer`.
+    /// Returns a Tower layer suitable for protected tenant routers.
+    ///
+    /// Requests that do not match a named tenant fall back to the default tenant
+    /// when one is configured. Without a matching or default tenant the inner
+    /// route is left alone, which lets public routes coexist with tenant routes
+    /// when the layer is applied narrowly.
     pub fn layer(self) -> TenantsLayer {
         TenantsLayer { tenants: self }
     }
@@ -160,6 +187,10 @@ fn validate_configured_tenant_paths(
 }
 
 /// Builder for [`Tenants`].
+///
+/// Add the most specific tenants you need and let the registry choose the best
+/// path match. Header selection, when configured, takes precedence over path
+/// matching because it is an explicit caller-supplied tenant choice.
 #[derive(Default)]
 pub struct TenantsBuilder {
     tenants: Vec<RegisteredTenant>,
@@ -170,12 +201,20 @@ pub struct TenantsBuilder {
 
 impl TenantsBuilder {
     /// Sets the fallback tenant used when no named tenant matches.
+    ///
+    /// A default tenant is convenient for single-issuer routes plus a few named
+    /// exceptions. Omit it when unmatched routes should remain public or be
+    /// handled by other middleware.
     pub fn default_tenant(mut self, oidc: Oidc) -> Self {
         self.default_tenant = Some(oidc);
         self
     }
 
     /// Adds a named tenant.
+    ///
+    /// If the tenant's [`crate::OidcConfig::tenant_paths`] is empty, the name is
+    /// used as a first-segment path prefix such as `/tenant-a/*`. Configure
+    /// explicit paths for overlapping route trees.
     pub fn tenant(mut self, name: impl Into<String>, oidc: Oidc) -> Self {
         let name: Arc<str> = Arc::from(name.into());
         let id: Arc<str> = Arc::from(
@@ -204,18 +243,29 @@ impl TenantsBuilder {
     }
 
     /// Selects tenants from a request header before path matching.
+    ///
+    /// Header selection is useful for APIs where all tenants share the same
+    /// paths. Treat the header as a selector only; the chosen tenant still
+    /// validates the token normally.
     pub fn tenant_header(mut self, header_name: http::HeaderName) -> Self {
         self.header_name = Some(header_name);
         self
     }
 
     /// Selects tenants by matching bearer token `iss` claims.
+    ///
+    /// This reads the token issuer before signature validation so the correct
+    /// tenant can be chosen. The selected tenant then performs normal
+    /// validation, so issuer selection is routing input, not trust by itself.
     pub fn resolve_with_issuer(mut self, enabled: bool) -> Self {
         self.resolve_with_issuer = enabled;
         self
     }
 
     /// Finishes the tenant registry.
+    ///
+    /// The registry is immutable and cloneable after build, which makes it safe
+    /// to share across Axum services.
     pub fn build(self) -> Tenants {
         Tenants {
             tenants: Arc::from(self.tenants),
@@ -332,6 +382,9 @@ fn default_tenant_path(name: &str) -> String {
 }
 
 /// Tower layer produced by [`Tenants::layer`].
+///
+/// Most applications use this through [`Tenants::layer`]. The concrete type is
+/// public for explicit Tower composition.
 #[derive(Clone)]
 pub struct TenantsLayer {
     tenants: Tenants,

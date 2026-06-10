@@ -6,15 +6,29 @@ use std::error::Error as StdError;
 use std::fmt;
 
 /// Error type returned while authenticating a request.
+///
+/// The type also implements Axum's response conversion so middleware can turn
+/// authentication failures into RFC 6750-style HTTP responses. `401` responses
+/// include `WWW-Authenticate`; authorization failures use `403`; disabled
+/// tenants use `404` to avoid advertising inactive tenant resources.
 #[derive(Debug)]
 pub enum Error {
-    /// The request did not include an `Authorization: Bearer` token.
+    /// The request did not include an authorization token.
+    ///
+    /// The challenged scheme follows `oidc.token.authorization-scheme` when
+    /// configured, so non-Bearer deployments still get consistent responses.
     MissingBearerToken,
     /// The `Authorization` header was not valid UTF-8 or not in bearer format.
     InvalidAuthorizationHeader,
     /// The selected tenant is disabled.
+    ///
+    /// This maps to `404 Not Found`, mirroring the common Quarkus behaviour of
+    /// hiding disabled tenant routes rather than treating them as bad tokens.
     TenantDisabled,
     /// The authenticated principal is not allowed to access the route.
+    ///
+    /// This is used after authentication succeeds but a route layer or handler
+    /// macro rejects the principal's roles.
     Forbidden,
     /// The validator rejected the token.
     TokenRejected(BoxError),
@@ -97,6 +111,10 @@ impl IntoResponse for Error {
 }
 
 /// Error type returned while building provider-backed middleware.
+///
+/// Build errors are deliberately separated from request-time [`Error`] values.
+/// They describe configuration, provider discovery, and endpoint wiring issues
+/// that should normally be caught during application startup.
 #[derive(Debug)]
 pub enum BuildError {
     /// Loading `mp-config` backed OIDC configuration failed.
@@ -120,7 +138,12 @@ pub enum BuildError {
     /// The configured public key could not be parsed.
     InvalidPublicKey(BoxError),
     /// A configured provider or metadata URL could not be parsed.
-    InvalidUrl { url: String, message: String },
+    InvalidUrl {
+        /// The URL value assembled from configuration or discovery metadata.
+        url: String,
+        /// Parser detail suitable for startup logs or diagnostics.
+        message: String,
+    },
     /// Fetching provider metadata or keys failed.
     Http(reqwest::Error),
 }

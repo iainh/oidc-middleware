@@ -6,8 +6,16 @@ use std::sync::Arc;
 pub(crate) type ValidationFuture = Pin<Box<dyn Future<Output = Result<Principal>> + Send>>;
 
 /// Validates a bearer token and returns the authenticated principal.
+///
+/// Implement this trait when token validation is owned by your application,
+/// another service, or a test fixture. The returned [`Principal`] is the single
+/// identity object used by extractors, route layers, and handler macros.
 pub trait TokenValidator: Send + Sync + 'static {
     /// Validates a raw bearer token.
+    ///
+    /// The token value does not include the authorization scheme. Return
+    /// [`crate::Error::TokenRejected`] for invalid tokens so the middleware can
+    /// produce a consistent `invalid_token` challenge.
     fn validate(&self, token: Arc<str>) -> ValidationFuture;
 }
 
@@ -22,6 +30,11 @@ where
 }
 
 /// Development/test token validator that accepts exactly one bearer token.
+///
+/// This validator is intentionally narrow. It is useful for examples and tests
+/// that need to exercise middleware behaviour without generating JWTs or
+/// starting a provider. Production services should use JWT, introspection,
+/// UserInfo, or a custom [`TokenValidator`].
 #[derive(Clone, Debug)]
 pub struct StaticTokenValidator {
     token: Arc<str>,
@@ -30,6 +43,9 @@ pub struct StaticTokenValidator {
 
 impl StaticTokenValidator {
     /// Creates a validator that accepts `token` and maps it to `subject`.
+    ///
+    /// The resulting principal has no groups; use [`StaticTokenValidator::principal`]
+    /// when examples or tests need role-based authorization.
     pub fn bearer(token: impl Into<String>, subject: impl Into<String>) -> Self {
         Self::principal(token, Principal::new(subject))
     }

@@ -32,6 +32,15 @@ enum WebAppPrincipal {
 }
 
 /// OIDC middleware entry point.
+///
+/// `Oidc` is the single-tenant authentication layer. It is cheap to clone and
+/// intended to wrap the routes that require identity. Keep health checks,
+/// static assets, and other public routes outside the layer unless they should
+/// also challenge unauthenticated callers.
+///
+/// Build it directly with [`Oidc::builder`], load `oidc.*` properties with
+/// [`Oidc::from_config`], or let [`Oidc::discover_from_config`] fetch provider
+/// metadata and install a JWKS-backed validator during startup.
 #[derive(Clone)]
 pub struct Oidc {
     pub(crate) config: OidcConfig,
@@ -41,6 +50,10 @@ pub struct Oidc {
 
 impl Oidc {
     /// Starts building OIDC middleware from configuration.
+    ///
+    /// Use this path when configuration is already represented as Rust values
+    /// or when tests need a custom validator. Provider-backed applications
+    /// usually call [`OidcBuilder::discover`] before serving traffic.
     pub fn builder(config: OidcConfig) -> OidcBuilder {
         OidcBuilder {
             config,
@@ -50,6 +63,11 @@ impl Oidc {
     }
 
     /// Loads `oidc.*` configuration.
+    ///
+    /// This mirrors Quarkus' configuration prefix but deliberately does not
+    /// install authorization rules. Route authorization should be expressed in
+    /// Axum with [`crate::RequireAuthenticatedLayer`],
+    /// [`crate::RequireRolesLayer`], or handler macros.
     pub fn from_config(config: &Config) -> mp_config::Result<OidcBuilder> {
         oidc_builder_from_config(
             OidcConfig::from_config(config)?,
@@ -63,6 +81,11 @@ impl Oidc {
     }
 
     /// Loads configuration, discovers the provider, and builds the middleware.
+    ///
+    /// This is the closest equivalent to Quarkus' provider-backed startup: it
+    /// reads `oidc.*`, resolves the issuer, fetches discovery metadata, and
+    /// installs the right JWT, introspection, UserInfo, or web-app pieces based
+    /// on configuration.
     ///
     /// This is the config-driven path for bearer-service and web-app middleware:
     /// local `public-key` validation is installed without network access, while
@@ -81,7 +104,12 @@ impl Oidc {
             .await
     }
 
-    /// Returns a tower layer suitable for `Router::layer`.
+    /// Returns a Tower layer suitable for `Router::layer` or nested routers.
+    ///
+    /// The layer validates the request before handlers run and inserts
+    /// [`crate::Principal`] into request extensions. Put authorization layers
+    /// inside the same protected router so they run after authentication has
+    /// created the principal.
     pub fn layer(self) -> OidcLayer {
         OidcLayer { oidc: self }
     }
@@ -269,6 +297,11 @@ fn oidc_http_client(config: &OidcConfig) -> BuildResult<reqwest::Client> {
 }
 
 /// Builder for [`Oidc`].
+///
+/// The builder separates provider configuration from the token validation
+/// backend. This makes tests simple with [`crate::StaticTokenValidator`] while
+/// production services can choose discovery, static public keys, introspection,
+/// UserInfo, or custom validators without changing router code.
 pub struct OidcBuilder {
     config: OidcConfig,
     validator: Option<Arc<dyn TokenValidator>>,
@@ -277,6 +310,10 @@ pub struct OidcBuilder {
 
 impl OidcBuilder {
     /// Sets the bearer token validator.
+    ///
+    /// Use this for custom validation, tests, or when another component owns
+    /// token verification. If no validator is installed, the middleware rejects
+    /// all bearer tokens so protected routes fail closed.
     pub fn validator<V>(mut self, validator: V) -> Self
     where
         V: TokenValidator,
@@ -286,6 +323,10 @@ impl OidcBuilder {
     }
 
     /// Installs a `oidc.public-key` backed JWT validator.
+    ///
+    /// Static public keys avoid network access at startup, but they do not
+    /// rotate automatically. Prefer discovery or refreshable JWKS when the
+    /// provider rotates signing keys.
     pub fn public_key(mut self, public_key: &str) -> BuildResult<Self> {
         self.validator = Some(Arc::new(JwtValidator::public_key(
             public_key,
@@ -295,6 +336,10 @@ impl OidcBuilder {
     }
 
     /// Installs a custom token introspection validator.
+    ///
+    /// Choose this when access tokens are opaque or must be validated by the
+    /// provider on every request. The introspection response is still checked
+    /// against configured issuer, audience, required claims, and role paths.
     pub fn token_introspector<I>(mut self, introspector: I) -> Self
     where
         I: TokenIntrospector,
@@ -307,6 +352,10 @@ impl OidcBuilder {
     }
 
     /// Installs an HTTP token introspection validator.
+    ///
+    /// This is useful when discovery is disabled or the provider exposes a
+    /// non-standard introspection endpoint. Client credentials come from
+    /// `oidc.credentials.*` and `oidc.introspection-credentials.*`.
     pub fn introspection_endpoint(self, endpoint: &str) -> BuildResult<Self> {
         let client = oidc_http_client(&self.config)?;
         self.introspection_endpoint_with_client(endpoint, client)
@@ -330,6 +379,10 @@ impl OidcBuilder {
     }
 
     /// Installs a custom UserInfo-backed token validator.
+    ///
+    /// Use this when the UserInfo response is the authoritative identity source
+    /// for a bearer token. For JWT validation plus UserInfo roles, configure
+    /// `oidc.roles.source=userinfo` instead of replacing the validator.
     pub fn user_info_provider<P>(mut self, provider: P) -> Self
     where
         P: UserInfoProvider,
@@ -361,7 +414,11 @@ impl OidcBuilder {
         Ok(self)
     }
 
-    /// Discovers provider metadata and installs a JWKS-backed JWT validator.
+    /// Discovers provider metadata and installs provider-backed validation.
+    ///
+    /// Discovery is the recommended production path. It derives endpoints from
+    /// the issuer, uses JWKS for JWT validation by default, and switches to
+    /// introspection or UserInfo when the token configuration asks for it.
     pub async fn discover(self) -> BuildResult<Oidc> {
         let client = oidc_http_client(&self.config)?;
         self.discover_with_client(client).await
@@ -489,7 +546,10 @@ impl OidcBuilder {
         builder.provider_metadata_refreshing(metadata, jwks, client)
     }
 
-    /// Installs provider metadata and a JWKS-backed JWT validator.
+    /// Installs already-fetched provider metadata and a JWKS-backed JWT validator.
+    ///
+    /// Use this when another startup component owns discovery caching, retries,
+    /// or trust policy but you still want this crate's validation behaviour.
     pub fn provider_metadata(
         mut self,
         metadata: ProviderMetadata,
@@ -522,6 +582,10 @@ impl OidcBuilder {
     }
 
     /// Installs provider metadata and a refreshable JWKS-backed JWT validator.
+    ///
+    /// The validator refreshes keys when a token references an unknown `kid`,
+    /// throttled by `oidc.token.forced-jwk-refresh-interval`. This handles key
+    /// rotation without refreshing on every rejected token.
     pub fn provider_metadata_refreshing(
         mut self,
         metadata: ProviderMetadata,
@@ -728,6 +792,10 @@ impl OidcBuilder {
 
     /// Finishes the OIDC middleware.
     ///
+    /// Building without a validator is allowed so routing can be wired before a
+    /// provider is available, but requests fail closed with `invalid_token`.
+    /// Install a validator or call discovery before exposing protected routes.
+    ///
     /// If no validator is supplied, all bearer tokens are rejected. This keeps
     /// protected routes closed while allowing configuration and routing to be
     /// wired before a JWT/JWKS backend is added.
@@ -741,6 +809,9 @@ impl OidcBuilder {
 }
 
 /// Tower layer produced by [`Oidc::layer`].
+///
+/// Most applications do not name this type directly; it is public so routers
+/// can store or compose the layer explicitly when needed.
 #[derive(Clone)]
 pub struct OidcLayer {
     oidc: Oidc,

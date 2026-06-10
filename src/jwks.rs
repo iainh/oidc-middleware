@@ -10,12 +10,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 /// Future returned by [`JwksProvider`].
+///
+/// The future resolves to a complete JWKS document. Returning a boxed error lets
+/// applications preserve provider, cache, or transport-specific diagnostics.
 pub type JwksRefreshFuture =
     Pin<Box<dyn Future<Output = std::result::Result<JwkSet, BoxError>> + Send>>;
 
 /// Source used to refresh a provider JSON Web Key Set.
+///
+/// Implement this trait when JWKS retrieval is owned by application
+/// infrastructure, for example a shared cache, custom retry policy, or service
+/// mesh endpoint. The built-in provider is used automatically by discovery.
 pub trait JwksProvider: Send + Sync + 'static {
     /// Fetches the current JSON Web Key Set.
+    ///
+    /// Implementations should return the full active set, not only the missing
+    /// key, because the validator replaces its cached set on successful refresh.
     fn fetch(&self) -> JwksRefreshFuture;
 }
 

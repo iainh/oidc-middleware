@@ -17,6 +17,11 @@ use std::time::Duration;
 
 /// OIDC UserInfo response.
 ///
+/// UserInfo can be the source of identity for opaque-token validation or the
+/// source of roles after JWT validation. Extra claims are preserved so the same
+/// role and principal-claim configuration works across JWT, introspection, and
+/// UserInfo flows.
+///
 /// Standard token-like fields are modelled directly and the remaining claims
 /// are available for principal, required-claim, and role extraction.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -60,6 +65,11 @@ impl UserInfoResponse {
 }
 
 /// Source used to fetch OIDC UserInfo for an access token.
+///
+/// Implement this trait when the application owns UserInfo transport concerns
+/// such as retries, caching, or non-standard headers. For a conventional HTTP
+/// endpoint, [`crate::OidcBuilder::user_info_endpoint`] installs the built-in
+/// provider.
 pub trait UserInfoProvider: Send + Sync + 'static {
     /// Fetches UserInfo for a raw bearer token.
     fn user_info(&self, token: Arc<str>) -> UserInfoFuture;
@@ -76,6 +86,9 @@ where
 }
 
 /// Token validator backed by the OIDC UserInfo endpoint.
+///
+/// This treats UserInfo as the source of identity. It is useful when access
+/// tokens are opaque and the provider exposes stable claims through UserInfo.
 #[derive(Clone)]
 pub struct UserInfoValidator {
     provider: Arc<dyn UserInfoProvider>,
@@ -140,6 +153,10 @@ impl TokenValidator for UserInfoValidator {
 }
 
 /// Token validator that validates a bearer token first, then loads roles from UserInfo.
+///
+/// This keeps JWT validation local while allowing providers to keep role claims
+/// out of access tokens. The UserInfo `sub`, when present, must match the
+/// already-validated token subject to prevent mixing identities.
 #[derive(Clone)]
 pub struct UserInfoRolesValidator {
     token_validator: Arc<dyn TokenValidator>,
@@ -150,6 +167,9 @@ pub struct UserInfoRolesValidator {
 
 impl UserInfoRolesValidator {
     /// Builds a validator that preserves token validation and sources roles from UserInfo.
+    ///
+    /// Prefer this over full UserInfo validation when the access token is a JWT
+    /// and only roles need to come from the UserInfo endpoint.
     pub fn new<V, P>(token_validator: V, provider: P, config: &OidcConfig) -> Self
     where
         V: TokenValidator,

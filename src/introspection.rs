@@ -16,6 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Token validator that falls back to introspection after local JWT rejection.
+///
+/// This mirrors deployments where JWTs should be validated locally when
+/// possible, but opaque tokens or selected JWT failures must be checked with the
+/// provider. The token configuration controls whether JWT-looking tokens,
+/// opaque tokens, or both may use the fallback.
 #[derive(Clone)]
 pub struct IntrospectionFallbackValidator {
     jwt: Arc<dyn TokenValidator>,
@@ -70,12 +75,19 @@ fn token_looks_like_jwt(token: &str) -> bool {
 
 /// OAuth2 token introspection response.
 ///
+/// The response is normalized into the same validation pipeline as JWT claims:
+/// issuer, audience, token type, age, required claims, principal selection, and
+/// role extraction are all applied after the provider says the token is active.
+///
 /// The standard `active` member controls whether the token is accepted. Common
 /// JWT-style members are modelled directly and remaining claims are preserved
 /// for role, principal, and required-claim extraction.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct IntrospectionResponse {
     /// Whether the token is currently active.
+    ///
+    /// Inactive responses are rejected even if they include otherwise valid
+    /// claims.
     #[serde(default)]
     pub active: bool,
     /// Token subject.
@@ -117,6 +129,10 @@ impl IntrospectionResponse {
 }
 
 /// Source used to introspect opaque or remote-validated bearer tokens.
+///
+/// Implement this trait when the application owns the HTTP call, caching,
+/// retries, or provider-specific request shape. For standard OAuth2 endpoints,
+/// [`crate::OidcBuilder::introspection_endpoint`] is usually enough.
 pub trait TokenIntrospector: Send + Sync + 'static {
     /// Introspects a raw bearer token.
     fn introspect(&self, token: Arc<str>) -> IntrospectionFuture;
@@ -133,6 +149,10 @@ where
 }
 
 /// Token validator backed by OAuth2 token introspection.
+///
+/// Use this for opaque tokens or providers that require remote validation. It
+/// accepts only active introspection responses and then applies local claim
+/// validation so provider responses still obey application policy.
 #[derive(Clone)]
 pub struct IntrospectionValidator {
     introspector: Arc<dyn TokenIntrospector>,
