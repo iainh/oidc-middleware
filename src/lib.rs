@@ -44,11 +44,13 @@ pub use oidc_middleware_macros::{authenticated, roles_allowed};
 mod authorization;
 mod claims;
 mod config_helpers;
+mod jwks;
 mod path;
 mod provider;
 mod token;
 
 pub use authorization::Authorization;
+pub use jwks::{JwksProvider, JwksRefreshFuture};
 pub use provider::ProviderMetadata;
 
 use authorization::AuthRequirement;
@@ -63,8 +65,9 @@ use config_helpers::{
 use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use http::request::Parts;
 use http::{HeaderValue, Request, StatusCode};
-use jsonwebtoken::jwk::{JwkSet, KeyAlgorithm};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jwks::{HttpJwksProvider, JwtKeys, supported_algorithms};
 use mp_config::{Config, ConfigProperties};
 use path::path_match_score;
 use provider::{
@@ -80,7 +83,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use token::{
@@ -104,10 +106,6 @@ pub type IntrospectionFuture =
 /// Future returned by [`UserInfoProvider`].
 pub type UserInfoFuture =
     Pin<Box<dyn Future<Output = std::result::Result<UserInfoResponse, BoxError>> + Send>>;
-/// Future returned by [`JwksProvider`].
-pub type JwksRefreshFuture =
-    Pin<Box<dyn Future<Output = std::result::Result<JwkSet, BoxError>> + Send>>;
-
 /// Result type returned while building OIDC middleware.
 pub type BuildResult<T> = std::result::Result<T, BuildError>;
 
@@ -1218,7 +1216,7 @@ impl JwtValidator {
         apply_signature_algorithm_config(&mut validation, config);
 
         Self {
-            keys: JwtKeys::Single(Arc::new(DecodingKey::from_secret(secret.as_ref()))),
+            keys: JwtKeys::single(DecodingKey::from_secret(secret.as_ref())),
             validation,
             role_claim_paths: Arc::from(role_claim_paths_for_source(
                 config,
@@ -1246,7 +1244,7 @@ impl JwtValidator {
         apply_jwks_algorithm_config(&mut validation, &jwks, config);
 
         Self {
-            keys: JwtKeys::Set(Arc::new(jwks)),
+            keys: JwtKeys::set(jwks),
             validation,
             role_claim_paths: Arc::from(role_claim_paths_for_source(
                 config,
@@ -1270,7 +1268,7 @@ impl JwtValidator {
         let key = public_decoding_key(public_key, &validation)?;
 
         Ok(Self {
-            keys: JwtKeys::Single(Arc::new(key)),
+            keys: JwtKeys::single(key),
             validation,
             role_claim_paths: Arc::from(role_claim_paths_for_source(
                 config,
@@ -1300,12 +1298,7 @@ impl JwtValidator {
         apply_jwks_algorithm_config(&mut validation, &jwks, config);
 
         Self {
-            keys: JwtKeys::Refreshing(RefreshingJwks {
-                current: Arc::new(Mutex::new(jwks)),
-                provider: Arc::new(provider),
-                last_forced_refresh: Arc::new(Mutex::new(None)),
-                forced_refresh_interval: config.token.forced_jwk_refresh_interval,
-            }),
+            keys: JwtKeys::refreshing(jwks, provider, config.token.forced_jwk_refresh_interval),
             validation,
             role_claim_paths: Arc::from(role_claim_paths_for_source(
                 config,
@@ -1927,136 +1920,6 @@ struct IntrospectionRequestAuth<'a> {
     include_client_id: bool,
 }
 
-/// Source used to refresh a provider JSON Web Key Set.
-pub trait JwksProvider: Send + Sync + 'static {
-    /// Fetches the current JSON Web Key Set.
-    fn fetch(&self) -> JwksRefreshFuture;
-}
-
-impl<F, Fut> JwksProvider for F
-where
-    F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = std::result::Result<JwkSet, BoxError>> + Send + 'static,
-{
-    fn fetch(&self) -> JwksRefreshFuture {
-        Box::pin(self())
-    }
-}
-
-#[derive(Clone)]
-struct HttpJwksProvider {
-    client: reqwest::Client,
-    jwks_uri: String,
-}
-
-impl JwksProvider for HttpJwksProvider {
-    fn fetch(&self) -> JwksRefreshFuture {
-        let client = self.client.clone();
-        let jwks_uri = self.jwks_uri.clone();
-        Box::pin(async move {
-            client
-                .get(&jwks_uri)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<JwkSet>()
-                .await
-                .map_err(|error| Box::new(error) as BoxError)
-        })
-    }
-}
-
-#[derive(Clone)]
-enum JwtKeys {
-    Single(Arc<DecodingKey>),
-    Set(Arc<JwkSet>),
-    Refreshing(RefreshingJwks),
-}
-
-#[derive(Clone)]
-struct RefreshingJwks {
-    current: Arc<Mutex<JwkSet>>,
-    provider: Arc<dyn JwksProvider>,
-    last_forced_refresh: Arc<Mutex<Option<SystemTime>>>,
-    forced_refresh_interval: Duration,
-}
-
-impl JwtKeys {
-    async fn decoding_key(&self, token: &str) -> Result<DecodingKey> {
-        match self {
-            Self::Single(key) => Ok((**key).clone()),
-            Self::Set(jwks) => decoding_key_from_jwks(jwks, token),
-            Self::Refreshing(jwks) => {
-                let key_result = {
-                    let current = jwks
-                        .current
-                        .lock()
-                        .map_err(|_| Error::TokenRejected("JWKS cache lock was poisoned".into()))?;
-                    decoding_key_from_jwks(&current, token)
-                };
-
-                match key_result {
-                    Ok(key) => Ok(key),
-                    Err(error) if should_refresh_jwks(&error) => {
-                        if !jwks.should_force_refresh()? {
-                            return Err(error);
-                        }
-                        let refreshed =
-                            jwks.provider.fetch().await.map_err(Error::TokenRejected)?;
-                        let key = decoding_key_from_jwks(&refreshed, token)?;
-                        let mut current = jwks.current.lock().map_err(|_| {
-                            Error::TokenRejected("JWKS cache lock was poisoned".into())
-                        })?;
-                        *current = refreshed;
-                        Ok(key)
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-        }
-    }
-}
-
-impl RefreshingJwks {
-    fn should_force_refresh(&self) -> Result<bool> {
-        let mut last_forced_refresh = self
-            .last_forced_refresh
-            .lock()
-            .map_err(|_| Error::TokenRejected("JWKS refresh lock was poisoned".into()))?;
-        let now = SystemTime::now();
-        if last_forced_refresh
-            .and_then(|last| now.duration_since(last).ok())
-            .is_some_and(|elapsed| elapsed < self.forced_refresh_interval)
-        {
-            return Ok(false);
-        }
-
-        *last_forced_refresh = Some(now);
-        Ok(true)
-    }
-}
-
-fn decoding_key_from_jwks(jwks: &JwkSet, token: &str) -> Result<DecodingKey> {
-    let header = decode_header(token).map_err(|error| Error::TokenRejected(Box::new(error)))?;
-    let jwk = match header.kid.as_deref() {
-        Some(kid) => jwks
-            .find(kid)
-            .ok_or_else(|| Error::TokenRejected(UnknownKid(kid.to_owned()).into()))?,
-        None if jwks.keys.len() == 1 => &jwks.keys[0],
-        None => {
-            return Err(Error::TokenRejected(
-                "JWT header did not include a key id".into(),
-            ));
-        }
-    };
-
-    DecodingKey::from_jwk(jwk).map_err(|error| Error::TokenRejected(Box::new(error)))
-}
-
-fn should_refresh_jwks(error: &Error) -> bool {
-    matches!(error, Error::TokenRejected(source) if source.is::<UnknownKid>())
-}
-
 fn validate_introspection_issuer(claims: &TokenClaims, expected: Option<&str>) -> Result<()> {
     let Some(expected) = expected else {
         return Ok(());
@@ -2259,17 +2122,6 @@ fn json_string_values(value: &Value) -> Option<Vec<String>> {
         _ => None,
     }
 }
-
-#[derive(Debug)]
-struct UnknownKid(String);
-
-impl fmt::Display for UnknownKid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "no JWK matched kid `{}`", self.0)
-    }
-}
-
-impl StdError for UnknownKid {}
 
 #[derive(Debug)]
 struct TokenClaims {
@@ -2809,10 +2661,7 @@ impl OidcBuilder {
         let validation_config = provider_validation_config(&self.config, &metadata);
         let jwt = JwtValidator::refreshable_jwks(
             jwks,
-            HttpJwksProvider {
-                client: client.clone(),
-                jwks_uri: metadata.jwks_uri.clone(),
-            },
+            HttpJwksProvider::new(client.clone(), metadata.jwks_uri.clone()),
             &validation_config,
         );
         let validator = self.jwt_with_metadata_introspection(jwt, metadata.clone(), client.clone());
@@ -3492,24 +3341,6 @@ fn public_decoding_key(public_key: &str, validation: &Validation) -> BuildResult
     .map_err(|error| BuildError::InvalidPublicKey(Box::new(error)))
 }
 
-fn supported_algorithms(jwks: &JwkSet) -> Vec<Algorithm> {
-    let mut algorithms = Vec::new();
-    for algorithm in jwks
-        .keys
-        .iter()
-        .filter_map(|jwk| jwk_algorithm(jwk.common.key_algorithm))
-    {
-        if !algorithms.contains(&algorithm) {
-            algorithms.push(algorithm);
-        }
-    }
-    algorithms
-}
-
-fn jwk_algorithm(algorithm: Option<KeyAlgorithm>) -> Option<Algorithm> {
-    Algorithm::from_str(&algorithm?.to_string()).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3524,6 +3355,7 @@ mod tests {
     use mp_config::MapSource;
     use serde::Serialize;
     use serde_json::json;
+    use std::sync::Mutex;
     use tower::ServiceExt;
 
     const TEST_IAT: u64 = 1_700_000_000;
