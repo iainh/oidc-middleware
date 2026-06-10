@@ -109,16 +109,6 @@ impl Principal {
             groups: groups.into_iter().map(Arc::from).collect(),
         }
     }
-
-    pub(crate) fn group_arcs(&self) -> impl Iterator<Item = &Arc<str>> {
-        self.groups.iter()
-    }
-
-    pub(crate) fn add_groups(&mut self, groups: impl IntoIterator<Item = Arc<str>>) {
-        self.groups.extend(groups);
-        self.groups.sort();
-        self.groups.dedup();
-    }
 }
 
 /// Axum extractor for the authenticated OIDC principal.

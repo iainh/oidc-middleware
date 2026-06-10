@@ -179,25 +179,6 @@ fn named_tenant_key_parts(rest: &str) -> Option<(String, String, &str)> {
     Some((name.to_owned(), name.to_owned(), property))
 }
 
-pub(crate) fn permission_names(config: &Config) -> Vec<String> {
-    let mut names = BTreeSet::new();
-
-    for key in config.property_names() {
-        if let Some(name) = key
-            .strip_prefix("quarkus.http.auth.permission.")
-            .and_then(|suffix| suffix.strip_suffix(".paths"))
-        {
-            names.insert(name.to_owned());
-        }
-    }
-
-    names.into_iter().collect()
-}
-
-pub(crate) fn has_authorization_config(config: &Config) -> bool {
-    !permission_names(config).is_empty()
-}
-
 pub(crate) fn split_csv(value: &str) -> Vec<String> {
     value
         .split(',')

@@ -34,8 +34,7 @@ impl Tenants {
     ///
     /// The default tenant uses `oidc.*`; named tenants use
     /// `oidc.<tenant>.*`. Tenant selection uses each tenant's
-    /// `tenant-paths` property, and configured `quarkus.http.auth.permission.*`
-    /// policies are applied to each tenant.
+    /// `tenant-paths` property.
     pub fn from_config(config: &Config) -> mp_config::Result<TenantsBuilder> {
         let mut builder = Tenants::builder().resolve_with_issuer(
             config
@@ -63,7 +62,6 @@ impl Tenants {
                 "oidc.token.decrypt-access-token",
                 "oidc.token.decrypt-id-token",
             )?
-            .authorization_from_config(config)?
             .build();
             builder = builder.default_tenant(default_tenant);
         }
@@ -81,7 +79,6 @@ impl Tenants {
                 &format!("{prefix}.token.decrypt-access-token"),
                 &format!("{prefix}.token.decrypt-id-token"),
             )?
-            .authorization_from_config(config)?
             .build();
             builder = builder.tenant(tenant.name, oidc);
         }
@@ -258,8 +255,7 @@ async fn discover_tenants_from_config(
             "oidc.token.binding.certificate",
             "oidc.token.decrypt-access-token",
             "oidc.token.decrypt-id-token",
-        )?
-        .authorization_from_config(config)?;
+        )?;
         let default_tenant = discover_oidc_builder(default_tenant, client.as_ref()).await?;
         builder = builder.default_tenant(default_tenant);
     }
@@ -276,8 +272,7 @@ async fn discover_tenants_from_config(
             &format!("{prefix}.token.binding.certificate"),
             &format!("{prefix}.token.decrypt-access-token"),
             &format!("{prefix}.token.decrypt-id-token"),
-        )?
-        .authorization_from_config(config)?;
+        )?;
         let oidc = discover_oidc_builder(oidc, client.as_ref()).await?;
         builder = builder.tenant(tenant.name, oidc);
     }

@@ -2,8 +2,8 @@
 
 `oidc-middleware` is an axum OIDC middleware crate inspired by the Quarkus OIDC
 extension. It uses `mp-config` to load Quarkus-style `oidc.*`
-configuration, can load Quarkus-style HTTP authorization policies, and exposes
-a tower layer that protects axum routes with bearer-token authentication.
+configuration and exposes tower layers that protect axum routes with
+bearer-token authentication and route-local role checks.
 
 This crate is in early development. The current implementation includes:
 
@@ -11,8 +11,7 @@ This crate is in early development. The current implementation includes:
   `client-id`, `client-name`, and well-known `provider` values. `provider=google`
   supplies the Google issuer URL when `auth-server-url` is not configured.
   Other provider identifiers require an explicit `auth-server-url` until their
-  issuer URLs are built in. `Oidc::from_config` also applies configured
-  `quarkus.http.auth.permission.*` policies.
+  issuer URLs are built in.
 - Service and hybrid `oidc.application-type` bearer-token middleware,
   plus `web-app` authorization-code flow when built through provider discovery
   or explicit authorization and token endpoint configuration.
@@ -65,8 +64,7 @@ This crate is in early development. The current implementation includes:
 - Multi-tenant routing with `oidc.<tenant>.tenant-paths`, quoted tenant
   aliases, tenant IDs, static first-path-segment tenant selection, and optional
   header-based (`oidc.tenant-id-header`) or issuer-based tenant
-  selection. `Tenants::from_config` applies the same configured HTTP
-  authorization policies to each configured tenant.
+  selection.
 - Refreshable provider JWKS validation when a token references an unknown `kid`,
   with `oidc.token.forced-jwk-refresh-interval` throttling.
 - Quarkus token introspection configuration flags for JWT, opaque-token, and
@@ -92,12 +90,10 @@ This crate is in early development. The current implementation includes:
   `resource_access/<client-id>/roles` support, plus
   `oidc.roles.role-claim-separator` and access-token or UserInfo
   role sources with `oidc.roles.source`.
-- Quarkus-style `quarkus.http.auth.permission.*` path policies for `permit`,
-  `deny`, `authenticated`, named `roles-allowed` policies including the `**`
-  authenticated role, method-specific matches, `quarkus.http.root-path`
-  relative path handling, exact trailing-slash matching, segment wildcards,
-  method-mismatch rejection, simultaneous winning role policies, disabled or
-  shared permission entries, and global or policy-local role mappings.
+- Axum-native route authorization with `RequireAuthenticatedLayer` and
+  `RequireRolesLayer::{any, all}`. Keep OIDC provider and token validation
+  configuration under `oidc.*`, then express authorization where Rust
+  developers expect it: on the routes and routers being protected.
 - `#[roles_allowed(...)]` and `#[authenticated]` handler macros for
   Quarkus-style authorization checks with the `OidcPrincipal` extractor,
   including `**` for any authenticated principal.
@@ -105,13 +101,23 @@ This crate is in early development. The current implementation includes:
 
 ```rust
 use axum::{Router, routing::get};
-use oidc_middleware::{Oidc, OidcConfig, StaticTokenValidator};
+use oidc_middleware::{Oidc, OidcConfig, RequireRolesLayer, StaticTokenValidator};
 
 let oidc = Oidc::builder(OidcConfig::default())
     .validator(StaticTokenValidator::bearer("dev-token", "alice"))
     .build();
 
-let app = Router::new()
-    .route("/protected", get(|| async { "ok" }))
+let protected = Router::new()
+    .route(
+        "/orders",
+        get(|| async { "ok" }).route_layer(RequireRolesLayer::any([
+            "orders-user",
+            "orders-admin",
+        ])),
+    )
     .layer(oidc.layer());
+
+let app = Router::new()
+    .route("/health", get(|| async { "ok" }))
+    .merge(protected);
 ```

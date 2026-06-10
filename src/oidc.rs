@@ -1,6 +1,3 @@
-use crate::authorization::AuthRequirement;
-use crate::claims::apply_role_mappings;
-use crate::config_helpers::has_authorization_config;
 use crate::introspection::http_token_introspector;
 use crate::jwks::HttpJwksProvider;
 use crate::provider::{
@@ -11,7 +8,7 @@ use crate::user_info::HttpUserInfoProvider;
 use crate::validator::RejectAllTokens;
 use crate::web_app::WebApp;
 use crate::{
-    ApplicationType, Authorization, BuildError, BuildResult, Error, IntrospectionFallbackValidator,
+    ApplicationType, BuildError, BuildResult, Error, IntrospectionFallbackValidator,
     IntrospectionValidator, JwtValidator, OidcConfig, Principal, ProviderMetadata, Result,
     RolesSource, TokenIntrospector, TokenValidator, UserInfoProvider, UserInfoRolesValidator,
     UserInfoValidator,
@@ -30,7 +27,7 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 enum WebAppPrincipal {
-    Authenticated(Principal),
+    Authenticated,
     Redirect(Response),
 }
 
@@ -39,7 +36,6 @@ enum WebAppPrincipal {
 pub struct Oidc {
     pub(crate) config: OidcConfig,
     validator: Arc<dyn TokenValidator>,
-    authorization: Option<Authorization>,
     web_app: Option<Arc<WebApp>>,
 }
 
@@ -49,12 +45,11 @@ impl Oidc {
         OidcBuilder {
             config,
             validator: None,
-            authorization: None,
             web_app: None,
         }
     }
 
-    /// Loads `oidc.*` and `quarkus.http.auth.permission.*` configuration.
+    /// Loads `oidc.*` configuration.
     pub fn from_config(config: &Config) -> mp_config::Result<OidcBuilder> {
         oidc_builder_from_config(
             OidcConfig::from_config(config)?,
@@ -64,8 +59,7 @@ impl Oidc {
             "oidc.token.binding.certificate",
             "oidc.token.decrypt-access-token",
             "oidc.token.decrypt-id-token",
-        )?
-        .authorization_from_config(config)
+        )
     }
 
     /// Loads configuration, discovers the provider, and builds the middleware.
@@ -101,37 +95,6 @@ impl Oidc {
             return Err(Error::TenantDisabled);
         }
 
-        if let Some(authorization) = &self.authorization {
-            match authorization.requirement(request.method(), request.uri().path()) {
-                AuthRequirement::Permit => return Ok(()),
-                AuthRequirement::Deny => {
-                    self.authenticate_principal(request).await?;
-                    return Err(Error::Forbidden);
-                }
-                AuthRequirement::Authenticated(role_mappings) => {
-                    let mut principal = self.authenticate_principal(request).await?;
-                    apply_role_mappings(&mut principal, &role_mappings);
-                    request.extensions_mut().insert(principal);
-                    return Ok(());
-                }
-                AuthRequirement::Roles {
-                    role_sets,
-                    role_mappings,
-                } => {
-                    let mut principal = self.authenticate_principal(request).await?;
-                    apply_role_mappings(&mut principal, &role_mappings);
-                    if role_sets
-                        .iter()
-                        .all(|roles| principal.has_any_group(roles.iter().map(String::as_str)))
-                    {
-                        request.extensions_mut().insert(principal);
-                        return Ok(());
-                    }
-                    return Err(Error::Forbidden);
-                }
-            }
-        }
-
         self.authenticate_principal(request).await?;
         Ok(())
     }
@@ -164,49 +127,8 @@ impl Oidc {
                 .map(Some);
         }
 
-        if let Some(authorization) = &self.authorization {
-            match authorization.requirement(request.method(), request.uri().path()) {
-                AuthRequirement::Permit => return Ok(None),
-                AuthRequirement::Deny => {
-                    match self.web_app_principal_or_redirect(request, web_app).await? {
-                        WebAppPrincipal::Authenticated(_) => return Err(Error::Forbidden),
-                        WebAppPrincipal::Redirect(response) => return Ok(Some(response)),
-                    }
-                }
-                AuthRequirement::Authenticated(role_mappings) => {
-                    let WebAppPrincipal::Authenticated(mut principal) =
-                        self.web_app_principal_or_redirect(request, web_app).await?
-                    else {
-                        return web_app.authorization_redirect(request).await.map(Some);
-                    };
-                    apply_role_mappings(&mut principal, &role_mappings);
-                    request.extensions_mut().insert(principal);
-                    return Ok(None);
-                }
-                AuthRequirement::Roles {
-                    role_sets,
-                    role_mappings,
-                } => {
-                    let WebAppPrincipal::Authenticated(mut principal) =
-                        self.web_app_principal_or_redirect(request, web_app).await?
-                    else {
-                        return web_app.authorization_redirect(request).await.map(Some);
-                    };
-                    apply_role_mappings(&mut principal, &role_mappings);
-                    if role_sets
-                        .iter()
-                        .all(|roles| principal.has_any_group(roles.iter().map(String::as_str)))
-                    {
-                        request.extensions_mut().insert(principal);
-                        return Ok(None);
-                    }
-                    return Err(Error::Forbidden);
-                }
-            }
-        }
-
         match self.web_app_principal_or_redirect(request, web_app).await? {
-            WebAppPrincipal::Authenticated(_) => Ok(None),
+            WebAppPrincipal::Authenticated => Ok(None),
             WebAppPrincipal::Redirect(response) => Ok(Some(response)),
         }
     }
@@ -218,7 +140,7 @@ impl Oidc {
     ) -> Result<WebAppPrincipal> {
         if let Some(principal) = web_app.session_principal(request).await? {
             request.extensions_mut().insert(principal.clone());
-            return Ok(WebAppPrincipal::Authenticated(principal));
+            return Ok(WebAppPrincipal::Authenticated);
         }
 
         web_app
@@ -350,7 +272,6 @@ fn oidc_http_client(config: &OidcConfig) -> BuildResult<reqwest::Client> {
 pub struct OidcBuilder {
     config: OidcConfig,
     validator: Option<Arc<dyn TokenValidator>>,
-    authorization: Option<Authorization>,
     web_app: Option<Arc<WebApp>>,
 }
 
@@ -362,19 +283,6 @@ impl OidcBuilder {
     {
         self.validator = Some(Arc::new(validator));
         self
-    }
-
-    /// Sets Quarkus-style path authorization policies.
-    pub fn authorization(mut self, authorization: Authorization) -> Self {
-        self.authorization = Some(authorization);
-        self
-    }
-
-    pub(crate) fn authorization_from_config(mut self, config: &Config) -> mp_config::Result<Self> {
-        if has_authorization_config(config) {
-            self.authorization = Some(Authorization::from_config(config)?);
-        }
-        Ok(self)
     }
 
     /// Installs a `oidc.public-key` backed JWT validator.
@@ -827,7 +735,6 @@ impl OidcBuilder {
         Oidc {
             config: self.config,
             validator: self.validator.unwrap_or_else(|| Arc::new(RejectAllTokens)),
-            authorization: self.authorization,
             web_app: self.web_app,
         }
     }

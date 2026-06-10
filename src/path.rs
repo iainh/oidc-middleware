@@ -1,28 +1,3 @@
-pub(crate) fn normalize_permission_paths(paths: Vec<String>, root_path: &str) -> Vec<String> {
-    let root_path = normalize_root_path(root_path);
-    paths
-        .into_iter()
-        .map(|path| {
-            if path.starts_with('/') {
-                path
-            } else if root_path == "/" {
-                format!("/{path}")
-            } else {
-                format!("{root_path}/{path}")
-            }
-        })
-        .collect()
-}
-
-fn normalize_root_path(root_path: &str) -> String {
-    let root_path = root_path.trim();
-    if root_path.is_empty() || root_path == "/" {
-        return "/".to_owned();
-    }
-
-    format!("/{}", root_path.trim_matches('/'))
-}
-
 pub(crate) fn path_match_score(pattern: &str, request_path: &str) -> Option<usize> {
     if pattern == request_path {
         return Some(1_000_000 + pattern.len());

@@ -1,11 +1,9 @@
 use super::*;
-use crate::authorization::parse_http_methods;
 use crate::claims::claim_path_parts;
 use crate::config_helpers::named_tenant_names;
 use crate::introspection::{
     IntrospectionRequestAuth, http_token_introspector, introspection_request,
 };
-use crate::path::{normalize_permission_paths, path_match_score};
 use crate::provider::{auth_server_url_from_config, discovery_url, provider_endpoint_url};
 use crate::validation_claims::unix_timestamp;
 use axum::Router;
@@ -1521,42 +1519,6 @@ async fn oidc_discover_from_config_requires_auth_server_url_for_provider_discove
     };
 
     assert!(matches!(error, BuildError::MissingAuthServerUrl));
-}
-
-#[tokio::test]
-async fn oidc_from_config_applies_http_authorization() {
-    let config = Config::builder()
-        .add_source(
-            MapSource::new("authz", 100)
-                .with("quarkus.http.auth.permission.public.paths", "/public")
-                .with("quarkus.http.auth.permission.public.policy", "permit")
-                .with("quarkus.http.auth.permission.private.paths", "/private")
-                .with(
-                    "quarkus.http.auth.permission.private.policy",
-                    "authenticated",
-                ),
-        )
-        .build();
-    let app = Router::new().fallback(|| async { "ok" }).layer(
-        Oidc::from_config(&config)
-            .expect("OIDC config should load")
-            .validator(StaticTokenValidator::bearer("test-token", "alice"))
-            .build()
-            .layer(),
-    );
-
-    let response = app
-        .clone()
-        .oneshot(request("/public", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .oneshot(request("/private", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[test]
@@ -4192,48 +4154,6 @@ fn tenants_reject_invalid_tenant_id_header_from_config() {
 }
 
 #[tokio::test]
-async fn tenants_from_config_apply_http_authorization() {
-    let config = Config::builder()
-        .add_source(
-            MapSource::new("tenant-authz", 100)
-                .with("oidc.tenant-a.tenant-paths", "/tenant-a/*")
-                .with(
-                    "quarkus.http.auth.permission.public.paths",
-                    "/tenant-a/public",
-                )
-                .with("quarkus.http.auth.permission.public.policy", "permit")
-                .with(
-                    "quarkus.http.auth.permission.private.paths",
-                    "/tenant-a/private",
-                )
-                .with(
-                    "quarkus.http.auth.permission.private.policy",
-                    "authenticated",
-                ),
-        )
-        .build();
-    let tenants = Tenants::from_config(&config)
-        .expect("tenant config should load")
-        .build();
-    let app = Router::new()
-        .fallback(|| async { "ok" })
-        .layer(tenants.layer());
-
-    let response = app
-        .clone()
-        .oneshot(request("/tenant-a/public", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .oneshot(request("/tenant-a/private", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
 async fn tenants_discover_from_config_builds_named_public_key_tenant() {
     let config = Config::builder()
         .add_source(
@@ -4598,568 +4518,115 @@ async fn tenants_preserve_disabled_tenant_behaviour() {
 }
 
 #[tokio::test]
-async fn authorization_matches_quarkus_default_deny_permissions() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-default-deny", 100)
-                    .with("quarkus.http.auth.permission.default-deny.paths", "/*")
-                    .with("quarkus.http.auth.permission.default-deny.policy", "deny")
-                    .with(
-                        "quarkus.http.auth.permission.permit1.paths",
-                        "/permit,/combined",
-                    )
-                    .with("quarkus.http.auth.permission.permit1.policy", "permit")
-                    .with("quarkus.http.auth.permission.permit2.paths", "/permit-get")
-                    .with("quarkus.http.auth.permission.permit2.methods", "GET")
-                    .with("quarkus.http.auth.permission.permit2.policy", "permit")
-                    .with(
-                        "quarkus.http.auth.permission.deny1.paths",
-                        "/deny,/combined",
-                    )
-                    .with("quarkus.http.auth.permission.deny1.policy", "deny"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
+async fn require_authenticated_layer_allows_principal() {
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .route_layer(RequireAuthenticatedLayer::new())
+        .layer(oidc().layer());
 
     let response = app
-        .clone()
-        .oneshot(request("/unmentioned", None))
+        .oneshot(request("/protected", Some("Bearer test-token")))
         .await
         .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-    let response = app
-        .clone()
-        .oneshot(request("/unmentioned", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    let response = app
-        .clone()
-        .oneshot(request("/permit", None))
-        .await
-        .expect("request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request_with_method(http::Method::POST, "/permit", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request("/permit-get", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request_with_method(http::Method::POST, "/permit-get", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .clone()
-        .oneshot(request("/combined", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(request("/combined", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn authorization_ignores_disabled_permissions() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-disabled-permission", 100)
-                    .with("quarkus.http.auth.permission.permit.paths", "/resource")
-                    .with("quarkus.http.auth.permission.permit.policy", "permit")
-                    .with("quarkus.http.auth.permission.deny.paths", "/resource")
-                    .with("quarkus.http.auth.permission.deny.policy", "deny")
-                    .with("quarkus.http.auth.permission.deny.enabled", "false"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
+async fn require_authenticated_layer_rejects_missing_principal() {
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .route_layer(RequireAuthenticatedLayer::new());
 
     let response = app
-        .oneshot(request("/resource", None))
+        .oneshot(request("/protected", None))
         .await
         .expect("request should complete");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
-#[test]
-fn authorization_rejects_undefined_named_policy() {
-    let error = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-undefined-policy", 100)
-                    .with("quarkus.http.auth.permission.secured.paths", "/resource")
-                    .with("quarkus.http.auth.permission.secured.policy", "missing"),
-            )
-            .build(),
-    )
-    .expect_err("undefined named policy should be rejected");
-
-    assert!(
-            error.to_string().contains(
-                "failed to convert config property `quarkus.http.auth.permission.secured.policy` value `missing`"
-            ),
-            "{error}"
+#[tokio::test]
+async fn require_roles_layer_allows_any_matching_role() {
+    let app = Router::new()
+        .route("/admin", get(|| async { "ok" }))
+        .route_layer(RequireRolesLayer::any(["admin", "operator"]))
+        .layer(
+            Oidc::builder(OidcConfig::default())
+                .validator(StaticTokenValidator::principal(
+                    "test-token",
+                    Principal::with_groups("alice", ["admin"]),
+                ))
+                .build()
+                .layer(),
         );
-    assert!(
-        error
-            .to_string()
-            .contains("authorization policy `missing` is not defined"),
-        "{error}"
-    );
+
+    let response = app
+        .oneshot(request("/admin", Some("Bearer test-token")))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
-#[test]
-fn authorization_rejects_empty_roles_allowed_policy() {
-    let error = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-empty-roles", 100)
-                    .with("quarkus.http.auth.policy.empty.roles-allowed", " , ")
-                    .with("quarkus.http.auth.permission.secured.paths", "/resource")
-                    .with("quarkus.http.auth.permission.secured.policy", "empty"),
-            )
-            .build(),
-    )
-    .expect_err("empty roles-allowed should be rejected");
-
-    assert!(
-        error.to_string().contains(
-            "failed to convert config property `quarkus.http.auth.policy.empty.roles-allowed`"
-        ),
-        "{error}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("roles-allowed must include at least one role"),
-        "{error}"
-    );
-}
-
-#[test]
-fn authorization_rejects_empty_permission_paths() {
-    let error = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-empty-paths", 100)
-                    .with("quarkus.http.auth.permission.secured.paths", " , ")
-                    .with(
-                        "quarkus.http.auth.permission.secured.policy",
-                        "authenticated",
-                    ),
-            )
-            .build(),
-    )
-    .expect_err("empty permission paths should be rejected");
-
-    assert!(
-        error.to_string().contains(
-            "failed to convert config property `quarkus.http.auth.permission.secured.paths`"
-        ),
-        "{error}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("permission paths must include at least one path"),
-        "{error}"
-    );
-}
-
-#[test]
-fn authorization_rejects_empty_permission_methods() {
-    let error = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-empty-methods", 100)
-                    .with("quarkus.http.auth.permission.secured.paths", "/resource")
-                    .with("quarkus.http.auth.permission.secured.methods", " , ")
-                    .with(
-                        "quarkus.http.auth.permission.secured.policy",
-                        "authenticated",
-                    ),
-            )
-            .build(),
-    )
-    .expect_err("empty permission methods should be rejected");
-
-    assert!(
-        error.to_string().contains(
-            "failed to convert config property `quarkus.http.auth.permission.secured.methods`"
-        ),
-        "{error}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("permission methods must include at least one method when configured"),
-        "{error}"
-    );
-}
-
-#[test]
-fn authorization_normalizes_configured_methods() {
-    assert_eq!(
-        parse_http_methods("quarkus.http.auth.permission.secured.methods", "get,Post")
-            .expect("methods should parse"),
-        vec!["GET".to_owned(), "POST".to_owned()]
-    );
-}
-
-#[test]
-fn authorization_rejects_invalid_configured_methods() {
-    let error = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-invalid-method", 100)
-                    .with("quarkus.http.auth.permission.secured.paths", "/resource")
-                    .with(
-                        "quarkus.http.auth.permission.secured.methods",
-                        "GET,not a method",
-                    )
-                    .with(
-                        "quarkus.http.auth.permission.secured.policy",
-                        "authenticated",
-                    ),
-            )
-            .build(),
-    )
-    .expect_err("invalid method should be rejected");
-
-    assert!(
-            error.to_string().contains(
-                "failed to convert config property `quarkus.http.auth.permission.secured.methods` value `NOT A METHOD`"
-            ),
-            "{error}"
+#[tokio::test]
+async fn require_roles_layer_rejects_missing_role() {
+    let app = Router::new()
+        .route("/admin", get(|| async { "ok" }))
+        .route_layer(RequireRolesLayer::any(["admin"]))
+        .layer(
+            Oidc::builder(OidcConfig::default())
+                .validator(StaticTokenValidator::principal(
+                    "test-token",
+                    Principal::with_groups("alice", ["user"]),
+                ))
+                .build()
+                .layer(),
         );
-}
-
-#[tokio::test]
-async fn authorization_exact_path_matches_trailing_slash() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-exact-path-trailing-slash", 100)
-                    .with("quarkus.http.auth.permission.deny.paths", "/forbidden")
-                    .with("quarkus.http.auth.permission.deny.policy", "deny"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
 
     let response = app
-        .clone()
-        .oneshot(request("/forbidden", Some("Bearer test-token")))
+        .oneshot(request("/admin", Some("Bearer test-token")))
         .await
         .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    let response = app
-        .oneshot(request("/forbidden/", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn authorization_explicit_trailing_slash_path_wins() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-explicit-trailing-slash", 100)
-                    .with("quarkus.http.auth.permission.deny.paths", "/forbidden")
-                    .with("quarkus.http.auth.permission.deny.policy", "deny")
-                    .with("quarkus.http.auth.permission.permit.paths", "/forbidden/")
-                    .with("quarkus.http.auth.permission.permit.policy", "permit"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
+async fn require_roles_layer_requires_all_roles() {
+    let app = Router::new()
+        .route("/admin", get(|| async { "ok" }))
+        .route_layer(RequireRolesLayer::all(["user", "admin"]))
+        .layer(
+            Oidc::builder(OidcConfig::default())
+                .validator(StaticTokenValidator::principal(
+                    "test-token",
+                    Principal::with_groups("alice", ["user"]),
+                ))
+                .build()
+                .layer(),
+        );
 
     let response = app
-        .clone()
-        .oneshot(request("/forbidden", Some("Bearer test-token")))
+        .oneshot(request("/admin", Some("Bearer test-token")))
         .await
         .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    let response = app
-        .oneshot(request("/forbidden/", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn authorization_prepends_root_path_to_relative_permission_paths() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-root-path-relative", 100)
-                    .with("quarkus.http.root-path", "/api")
-                    .with("quarkus.http.auth.permission.deny.paths", "admin/*")
-                    .with("quarkus.http.auth.permission.deny.policy", "deny"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
-
-    let response = app
-        .clone()
-        .oneshot(request("/admin/users", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .oneshot(request("/api/admin/users", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn authorization_keeps_absolute_permission_paths_with_root_path() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-root-path-absolute", 100)
-                    .with("quarkus.http.root-path", "/api")
-                    .with("quarkus.http.auth.permission.deny.paths", "/admin/*")
-                    .with("quarkus.http.auth.permission.deny.policy", "deny"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
+async fn route_layer_authorization_preserves_unmatched_routes() {
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .route_layer(RequireAuthenticatedLayer::new());
 
     let response = app
-        .clone()
-        .oneshot(request("/api/admin/users", Some("Bearer test-token")))
+        .oneshot(request("/missing", None))
         .await
         .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
 
-    let response = app
-        .oneshot(request("/admin/users", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn authorization_prefers_method_specific_permission_for_same_path() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-method-specific-permission", 100)
-                    .with("quarkus.http.auth.permission.deny.paths", "/resource")
-                    .with("quarkus.http.auth.permission.deny.policy", "deny")
-                    .with("quarkus.http.auth.permission.permit-get.paths", "/resource")
-                    .with("quarkus.http.auth.permission.permit-get.methods", "GET")
-                    .with("quarkus.http.auth.permission.permit-get.policy", "permit"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
-
-    let response = app
-        .clone()
-        .oneshot(request("/resource", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request_with_method(http::Method::POST, "/resource", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(request_with_method(
-            http::Method::POST,
-            "/resource",
-            Some("Bearer test-token"),
-        ))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn authorization_rejects_path_match_without_method_match() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-method-mismatch", 100)
-                    .with(
-                        "quarkus.http.auth.permission.permit-get.paths",
-                        "/resource/*",
-                    )
-                    .with("quarkus.http.auth.permission.permit-get.methods", "GET")
-                    .with("quarkus.http.auth.permission.permit-get.policy", "permit"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
-
-    let response = app
-        .clone()
-        .oneshot(request("/resource/item", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request_with_method(
-            http::Method::POST,
-            "/resource/item",
-            None,
-        ))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .clone()
-        .oneshot(request_with_method(
-            http::Method::POST,
-            "/resource/item",
-            Some("Bearer test-token"),
-        ))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    let response = app
-        .oneshot(request_with_method(
-            http::Method::POST,
-            "/unmatched",
-            Some("Bearer test-token"),
-        ))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn authorization_matches_single_segment_wildcards() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-segment-wildcard", 100)
-                    .with(
-                        "quarkus.http.auth.permission.secured.paths",
-                        "/api/*/detail",
-                    )
-                    .with(
-                        "quarkus.http.auth.permission.secured.policy",
-                        "authenticated",
-                    )
-                    .with(
-                        "quarkus.http.auth.permission.public.paths",
-                        "/api/public-product/detail",
-                    )
-                    .with("quarkus.http.auth.permission.public.policy", "permit"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
-
-    let response = app
-        .clone()
-        .oneshot(request("/api/product/detail", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .clone()
-        .oneshot(request("/api/product/detail", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request("/api/product/other", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .oneshot(request("/api/public-product/detail", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[test]
-fn path_match_scores_single_segment_wildcards_by_specificity() {
-    let exact = path_match_score("/one/two/three/four/five", "/one/two/three/four/five")
-        .expect("exact path should match");
-    let trailing = path_match_score("/one/two/three/four/*", "/one/two/three/four/five")
-        .expect("trailing wildcard path should match");
-    let middle = path_match_score("/one/two/three/*/five", "/one/two/three/four/five")
-        .expect("middle wildcard path should match");
-    let root = path_match_score("/*", "/one/two/three/four/five")
-        .expect("root wildcard path should match");
-
-    assert!(exact > trailing);
-    assert!(trailing > middle);
-    assert!(middle > root);
-    assert_eq!(
-        path_match_score("/one/two/*/five", "/one/two/three/four/five"),
-        None
-    );
-    assert_eq!(
-        path_match_score("/one/two/*four/five", "/one/two/three/four/five"),
-        None
-    );
-    assert!(path_match_score("/public*", "/public").is_some());
-    assert!(path_match_score("/public*", "/public/css/site.css").is_some());
-    assert_eq!(path_match_score("/public*", "/public-info"), None);
-}
-
-#[test]
-fn relative_permission_paths_are_normalized_with_root_path() {
-    assert_eq!(
-        normalize_permission_paths(vec!["public/*".to_owned(), "/fixed/*".to_owned()], "/api/"),
-        vec!["/api/public/*".to_owned(), "/fixed/*".to_owned()]
-    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[test]
@@ -5176,388 +4643,6 @@ fn claim_path_parts_preserve_quoted_segments() {
         claim_path_parts("\"https://claims.example/roles\""),
         vec!["https://claims.example/roles".to_owned()]
     );
-}
-
-#[tokio::test]
-async fn authorization_applies_shared_permissions_with_most_specific_match() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-shared-permission", 100)
-                    .with("quarkus.http.auth.permission.shared.paths", "/api/*")
-                    .with(
-                        "quarkus.http.auth.permission.shared.policy",
-                        "authenticated",
-                    )
-                    .with("quarkus.http.auth.permission.shared.shared", "true")
-                    .with("quarkus.http.auth.permission.permit.paths", "/api/public")
-                    .with("quarkus.http.auth.permission.permit.policy", "permit"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
-
-    let response = app
-        .clone()
-        .oneshot(request("/api/public", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .clone()
-        .oneshot(request("/api/public", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request("/api/other", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(request("/outside", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn authorization_matches_quarkus_role_policy_permissions() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-roles", 100)
-                    .with("quarkus.http.auth.policy.r1.roles-allowed", "test")
-                    .with("quarkus.http.auth.policy.r2.roles-allowed", "admin")
-                    .with(
-                        "quarkus.http.auth.permission.roles1.paths",
-                        "/roles1,/deny,/permit,/combined,/wildcard1/*,/wildcard2*",
-                    )
-                    .with("quarkus.http.auth.permission.roles1.policy", "r1")
-                    .with(
-                        "quarkus.http.auth.permission.roles2.paths",
-                        "/roles2,/deny,/permit/combined,/wildcard3/*",
-                    )
-                    .with("quarkus.http.auth.permission.roles2.policy", "r2")
-                    .with("quarkus.http.auth.permission.permit1.paths", "/permit")
-                    .with("quarkus.http.auth.permission.permit1.policy", "permit")
-                    .with(
-                        "quarkus.http.auth.permission.deny1.paths",
-                        "/deny,/combined",
-                    )
-                    .with("quarkus.http.auth.permission.deny1.policy", "deny"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app(authorization);
-
-    let response = app
-        .clone()
-        .oneshot(request("/roles1", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .clone()
-        .oneshot(request("/roles1", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request("/roles2", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    let response = app
-        .clone()
-        .oneshot(request("/permit", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .clone()
-        .oneshot(request("/permit", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request("/deny", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    let response = app
-        .clone()
-        .oneshot(request("/wildcard1/a", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .clone()
-        .oneshot(request("/wildcard1/a", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .clone()
-        .oneshot(request("/wildcard2", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = app
-        .oneshot(request("/wildcard3XXX", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn authorization_requires_all_winning_role_policies() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-both-permissions-win", 100)
-                    .with("quarkus.http.auth.policy.user.roles-allowed", "user")
-                    .with("quarkus.http.auth.policy.admin.roles-allowed", "admin")
-                    .with("quarkus.http.auth.permission.users.paths", "/api/*")
-                    .with("quarkus.http.auth.permission.users.policy", "user")
-                    .with("quarkus.http.auth.permission.admins.paths", "/api/*")
-                    .with("quarkus.http.auth.permission.admins.policy", "admin"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-
-    let app = authz_app_with_principal(
-        authorization.clone(),
-        Principal::with_groups("test", ["user"]),
-    );
-    let response = app
-        .oneshot(request("/api/orders", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    let app = authz_app_with_principal(
-        authorization,
-        Principal::with_groups("test", ["user", "admin"]),
-    );
-    let response = app
-        .oneshot(request("/api/orders", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn authorization_roles_within_one_policy_are_alternatives() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-policy-role-alternatives", 100)
-                    .with("quarkus.http.auth.policy.staff.roles-allowed", "user,admin")
-                    .with("quarkus.http.auth.permission.staff.paths", "/api/*")
-                    .with("quarkus.http.auth.permission.staff.policy", "staff"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app_with_principal(authorization, Principal::with_groups("test", ["user"]));
-
-    let response = app
-        .oneshot(request("/api/orders", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn authorization_double_star_role_requires_authentication_only() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-policy-double-star", 100)
-                    .with("quarkus.http.auth.policy.any.roles-allowed", "**")
-                    .with("quarkus.http.auth.permission.any.paths", "/authenticated")
-                    .with("quarkus.http.auth.permission.any.policy", "any"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app_with_principal(authorization, Principal::new("test"));
-
-    let response = app
-        .clone()
-        .oneshot(request("/authenticated", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(request("/authenticated", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn authorization_applies_global_role_mappings() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-global-role-mapping", 100)
-                    .with("quarkus.http.auth.roles-mapping.admin", "Admin1")
-                    .with("quarkus.http.auth.policy.mapped.roles-allowed", "Admin1")
-                    .with("quarkus.http.auth.permission.mapped.paths", "/mapped")
-                    .with("quarkus.http.auth.permission.mapped.policy", "mapped"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app_with_principal(authorization, Principal::with_groups("test", ["admin"]));
-
-    let response = app
-        .clone()
-        .oneshot(request("/mapped", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(request("/mapped", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[test]
-fn authorization_rejects_empty_global_role_mapping() {
-    let error = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-empty-global-role-mapping", 100)
-                    .with("quarkus.http.auth.roles-mapping.admin", " , "),
-            )
-            .build(),
-    )
-    .expect_err("empty global role mapping should be rejected");
-
-    assert!(
-        error
-            .to_string()
-            .contains("quarkus.http.auth.roles-mapping.admin"),
-        "{error}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("role mappings must include at least one mapped role"),
-        "{error}"
-    );
-}
-
-#[tokio::test]
-async fn authorization_applies_policy_role_mappings() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-policy-role-mapping", 100)
-                    .with("quarkus.http.auth.policy.mapped.roles-allowed", "Admin1")
-                    .with("quarkus.http.auth.policy.mapped.roles.admin", "Admin1")
-                    .with("quarkus.http.auth.permission.mapped.paths", "/mapped")
-                    .with("quarkus.http.auth.permission.mapped.policy", "mapped"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app_with_principal(authorization, Principal::with_groups("test", ["admin"]));
-
-    let response = app
-        .clone()
-        .oneshot(request("/mapped", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(request("/mapped", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[test]
-fn authorization_rejects_empty_policy_role_mapping() {
-    let error = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-empty-policy-role-mapping", 100)
-                    .with("quarkus.http.auth.policy.mapped.roles-allowed", "Admin1")
-                    .with("quarkus.http.auth.policy.mapped.roles.admin", " , ")
-                    .with("quarkus.http.auth.permission.mapped.paths", "/mapped")
-                    .with("quarkus.http.auth.permission.mapped.policy", "mapped"),
-            )
-            .build(),
-    )
-    .expect_err("empty policy role mapping should be rejected");
-
-    assert!(
-        error
-            .to_string()
-            .contains("quarkus.http.auth.policy.mapped.roles.admin"),
-        "{error}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("role mappings must include at least one mapped role"),
-        "{error}"
-    );
-}
-
-#[tokio::test]
-async fn authorization_role_mapping_policy_requires_authentication() {
-    let authorization = Authorization::from_config(
-        &Config::builder()
-            .add_source(
-                MapSource::new("quarkus-mapping-only-policy", 100)
-                    .with("quarkus.http.auth.policy.mapped.roles.admin", "Admin1")
-                    .with("quarkus.http.auth.permission.mapped.paths", "/mapped")
-                    .with("quarkus.http.auth.permission.mapped.policy", "mapped"),
-            )
-            .build(),
-    )
-    .expect("authorization config should load");
-    let app = authz_app_with_principal(authorization, Principal::with_groups("test", ["admin"]));
-
-    let response = app
-        .clone()
-        .oneshot(request("/mapped", None))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(request("/mapped", Some("Bearer test-token")))
-        .await
-        .expect("request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
 }
 
 fn oidc() -> Oidc {
@@ -5581,20 +4666,6 @@ fn public_app(oidc: Oidc) -> Router {
     Router::new()
         .route("/protected", get(|| async { "ok" }))
         .layer(oidc.layer())
-}
-
-fn authz_app(authorization: Authorization) -> Router {
-    authz_app_with_principal(authorization, Principal::with_groups("test", ["test"]))
-}
-
-fn authz_app_with_principal(authorization: Authorization, principal: Principal) -> Router {
-    Router::new().fallback(|| async { "ok" }).layer(
-        Oidc::builder(OidcConfig::default())
-            .validator(StaticTokenValidator::principal("test-token", principal))
-            .authorization(authorization)
-            .build()
-            .layer(),
-    )
 }
 
 fn tenant_app(tenants: Tenants) -> Router {

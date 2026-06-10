@@ -63,7 +63,9 @@ mod validation_claims;
 mod validator;
 mod web_app;
 
-pub use authorization::Authorization;
+pub use authorization::{
+    RequireAuthenticatedLayer, RequireAuthenticatedService, RequireRolesLayer, RequireRolesService,
+};
 pub use config::{
     ApplicationType, ClientSecretMethod, OidcAuthenticationConfig, OidcClientSecretConfig,
     OidcConfig, OidcCredentialsConfig, OidcIntrospectionCredentialsConfig, OidcRolesConfig,

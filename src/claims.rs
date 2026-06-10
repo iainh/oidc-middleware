@@ -1,8 +1,6 @@
-use crate::Principal;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 
 pub(crate) fn extract_roles(claims: &Value, paths: &[String], separator: &str) -> Vec<String> {
     let mut roles = Vec::new();
@@ -15,27 +13,12 @@ pub(crate) fn extract_roles(claims: &Value, paths: &[String], separator: &str) -
     roles
 }
 
-pub(crate) fn apply_role_mappings(
-    principal: &mut Principal,
-    role_mappings: &HashMap<String, Vec<String>>,
-) {
-    if role_mappings.is_empty() {
-        return;
-    }
-
-    let mapped_roles = principal
-        .group_arcs()
-        .filter_map(|role| role_mappings.get(role.as_ref()))
-        .flatten()
-        .map(|role| Arc::from(role.clone()))
-        .collect::<Vec<_>>();
-    principal.add_groups(mapped_roles);
-}
-
 pub(crate) fn claim_path_value<'a>(claims: &'a Value, path: &str) -> Option<&'a Value> {
-    claim_path_parts(path)
-        .into_iter()
-        .try_fold(claims, |value, part| value.get(part))
+    let mut value = claims;
+    for part in claim_path_parts(path) {
+        value = value.get(part)?;
+    }
+    Some(value)
 }
 
 pub(crate) fn claim_path_parts(path: &str) -> Vec<String> {
