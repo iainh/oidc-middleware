@@ -55,6 +55,7 @@ mod provider;
 mod token;
 mod user_info;
 mod validation_claims;
+mod validator;
 
 pub use authorization::Authorization;
 pub use config::{
@@ -74,6 +75,7 @@ pub use provider::ProviderMetadata;
 pub use user_info::{
     UserInfoProvider, UserInfoResponse, UserInfoRolesValidator, UserInfoValidator,
 };
+pub use validator::{StaticTokenValidator, TokenValidator};
 
 use authorization::AuthRequirement;
 use axum::body::Body;
@@ -103,13 +105,14 @@ use token::{bearer_token, unverified_token_from_request, unverified_token_issuer
 use tower_layer::Layer;
 use tower_service::Service;
 use user_info::HttpUserInfoProvider;
+use validator::RejectAllTokens;
+pub(crate) use validator::ValidationFuture;
 
 /// Result type returned by token validators.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Boxed error type used by extension points.
 pub type BoxError = Box<dyn StdError + Send + Sync>;
-type ValidationFuture = Pin<Box<dyn Future<Output = Result<Principal>> + Send>>;
 /// Future returned by [`TokenIntrospector`].
 pub type IntrospectionFuture =
     Pin<Box<dyn Future<Output = std::result::Result<IntrospectionResponse, BoxError>> + Send>>;
@@ -118,58 +121,6 @@ pub type UserInfoFuture =
     Pin<Box<dyn Future<Output = std::result::Result<UserInfoResponse, BoxError>> + Send>>;
 /// Result type returned while building OIDC middleware.
 pub type BuildResult<T> = std::result::Result<T, BuildError>;
-
-/// Validates a bearer token and returns the authenticated principal.
-pub trait TokenValidator: Send + Sync + 'static {
-    /// Validates a raw bearer token.
-    fn validate(&self, token: Arc<str>) -> ValidationFuture;
-}
-
-impl<F, Fut> TokenValidator for F
-where
-    F: Fn(Arc<str>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Principal>> + Send + 'static,
-{
-    fn validate(&self, token: Arc<str>) -> ValidationFuture {
-        Box::pin(self(token))
-    }
-}
-
-/// Development/test token validator that accepts exactly one bearer token.
-#[derive(Clone, Debug)]
-pub struct StaticTokenValidator {
-    token: Arc<str>,
-    principal: Principal,
-}
-
-impl StaticTokenValidator {
-    /// Creates a validator that accepts `token` and maps it to `subject`.
-    pub fn bearer(token: impl Into<String>, subject: impl Into<String>) -> Self {
-        Self::principal(token, Principal::new(subject))
-    }
-
-    /// Creates a validator that accepts `token` and returns `principal`.
-    pub fn principal(token: impl Into<String>, principal: Principal) -> Self {
-        Self {
-            token: Arc::from(token.into()),
-            principal,
-        }
-    }
-}
-
-impl TokenValidator for StaticTokenValidator {
-    fn validate(&self, token: Arc<str>) -> ValidationFuture {
-        let principal = self.principal.clone();
-        let expected = self.token.clone();
-        Box::pin(async move {
-            if token == expected {
-                Ok(principal)
-            } else {
-                Err(Error::TokenRejected("bearer token did not match".into()))
-            }
-        })
-    }
-}
 
 /// OIDC middleware entry point.
 #[derive(Clone)]
@@ -825,15 +776,6 @@ impl OidcBuilder {
             validator: self.validator.unwrap_or_else(|| Arc::new(RejectAllTokens)),
             authorization: self.authorization,
         }
-    }
-}
-
-#[derive(Clone)]
-struct RejectAllTokens;
-
-impl TokenValidator for RejectAllTokens {
-    fn validate(&self, _token: Arc<str>) -> ValidationFuture {
-        Box::pin(async { Err(Error::TokenRejected("no token validator configured".into())) })
     }
 }
 
