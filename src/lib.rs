@@ -2432,8 +2432,12 @@ impl Oidc {
 
     /// Loads `quarkus.oidc.*` and `quarkus.http.auth.permission.*` configuration.
     pub fn from_config(config: &Config) -> mp_config::Result<OidcBuilder> {
-        oidc_builder_from_config(OidcConfig::from_config(config)?, "quarkus.oidc.public-key")?
-            .authorization_from_config(config)
+        oidc_builder_from_config(
+            OidcConfig::from_config(config)?,
+            "quarkus.oidc.public-key",
+            "quarkus.oidc.roles.source",
+        )?
+        .authorization_from_config(config)
     }
 
     /// Returns a tower layer suitable for `Router::layer`.
@@ -2496,12 +2500,14 @@ impl Oidc {
 fn oidc_builder_from_config(
     config: OidcConfig,
     public_key_property: &str,
+    roles_source_property: &str,
 ) -> mp_config::Result<OidcBuilder> {
     let public_key = config.public_key.clone();
     let mut builder = Oidc::builder(config);
     if !builder.config.enabled {
         return Ok(builder);
     }
+    validate_service_roles_source(&builder.config, roles_source_property)?;
     if let Some(public_key) = public_key {
         builder = builder.public_key(&public_key).map_err(|error| {
             mp_config::ConfigError::Conversion {
@@ -2512,6 +2518,20 @@ fn oidc_builder_from_config(
         })?;
     }
     Ok(builder)
+}
+
+fn validate_service_roles_source(
+    config: &OidcConfig,
+    property_name: &str,
+) -> mp_config::Result<()> {
+    if config.roles.source == RolesSource::IdToken {
+        return Err(mp_config::ConfigError::Conversion {
+            name: property_name.to_owned(),
+            value: "idtoken".to_owned(),
+            message: "`idtoken` roles require web-app ID token support, which is not implemented for bearer-service middleware".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn oidc_http_client(config: &OidcConfig) -> BuildResult<reqwest::Client> {
@@ -3043,19 +3063,26 @@ impl Tenants {
         }
         if has_default_tenant_config(config) {
             let default_config = OidcConfig::from_config(config)?;
-            let default_tenant =
-                oidc_builder_from_config(default_config, "quarkus.oidc.public-key")?
-                    .authorization_from_config(config)?
-                    .build();
+            let default_tenant = oidc_builder_from_config(
+                default_config,
+                "quarkus.oidc.public-key",
+                "quarkus.oidc.roles.source",
+            )?
+            .authorization_from_config(config)?
+            .build();
             builder = builder.default_tenant(default_tenant);
         }
 
         for tenant in named_tenant_configs(config) {
             let prefix = format!("quarkus.oidc.{}", tenant.prefix_segment);
             let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
-            let oidc = oidc_builder_from_config(tenant_config, &format!("{prefix}.public-key"))?
-                .authorization_from_config(config)?
-                .build();
+            let oidc = oidc_builder_from_config(
+                tenant_config,
+                &format!("{prefix}.public-key"),
+                &format!("{prefix}.roles.source"),
+            )?
+            .authorization_from_config(config)?
+            .build();
             builder = builder.tenant(tenant.name, oidc);
         }
 
@@ -4199,6 +4226,17 @@ dQIDAQAB
                 .contains("expected one of `accesstoken`, `idtoken`, or `userinfo`"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn config_loads_id_token_roles_source() {
+        let config = Config::builder()
+            .add_source(MapSource::new("test", 100).with("quarkus.oidc.roles.source", "idtoken"))
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert_eq!(oidc.roles.source, RolesSource::IdToken);
     }
 
     #[test]
@@ -5356,6 +5394,32 @@ dQIDAQAB
             .build();
 
         let _builder = Oidc::from_config(&config).expect("disabled OIDC should not parse key");
+    }
+
+    #[test]
+    fn oidc_from_config_rejects_id_token_roles_source() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("idtoken-roles", 100)
+                    .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
+                    .with("quarkus.oidc.roles.source", "idtoken"),
+            )
+            .build();
+
+        let Err(error) = Oidc::from_config(&config) else {
+            panic!("ID token roles should be rejected for bearer-service middleware");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { ref name, .. }
+                if name == "quarkus.oidc.roles.source"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("`idtoken` roles require web-app ID token support"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -7126,6 +7190,32 @@ dQIDAQAB
         let _tenants = Tenants::from_config(&config)
             .expect("quoted tenant config should load")
             .build();
+    }
+
+    #[test]
+    fn tenants_from_config_rejects_named_id_token_roles_source() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-idtoken-roles", 100)
+                    .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
+                    .with("quarkus.oidc.tenant-a.roles.source", "idtoken"),
+            )
+            .build();
+
+        let Err(error) = Tenants::from_config(&config) else {
+            panic!("ID token roles should be rejected for named bearer-service tenants");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { ref name, .. }
+                if name == "quarkus.oidc.tenant-a.roles.source"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("`idtoken` roles require web-app ID token support"),
+            "{error}"
+        );
     }
 
     #[test]
