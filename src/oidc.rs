@@ -54,16 +54,16 @@ impl Oidc {
         }
     }
 
-    /// Loads `quarkus.oidc.*` and `quarkus.http.auth.permission.*` configuration.
+    /// Loads `oidc.*` and `quarkus.http.auth.permission.*` configuration.
     pub fn from_config(config: &Config) -> mp_config::Result<OidcBuilder> {
         oidc_builder_from_config(
             OidcConfig::from_config(config)?,
-            "quarkus.oidc.public-key",
-            "quarkus.oidc.application-type",
-            "quarkus.oidc.roles.source",
-            "quarkus.oidc.token.binding.certificate",
-            "quarkus.oidc.token.decrypt-access-token",
-            "quarkus.oidc.token.decrypt-id-token",
+            "oidc.public-key",
+            "oidc.application-type",
+            "oidc.roles.source",
+            "oidc.token.binding.certificate",
+            "oidc.token.decrypt-access-token",
+            "oidc.token.decrypt-id-token",
         )?
         .authorization_from_config(config)
     }
@@ -377,7 +377,7 @@ impl OidcBuilder {
         Ok(self)
     }
 
-    /// Installs a `quarkus.oidc.public-key` backed JWT validator.
+    /// Installs a `oidc.public-key` backed JWT validator.
     pub fn public_key(mut self, public_key: &str) -> BuildResult<Self> {
         self.validator = Some(Arc::new(JwtValidator::public_key(
             public_key,

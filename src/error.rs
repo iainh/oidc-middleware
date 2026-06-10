@@ -101,11 +101,11 @@ impl IntoResponse for Error {
 pub enum BuildError {
     /// Loading `mp-config` backed OIDC configuration failed.
     Config(mp_config::ConfigError),
-    /// Provider discovery requires `quarkus.oidc.auth-server-url`.
+    /// Provider discovery requires `oidc.auth-server-url`.
     MissingAuthServerUrl,
     /// The configured well-known provider has no built-in issuer URL yet.
     UnsupportedWellKnownProvider(WellKnownProvider),
-    /// Direct JWKS loading requires `quarkus.oidc.jwks-path`.
+    /// Direct JWKS loading requires `oidc.jwks-path`.
     MissingJwksPath,
     /// Remote token introspection requires a configured or discovered endpoint.
     MissingIntrospectionEndpoint,
@@ -115,7 +115,7 @@ pub enum BuildError {
     MissingAuthorizationEndpoint,
     /// Web-app authorization-code callbacks require a token endpoint.
     MissingTokenEndpoint,
-    /// Web-app authorization-code flow requires `quarkus.oidc.client-id`.
+    /// Web-app authorization-code flow requires `oidc.client-id`.
     MissingClientId,
     /// The configured public key could not be parsed.
     InvalidPublicKey(BoxError),
@@ -129,18 +129,17 @@ impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(source) => write!(f, "OIDC configuration failed: {source}"),
-            Self::MissingAuthServerUrl => write!(
-                f,
-                "OIDC provider discovery requires `quarkus.oidc.auth-server-url`"
-            ),
+            Self::MissingAuthServerUrl => {
+                write!(f, "OIDC provider discovery requires `oidc.auth-server-url`")
+            }
             Self::UnsupportedWellKnownProvider(provider) => write!(
                 f,
-                "well-known OIDC provider `{}` requires `quarkus.oidc.auth-server-url` until its issuer URL is built in",
+                "well-known OIDC provider `{}` requires `oidc.auth-server-url` until its issuer URL is built in",
                 provider.as_config_value()
             ),
             Self::MissingJwksPath => write!(
                 f,
-                "OIDC JWKS loading requires `quarkus.oidc.jwks-path` when discovery is disabled"
+                "OIDC JWKS loading requires `oidc.jwks-path` when discovery is disabled"
             ),
             Self::MissingIntrospectionEndpoint => write!(
                 f,
@@ -158,10 +157,9 @@ impl fmt::Display for BuildError {
             Self::MissingTokenEndpoint => {
                 write!(f, "OIDC web-app authentication requires a token endpoint")
             }
-            Self::MissingClientId => write!(
-                f,
-                "OIDC web-app authentication requires `quarkus.oidc.client-id`"
-            ),
+            Self::MissingClientId => {
+                write!(f, "OIDC web-app authentication requires `oidc.client-id`")
+            }
             Self::InvalidPublicKey(source) => write!(f, "invalid OIDC public key: {source}"),
             Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
             Self::Http(source) => write!(f, "OIDC provider request failed: {source}"),

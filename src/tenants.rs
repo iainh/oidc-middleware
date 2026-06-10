@@ -32,20 +32,20 @@ impl Tenants {
 
     /// Loads the default tenant and named tenants from `mp-config`.
     ///
-    /// The default tenant uses `quarkus.oidc.*`; named tenants use
-    /// `quarkus.oidc.<tenant>.*`. Tenant selection uses each tenant's
+    /// The default tenant uses `oidc.*`; named tenants use
+    /// `oidc.<tenant>.*`. Tenant selection uses each tenant's
     /// `tenant-paths` property, and configured `quarkus.http.auth.permission.*`
     /// policies are applied to each tenant.
     pub fn from_config(config: &Config) -> mp_config::Result<TenantsBuilder> {
         let mut builder = Tenants::builder().resolve_with_issuer(
             config
-                .get_optional::<bool>("quarkus.oidc.resolve-tenants-with-issuer")?
+                .get_optional::<bool>("oidc.resolve-tenants-with-issuer")?
                 .unwrap_or_default(),
         );
-        if let Some(header_name) = config.get_optional::<String>("quarkus.oidc.tenant-id-header")? {
+        if let Some(header_name) = config.get_optional::<String>("oidc.tenant-id-header")? {
             let parsed = http::HeaderName::from_str(&header_name).map_err(|error| {
                 mp_config::ConfigError::Conversion {
-                    name: "quarkus.oidc.tenant-id-header".to_owned(),
+                    name: "oidc.tenant-id-header".to_owned(),
                     value: header_name,
                     message: error.to_string(),
                 }
@@ -56,12 +56,12 @@ impl Tenants {
             let default_config = OidcConfig::from_config(config)?;
             let default_tenant = oidc_builder_from_config(
                 default_config,
-                "quarkus.oidc.public-key",
-                "quarkus.oidc.application-type",
-                "quarkus.oidc.roles.source",
-                "quarkus.oidc.token.binding.certificate",
-                "quarkus.oidc.token.decrypt-access-token",
-                "quarkus.oidc.token.decrypt-id-token",
+                "oidc.public-key",
+                "oidc.application-type",
+                "oidc.roles.source",
+                "oidc.token.binding.certificate",
+                "oidc.token.decrypt-access-token",
+                "oidc.token.decrypt-id-token",
             )?
             .authorization_from_config(config)?
             .build();
@@ -69,7 +69,7 @@ impl Tenants {
         }
 
         for tenant in named_tenant_configs(config) {
-            let prefix = format!("quarkus.oidc.{}", tenant.prefix_segment);
+            let prefix = format!("oidc.{}", tenant.prefix_segment);
             let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
             validate_configured_tenant_paths(&tenant_config, &format!("{prefix}.tenant-paths"))?;
             let oidc = oidc_builder_from_config(
@@ -91,8 +91,8 @@ impl Tenants {
 
     /// Loads configured tenants, discovers their providers, and builds the registry.
     ///
-    /// The default tenant uses `quarkus.oidc.*`; named tenants use
-    /// `quarkus.oidc.<tenant>.*`. Local `public-key` tenants are built without
+    /// The default tenant uses `oidc.*`; named tenants use
+    /// `oidc.<tenant>.*`. Local `public-key` tenants are built without
     /// network access, while provider-backed tenants fetch discovery metadata
     /// and keys.
     pub async fn discover_from_config(config: &Config) -> BuildResult<Tenants> {
@@ -235,13 +235,13 @@ async fn discover_tenants_from_config(
 ) -> BuildResult<Tenants> {
     let mut builder = Tenants::builder().resolve_with_issuer(
         config
-            .get_optional::<bool>("quarkus.oidc.resolve-tenants-with-issuer")?
+            .get_optional::<bool>("oidc.resolve-tenants-with-issuer")?
             .unwrap_or_default(),
     );
-    if let Some(header_name) = config.get_optional::<String>("quarkus.oidc.tenant-id-header")? {
+    if let Some(header_name) = config.get_optional::<String>("oidc.tenant-id-header")? {
         let parsed = http::HeaderName::from_str(&header_name).map_err(|error| {
             mp_config::ConfigError::Conversion {
-                name: "quarkus.oidc.tenant-id-header".to_owned(),
+                name: "oidc.tenant-id-header".to_owned(),
                 value: header_name,
                 message: error.to_string(),
             }
@@ -252,12 +252,12 @@ async fn discover_tenants_from_config(
         let default_config = OidcConfig::from_config(config)?;
         let default_tenant = oidc_builder_from_config(
             default_config,
-            "quarkus.oidc.public-key",
-            "quarkus.oidc.application-type",
-            "quarkus.oidc.roles.source",
-            "quarkus.oidc.token.binding.certificate",
-            "quarkus.oidc.token.decrypt-access-token",
-            "quarkus.oidc.token.decrypt-id-token",
+            "oidc.public-key",
+            "oidc.application-type",
+            "oidc.roles.source",
+            "oidc.token.binding.certificate",
+            "oidc.token.decrypt-access-token",
+            "oidc.token.decrypt-id-token",
         )?
         .authorization_from_config(config)?;
         let default_tenant = discover_oidc_builder(default_tenant, client.as_ref()).await?;
@@ -265,7 +265,7 @@ async fn discover_tenants_from_config(
     }
 
     for tenant in named_tenant_configs(config) {
-        let prefix = format!("quarkus.oidc.{}", tenant.prefix_segment);
+        let prefix = format!("oidc.{}", tenant.prefix_segment);
         let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
         validate_configured_tenant_paths(&tenant_config, &format!("{prefix}.tenant-paths"))?;
         let oidc = oidc_builder_from_config(

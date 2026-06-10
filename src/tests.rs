@@ -75,103 +75,70 @@ fn config_loads_quarkus_oidc_properties() {
     let config = Config::builder()
         .add_source(
             MapSource::new("test", 100)
+                .with("oidc.auth-server-url", "https://issuer.example/realms/app")
+                .with("oidc.provider", "github")
+                .with("oidc.connection-timeout", "2s")
+                .with("oidc.resolve-tenants-with-issuer", "true")
+                .with("oidc.discovery-enabled", "false")
+                .with("oidc.discovery-path", "custom-discovery")
+                .with("oidc.jwks-path", "protocol/openid-connect/certs")
+                .with("oidc.authorization-path", "protocol/openid-connect/auth")
+                .with("oidc.token-path", "protocol/openid-connect/token")
                 .with(
-                    "quarkus.oidc.auth-server-url",
-                    "https://issuer.example/realms/app",
-                )
-                .with("quarkus.oidc.provider", "github")
-                .with("quarkus.oidc.connection-timeout", "2s")
-                .with("quarkus.oidc.resolve-tenants-with-issuer", "true")
-                .with("quarkus.oidc.discovery-enabled", "false")
-                .with("quarkus.oidc.discovery-path", "custom-discovery")
-                .with("quarkus.oidc.jwks-path", "protocol/openid-connect/certs")
-                .with(
-                    "quarkus.oidc.authorization-path",
-                    "protocol/openid-connect/auth",
-                )
-                .with("quarkus.oidc.token-path", "protocol/openid-connect/token")
-                .with(
-                    "quarkus.oidc.registration-path",
+                    "oidc.registration-path",
                     "clients-registrations/openid-connect",
                 )
-                .with("quarkus.oidc.revoke-path", "protocol/openid-connect/revoke")
+                .with("oidc.revoke-path", "protocol/openid-connect/revoke")
                 .with(
-                    "quarkus.oidc.introspection-path",
+                    "oidc.introspection-path",
                     "protocol/openid-connect/token/introspect",
                 )
+                .with("oidc.user-info-path", "protocol/openid-connect/userinfo")
+                .with("oidc.end-session-path", "protocol/openid-connect/logout")
+                .with("oidc.client-id", "orders-service")
+                .with("oidc.client-name", "Orders Service")
+                .with("oidc.credentials.secret", "orders-secret")
+                .with("oidc.credentials.client-secret.method", "post")
+                .with("oidc.introspection-credentials.name", "introspect")
+                .with("oidc.introspection-credentials.secret", "introspect-secret")
+                .with("oidc.introspection-credentials.include-client-id", "false")
+                .with("oidc.tenant-id", "orders-tenant")
+                .with("oidc.public-key", "configured-public-key")
+                .with("oidc.application-type", "hybrid")
+                .with("oidc.authentication.redirect-path", "/login/callback")
+                .with("oidc.authentication.restore-path-after-redirect", "false")
+                .with("oidc.authentication.scopes", "openid,email,profile")
+                .with("oidc.token.audience", "orders-api")
+                .with("oidc.token.token-type", "bearer")
+                .with("oidc.token.signature-algorithm", "rs256")
                 .with(
-                    "quarkus.oidc.user-info-path",
-                    "protocol/openid-connect/userinfo",
-                )
-                .with(
-                    "quarkus.oidc.end-session-path",
-                    "protocol/openid-connect/logout",
-                )
-                .with("quarkus.oidc.client-id", "orders-service")
-                .with("quarkus.oidc.client-name", "Orders Service")
-                .with("quarkus.oidc.credentials.secret", "orders-secret")
-                .with("quarkus.oidc.credentials.client-secret.method", "post")
-                .with("quarkus.oidc.introspection-credentials.name", "introspect")
-                .with(
-                    "quarkus.oidc.introspection-credentials.secret",
-                    "introspect-secret",
-                )
-                .with(
-                    "quarkus.oidc.introspection-credentials.include-client-id",
-                    "false",
-                )
-                .with("quarkus.oidc.tenant-id", "orders-tenant")
-                .with("quarkus.oidc.public-key", "configured-public-key")
-                .with("quarkus.oidc.application-type", "hybrid")
-                .with(
-                    "quarkus.oidc.authentication.redirect-path",
-                    "/login/callback",
-                )
-                .with(
-                    "quarkus.oidc.authentication.restore-path-after-redirect",
-                    "false",
-                )
-                .with("quarkus.oidc.authentication.scopes", "openid,email,profile")
-                .with("quarkus.oidc.token.audience", "orders-api")
-                .with("quarkus.oidc.token.token-type", "bearer")
-                .with("quarkus.oidc.token.signature-algorithm", "rs256")
-                .with(
-                    "quarkus.oidc.token.decryption-key-location",
+                    "oidc.token.decryption-key-location",
                     "/etc/oidc/decryption.pem",
                 )
-                .with("quarkus.oidc.token.decrypt-id-token", "false")
-                .with("quarkus.oidc.token.decrypt-access-token", "false")
-                .with("quarkus.oidc.token.subject-required", "true")
-                .with("quarkus.oidc.token.issued-at-required", "false")
-                .with("quarkus.oidc.token.required-claims.org_id", "org_xyz")
-                .with("quarkus.oidc.token.required-claims.scope", "read,write")
+                .with("oidc.token.decrypt-id-token", "false")
+                .with("oidc.token.decrypt-access-token", "false")
+                .with("oidc.token.subject-required", "true")
+                .with("oidc.token.issued-at-required", "false")
+                .with("oidc.token.required-claims.org_id", "org_xyz")
+                .with("oidc.token.required-claims.scope", "read,write")
                 .with(
-                    "quarkus.oidc.token.required-claims.\"resource_access.orders.roles\"",
+                    "oidc.token.required-claims.\"resource_access.orders.roles\"",
                     "orders-admin",
                 )
-                .with("quarkus.oidc.token.principal-claim", "email")
-                .with("quarkus.oidc.token.header", "x-access-token")
-                .with("quarkus.oidc.token.authorization-scheme", "Token")
-                .with("quarkus.oidc.token.lifespan-grace", "5")
-                .with("quarkus.oidc.token.age", "60s")
-                .with("quarkus.oidc.token.forced-jwk-refresh-interval", "30s")
-                .with("quarkus.oidc.token.allow-jwt-introspection", "false")
-                .with("quarkus.oidc.token.require-jwt-introspection-only", "true")
-                .with(
-                    "quarkus.oidc.token.allow-opaque-token-introspection",
-                    "false",
-                )
-                .with(
-                    "quarkus.oidc.token.verify-access-token-with-user-info",
-                    "true",
-                )
-                .with("quarkus.oidc.token.binding.certificate", "true")
-                .with(
-                    "quarkus.oidc.roles.role-claim-path",
-                    "resource_access.api.roles",
-                )
-                .with("quarkus.oidc.roles.source", "userinfo")
-                .with("quarkus.oidc.roles.role-claim-separator", "|"),
+                .with("oidc.token.principal-claim", "email")
+                .with("oidc.token.header", "x-access-token")
+                .with("oidc.token.authorization-scheme", "Token")
+                .with("oidc.token.lifespan-grace", "5")
+                .with("oidc.token.age", "60s")
+                .with("oidc.token.forced-jwk-refresh-interval", "30s")
+                .with("oidc.token.allow-jwt-introspection", "false")
+                .with("oidc.token.require-jwt-introspection-only", "true")
+                .with("oidc.token.allow-opaque-token-introspection", "false")
+                .with("oidc.token.verify-access-token-with-user-info", "true")
+                .with("oidc.token.binding.certificate", "true")
+                .with("oidc.roles.role-claim-path", "resource_access.api.roles")
+                .with("oidc.roles.source", "userinfo")
+                .with("oidc.roles.role-claim-separator", "|"),
         )
         .build();
 
@@ -268,7 +235,7 @@ fn config_loads_quarkus_oidc_properties() {
 #[test]
 fn config_rejects_unknown_roles_source() {
     let config = Config::builder()
-        .add_source(MapSource::new("test", 100).with("quarkus.oidc.roles.source", "session"))
+        .add_source(MapSource::new("test", 100).with("oidc.roles.source", "session"))
         .build();
 
     let error = OidcConfig::from_config(&config).expect_err("roles source should be rejected");
@@ -285,8 +252,7 @@ fn config_rejects_unknown_roles_source() {
 fn config_rejects_empty_role_claim_path() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("empty-role-claim-path", 100)
-                .with("quarkus.oidc.roles.role-claim-path", " , "),
+            MapSource::new("empty-role-claim-path", 100).with("oidc.roles.role-claim-path", " , "),
         )
         .build();
 
@@ -294,9 +260,7 @@ fn config_rejects_empty_role_claim_path() {
         OidcConfig::from_config(&config).expect_err("empty role claim path should be rejected");
 
     assert!(
-        error
-            .to_string()
-            .contains("quarkus.oidc.roles.role-claim-path"),
+        error.to_string().contains("oidc.roles.role-claim-path"),
         "{error}"
     );
     assert!(
@@ -310,7 +274,7 @@ fn config_rejects_empty_role_claim_path() {
 #[test]
 fn config_loads_id_token_roles_source() {
     let config = Config::builder()
-        .add_source(MapSource::new("test", 100).with("quarkus.oidc.roles.source", "idtoken"))
+        .add_source(MapSource::new("test", 100).with("oidc.roles.source", "idtoken"))
         .build();
 
     let oidc = OidcConfig::from_config(&config).expect("config should load");
@@ -332,7 +296,7 @@ fn config_defaults_token_binding_certificate_to_false() {
 #[test]
 fn config_rejects_unknown_provider() {
     let config = Config::builder()
-        .add_source(MapSource::new("test", 100).with("quarkus.oidc.provider", "custom"))
+        .add_source(MapSource::new("test", 100).with("oidc.provider", "custom"))
         .build();
 
     let error = OidcConfig::from_config(&config).expect_err("provider should be rejected");
@@ -348,10 +312,10 @@ fn config_rejects_unknown_provider() {
 #[test]
 fn config_loads_client_secret_value() {
     let config = Config::builder()
-        .add_source(MapSource::new("test", 100).with(
-            "quarkus.oidc.credentials.client-secret.value",
-            "orders-secret",
-        ))
+        .add_source(
+            MapSource::new("test", 100)
+                .with("oidc.credentials.client-secret.value", "orders-secret"),
+        )
         .build();
 
     let oidc = OidcConfig::from_config(&config).expect("config should load");
@@ -367,11 +331,8 @@ fn config_prefers_credentials_secret_over_client_secret_value() {
     let config = Config::builder()
         .add_source(
             MapSource::new("test", 100)
-                .with("quarkus.oidc.credentials.secret", "primary-secret")
-                .with(
-                    "quarkus.oidc.credentials.client-secret.value",
-                    "fallback-secret",
-                ),
+                .with("oidc.credentials.secret", "primary-secret")
+                .with("oidc.credentials.client-secret.value", "fallback-secret"),
         )
         .build();
 
@@ -387,8 +348,7 @@ fn config_prefers_credentials_secret_over_client_secret_value() {
 fn config_rejects_empty_credentials_secret() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("empty-credentials-secret", 100)
-                .with("quarkus.oidc.credentials.secret", " "),
+            MapSource::new("empty-credentials-secret", 100).with("oidc.credentials.secret", " "),
         )
         .build();
 
@@ -396,9 +356,7 @@ fn config_rejects_empty_credentials_secret() {
         OidcConfig::from_config(&config).expect_err("empty credentials secret should be rejected");
 
     assert!(
-        error
-            .to_string()
-            .contains("quarkus.oidc.credentials.secret"),
+        error.to_string().contains("oidc.credentials.secret"),
         "{error}"
     );
     assert!(
@@ -414,7 +372,7 @@ fn config_rejects_empty_client_secret_value() {
     let config = Config::builder()
         .add_source(
             MapSource::new("empty-client-secret-value", 100)
-                .with("quarkus.oidc.credentials.client-secret.value", " "),
+                .with("oidc.credentials.client-secret.value", " "),
         )
         .build();
 
@@ -424,7 +382,7 @@ fn config_rejects_empty_client_secret_value() {
     assert!(
         error
             .to_string()
-            .contains("quarkus.oidc.credentials.client-secret.value"),
+            .contains("oidc.credentials.client-secret.value"),
         "{error}"
     );
     assert!(
@@ -440,15 +398,9 @@ fn config_loads_introspection_credentials() {
     let config = Config::builder()
         .add_source(
             MapSource::new("test", 100)
-                .with("quarkus.oidc.introspection-credentials.name", "introspect")
-                .with(
-                    "quarkus.oidc.introspection-credentials.secret",
-                    "introspect-secret",
-                )
-                .with(
-                    "quarkus.oidc.introspection-credentials.include-client-id",
-                    "false",
-                ),
+                .with("oidc.introspection-credentials.name", "introspect")
+                .with("oidc.introspection-credentials.secret", "introspect-secret")
+                .with("oidc.introspection-credentials.include-client-id", "false"),
         )
         .build();
 
@@ -469,7 +421,7 @@ fn config_rejects_empty_introspection_credentials_name() {
     let config = Config::builder()
         .add_source(
             MapSource::new("empty-introspection-name", 100)
-                .with("quarkus.oidc.introspection-credentials.name", " "),
+                .with("oidc.introspection-credentials.name", " "),
         )
         .build();
 
@@ -479,7 +431,7 @@ fn config_rejects_empty_introspection_credentials_name() {
     assert!(
         error
             .to_string()
-            .contains("quarkus.oidc.introspection-credentials.name"),
+            .contains("oidc.introspection-credentials.name"),
         "{error}"
     );
     assert!(
@@ -495,7 +447,7 @@ fn config_rejects_empty_introspection_credentials_secret() {
     let config = Config::builder()
         .add_source(
             MapSource::new("empty-introspection-secret", 100)
-                .with("quarkus.oidc.introspection-credentials.secret", " "),
+                .with("oidc.introspection-credentials.secret", " "),
         )
         .build();
 
@@ -505,7 +457,7 @@ fn config_rejects_empty_introspection_credentials_secret() {
     assert!(
         error
             .to_string()
-            .contains("quarkus.oidc.introspection-credentials.secret"),
+            .contains("oidc.introspection-credentials.secret"),
         "{error}"
     );
     assert!(
@@ -520,8 +472,7 @@ fn config_rejects_empty_introspection_credentials_secret() {
 fn config_loads_query_client_secret_method() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("test", 100)
-                .with("quarkus.oidc.credentials.client-secret.method", "query"),
+            MapSource::new("test", 100).with("oidc.credentials.client-secret.method", "query"),
         )
         .build();
 
@@ -537,8 +488,7 @@ fn config_loads_query_client_secret_method() {
 fn config_rejects_unknown_client_secret_method() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("test", 100)
-                .with("quarkus.oidc.credentials.client-secret.method", "post-jwt"),
+            MapSource::new("test", 100).with("oidc.credentials.client-secret.method", "post-jwt"),
         )
         .build();
 
@@ -556,7 +506,7 @@ fn config_rejects_unknown_client_secret_method() {
 #[test]
 fn config_loads_application_type_case_insensitively() {
     let config = Config::builder()
-        .add_source(MapSource::new("test", 100).with("quarkus.oidc.application-type", "WEB-APP"))
+        .add_source(MapSource::new("test", 100).with("oidc.application-type", "WEB-APP"))
         .build();
 
     let oidc = OidcConfig::from_config(&config).expect("config should load");
@@ -567,7 +517,7 @@ fn config_loads_application_type_case_insensitively() {
 #[test]
 fn config_loads_hybrid_application_type() {
     let config = Config::builder()
-        .add_source(MapSource::new("test", 100).with("quarkus.oidc.application-type", "hybrid"))
+        .add_source(MapSource::new("test", 100).with("oidc.application-type", "hybrid"))
         .build();
 
     let oidc = OidcConfig::from_config(&config).expect("config should load");
@@ -578,7 +528,7 @@ fn config_loads_hybrid_application_type() {
 #[test]
 fn config_rejects_invalid_token_header() {
     let config = Config::builder()
-        .add_source(MapSource::new("test", 100).with("quarkus.oidc.token.header", "not a header"))
+        .add_source(MapSource::new("test", 100).with("oidc.token.header", "not a header"))
         .build();
 
     let error = match OidcConfig::from_config(&config) {
@@ -586,18 +536,13 @@ fn config_rejects_invalid_token_header() {
         Ok(_) => panic!("token header should be rejected"),
     };
 
-    assert!(
-        error.to_string().contains("quarkus.oidc.token.header"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("oidc.token.header"), "{error}");
 }
 
 #[test]
 fn config_loads_valid_authorization_scheme() {
     let config = Config::builder()
-        .add_source(
-            MapSource::new("test", 100).with("quarkus.oidc.token.authorization-scheme", "DPoP"),
-        )
+        .add_source(MapSource::new("test", 100).with("oidc.token.authorization-scheme", "DPoP"))
         .build();
 
     let oidc = OidcConfig::from_config(&config).expect("config should load");
@@ -620,9 +565,7 @@ fn config_defaults_token_header_to_authorization() {
 fn config_rejects_invalid_authorization_scheme() {
     for scheme in ["Bearer Token", "Bearer/Token"] {
         let config = Config::builder()
-            .add_source(
-                MapSource::new("test", 100).with("quarkus.oidc.token.authorization-scheme", scheme),
-            )
+            .add_source(MapSource::new("test", 100).with("oidc.token.authorization-scheme", scheme))
             .build();
 
         let error =
@@ -631,7 +574,7 @@ fn config_rejects_invalid_authorization_scheme() {
         assert!(
             error
                 .to_string()
-                .contains("quarkus.oidc.token.authorization-scheme"),
+                .contains("oidc.token.authorization-scheme"),
             "{error}"
         );
         assert!(
@@ -1505,12 +1448,9 @@ async fn oidc_from_config_uses_public_key_for_local_jwt_verification() {
     let config = Config::builder()
         .add_source(
             MapSource::new("public-key", 100)
-                .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
-                .with(
-                    "quarkus.oidc.auth-server-url",
-                    "https://issuer.example/realms/app",
-                )
-                .with("quarkus.oidc.token.audience", "orders-api"),
+                .with("oidc.public-key", PUBLIC_RSA_KEY)
+                .with("oidc.auth-server-url", "https://issuer.example/realms/app")
+                .with("oidc.token.audience", "orders-api"),
         )
         .build();
     let token = jwt_rs256(TestClaims {
@@ -1541,12 +1481,9 @@ async fn oidc_discover_from_config_builds_public_key_validator() {
     let config = Config::builder()
         .add_source(
             MapSource::new("public-key-discovery", 100)
-                .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
-                .with(
-                    "quarkus.oidc.auth-server-url",
-                    "https://issuer.example/realms/app",
-                )
-                .with("quarkus.oidc.token.audience", "orders-api"),
+                .with("oidc.public-key", PUBLIC_RSA_KEY)
+                .with("oidc.auth-server-url", "https://issuer.example/realms/app")
+                .with("oidc.token.audience", "orders-api"),
         )
         .build();
     let token = jwt_rs256(TestClaims {
@@ -1626,8 +1563,7 @@ async fn oidc_from_config_applies_http_authorization() {
 fn oidc_from_config_rejects_invalid_public_key() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("public-key", 100)
-                .with("quarkus.oidc.public-key", "not a pem public key"),
+            MapSource::new("public-key", 100).with("oidc.public-key", "not a pem public key"),
         )
         .build();
 
@@ -1637,7 +1573,7 @@ fn oidc_from_config_rejects_invalid_public_key() {
     assert!(matches!(
         error,
         mp_config::ConfigError::Conversion { name, .. }
-            if name == "quarkus.oidc.public-key"
+            if name == "oidc.public-key"
     ));
 }
 
@@ -1646,8 +1582,8 @@ fn oidc_from_config_ignores_public_key_when_disabled() {
     let config = Config::builder()
         .add_source(
             MapSource::new("disabled-public-key", 100)
-                .with("quarkus.oidc.enabled", "false")
-                .with("quarkus.oidc.public-key", "not a pem public key"),
+                .with("oidc.enabled", "false")
+                .with("oidc.public-key", "not a pem public key"),
         )
         .build();
 
@@ -1659,8 +1595,8 @@ fn oidc_from_config_rejects_id_token_roles_source() {
     let config = Config::builder()
         .add_source(
             MapSource::new("idtoken-roles", 100)
-                .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
-                .with("quarkus.oidc.roles.source", "idtoken"),
+                .with("oidc.public-key", PUBLIC_RSA_KEY)
+                .with("oidc.roles.source", "idtoken"),
         )
         .build();
 
@@ -1670,7 +1606,7 @@ fn oidc_from_config_rejects_id_token_roles_source() {
     assert!(matches!(
         error,
         mp_config::ConfigError::Conversion { ref name, .. }
-            if name == "quarkus.oidc.roles.source"
+            if name == "oidc.roles.source"
     ));
     assert!(
         error
@@ -1685,8 +1621,8 @@ fn oidc_from_config_accepts_web_app_application_type() {
     let config = Config::builder()
         .add_source(
             MapSource::new("web-app", 100)
-                .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
-                .with("quarkus.oidc.application-type", "web-app"),
+                .with("oidc.public-key", PUBLIC_RSA_KEY)
+                .with("oidc.application-type", "web-app"),
         )
         .build();
 
@@ -1879,8 +1815,7 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
 fn oidc_from_config_rejects_token_binding_certificate() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("token-binding", 100)
-                .with("quarkus.oidc.token.binding.certificate", "true"),
+            MapSource::new("token-binding", 100).with("oidc.token.binding.certificate", "true"),
         )
         .build();
 
@@ -1890,7 +1825,7 @@ fn oidc_from_config_rejects_token_binding_certificate() {
     assert!(matches!(
         error,
         mp_config::ConfigError::Conversion { ref name, .. }
-            if name == "quarkus.oidc.token.binding.certificate"
+            if name == "oidc.token.binding.certificate"
     ));
     assert!(
         error
@@ -1905,7 +1840,7 @@ fn oidc_from_config_rejects_decrypt_access_token() {
     let config = Config::builder()
         .add_source(
             MapSource::new("decrypt-access-token", 100)
-                .with("quarkus.oidc.token.decrypt-access-token", "true"),
+                .with("oidc.token.decrypt-access-token", "true"),
         )
         .build();
 
@@ -1915,7 +1850,7 @@ fn oidc_from_config_rejects_decrypt_access_token() {
     assert!(matches!(
         error,
         mp_config::ConfigError::Conversion { ref name, .. }
-            if name == "quarkus.oidc.token.decrypt-access-token"
+            if name == "oidc.token.decrypt-access-token"
     ));
     assert!(
         error
@@ -1929,8 +1864,7 @@ fn oidc_from_config_rejects_decrypt_access_token() {
 fn oidc_from_config_rejects_decrypt_id_token() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("decrypt-id-token", 100)
-                .with("quarkus.oidc.token.decrypt-id-token", "true"),
+            MapSource::new("decrypt-id-token", 100).with("oidc.token.decrypt-id-token", "true"),
         )
         .build();
 
@@ -1940,7 +1874,7 @@ fn oidc_from_config_rejects_decrypt_id_token() {
     assert!(matches!(
         error,
         mp_config::ConfigError::Conversion { ref name, .. }
-            if name == "quarkus.oidc.token.decrypt-id-token"
+            if name == "oidc.token.decrypt-id-token"
     ));
     assert!(
         error
@@ -1955,8 +1889,8 @@ fn oidc_from_config_accepts_hybrid_application_type() {
     let config = Config::builder()
         .add_source(
             MapSource::new("hybrid", 100)
-                .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
-                .with("quarkus.oidc.application-type", "hybrid"),
+                .with("oidc.public-key", PUBLIC_RSA_KEY)
+                .with("oidc.application-type", "hybrid"),
         )
         .build();
 
@@ -2725,9 +2659,7 @@ async fn jwt_validator_rejects_unexpected_signature_algorithm() {
 #[test]
 fn config_rejects_unknown_signature_algorithm() {
     let config = Config::builder()
-        .add_source(
-            MapSource::new("test", 100).with("quarkus.oidc.token.signature-algorithm", "hs256"),
-        )
+        .add_source(MapSource::new("test", 100).with("oidc.token.signature-algorithm", "hs256"))
         .build();
 
     let error = OidcConfig::from_config(&config).expect_err("config should reject hs256");
@@ -2858,13 +2790,10 @@ async fn jwt_validator_loads_quoted_nested_required_claims_from_config() {
     let config = Config::builder()
         .add_source(
             MapSource::new("quoted-required-claims", 100)
+                .with("oidc.auth-server-url", "https://issuer.example/realms/app")
+                .with("oidc.token.audience", "orders-api")
                 .with(
-                    "quarkus.oidc.auth-server-url",
-                    "https://issuer.example/realms/app",
-                )
-                .with("quarkus.oidc.token.audience", "orders-api")
-                .with(
-                    "quarkus.oidc.token.required-claims.\"resource_access.orders.roles\"",
+                    "oidc.token.required-claims.\"resource_access.orders.roles\"",
                     "orders-admin",
                 ),
         )
@@ -2899,13 +2828,10 @@ async fn jwt_validator_loads_slash_separated_required_claims_from_config() {
     let config = Config::builder()
         .add_source(
             MapSource::new("slash-required-claims", 100)
+                .with("oidc.auth-server-url", "https://issuer.example/realms/app")
+                .with("oidc.token.audience", "orders-api")
                 .with(
-                    "quarkus.oidc.auth-server-url",
-                    "https://issuer.example/realms/app",
-                )
-                .with("quarkus.oidc.token.audience", "orders-api")
-                .with(
-                    "quarkus.oidc.token.required-claims.\"resource_access/orders/roles\"",
+                    "oidc.token.required-claims.\"resource_access/orders/roles\"",
                     "orders-admin",
                 ),
         )
@@ -2940,7 +2866,7 @@ fn config_rejects_empty_required_claim_values() {
     let config = Config::builder()
         .add_source(
             MapSource::new("empty-required-claims", 100)
-                .with("quarkus.oidc.token.required-claims.scope", " , "),
+                .with("oidc.token.required-claims.scope", " , "),
         )
         .build();
 
@@ -2950,7 +2876,7 @@ fn config_rejects_empty_required_claim_values() {
     assert!(
         error
             .to_string()
-            .contains("quarkus.oidc.token.required-claims.scope"),
+            .contains("oidc.token.required-claims.scope"),
         "{error}"
     );
     assert!(
@@ -2964,18 +2890,13 @@ fn config_rejects_empty_required_claim_values() {
 #[test]
 fn config_rejects_empty_token_audience() {
     let config = Config::builder()
-        .add_source(
-            MapSource::new("empty-token-audience", 100).with("quarkus.oidc.token.audience", " , "),
-        )
+        .add_source(MapSource::new("empty-token-audience", 100).with("oidc.token.audience", " , "))
         .build();
 
     let error =
         OidcConfig::from_config(&config).expect_err("empty token audience should be rejected");
 
-    assert!(
-        error.to_string().contains("quarkus.oidc.token.audience"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("oidc.token.audience"), "{error}");
     assert!(
         error
             .to_string()
@@ -2987,15 +2908,13 @@ fn config_rejects_empty_token_audience() {
 #[test]
 fn config_rejects_empty_token_type() {
     let config = Config::builder()
-        .add_source(
-            MapSource::new("empty-token-type", 100).with("quarkus.oidc.token.token-type", " "),
-        )
+        .add_source(MapSource::new("empty-token-type", 100).with("oidc.token.token-type", " "))
         .build();
 
     let error = OidcConfig::from_config(&config).expect_err("empty token type should be rejected");
 
     assert!(
-        error.to_string().contains("quarkus.oidc.token.token-type"),
+        error.to_string().contains("oidc.token.token-type"),
         "{error}"
     );
     assert!(
@@ -3010,8 +2929,7 @@ fn config_rejects_empty_token_type() {
 fn config_rejects_empty_principal_claim() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("empty-principal-claim", 100)
-                .with("quarkus.oidc.token.principal-claim", " "),
+            MapSource::new("empty-principal-claim", 100).with("oidc.token.principal-claim", " "),
         )
         .build();
 
@@ -3019,9 +2937,7 @@ fn config_rejects_empty_principal_claim() {
         OidcConfig::from_config(&config).expect_err("empty principal claim should be rejected");
 
     assert!(
-        error
-            .to_string()
-            .contains("quarkus.oidc.token.principal-claim"),
+        error.to_string().contains("oidc.token.principal-claim"),
         "{error}"
     );
     assert!(
@@ -3918,15 +3834,15 @@ fn tenants_load_named_tenant_paths_from_config() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenants", 100)
-                .with("quarkus.oidc.tenant-paths", "/api/default")
-                .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
-                .with("quarkus.oidc.tenant-a.provider", "google")
-                .with("quarkus.oidc.tenant-a.connection-timeout", "3s")
-                .with("quarkus.oidc.tenant-a.client-id", "tenant-a-client")
-                .with("quarkus.oidc.tenant-a.client-name", "Tenant A")
-                .with("quarkus.oidc.tenant-a.tenant-id", "orders")
-                .with("quarkus.oidc.tenant-b.tenant-enabled", "false")
-                .with("quarkus.oidc.tenant-b.tenant-paths", "/api/b/*"),
+                .with("oidc.tenant-paths", "/api/default")
+                .with("oidc.tenant-a.tenant-paths", "/api/a/*")
+                .with("oidc.tenant-a.provider", "google")
+                .with("oidc.tenant-a.connection-timeout", "3s")
+                .with("oidc.tenant-a.client-id", "tenant-a-client")
+                .with("oidc.tenant-a.client-name", "Tenant A")
+                .with("oidc.tenant-a.tenant-id", "orders")
+                .with("oidc.tenant-b.tenant-enabled", "false")
+                .with("oidc.tenant-b.tenant-paths", "/api/b/*"),
         )
         .build();
 
@@ -3935,7 +3851,7 @@ fn tenants_load_named_tenant_paths_from_config() {
         vec!["tenant-a".to_owned(), "tenant-b".to_owned()]
     );
 
-    let tenant_a = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a").unwrap();
+    let tenant_a = OidcConfig::from_config_prefix(&config, "oidc.tenant-a").unwrap();
     assert_eq!(tenant_a.tenant_paths, Some("/api/a/*".to_owned()));
     assert_eq!(tenant_a.provider, Some(WellKnownProvider::Google));
     assert_eq!(tenant_a.connection_timeout, Duration::from_secs(3));
@@ -3948,8 +3864,7 @@ fn tenants_load_named_tenant_paths_from_config() {
 fn tenants_from_config_rejects_empty_named_tenant_paths() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("empty-tenant-paths", 100)
-                .with("quarkus.oidc.tenant-a.tenant-paths", " , "),
+            MapSource::new("empty-tenant-paths", 100).with("oidc.tenant-a.tenant-paths", " , "),
         )
         .build();
 
@@ -3958,9 +3873,7 @@ fn tenants_from_config_rejects_empty_named_tenant_paths() {
     };
 
     assert!(
-        error
-            .to_string()
-            .contains("quarkus.oidc.tenant-a.tenant-paths"),
+        error.to_string().contains("oidc.tenant-a.tenant-paths"),
         "{error}"
     );
     assert!(
@@ -3976,16 +3889,10 @@ fn tenants_load_quoted_named_tenant_config() {
     let config = Config::builder()
         .add_source(
             MapSource::new("quoted-tenants", 100)
+                .with(r#"oidc."tenant.with.dot".tenant-paths"#, "/api/quoted/*")
+                .with(r#"oidc."tenant.with.dot".client-id"#, "quoted-client")
                 .with(
-                    r#"quarkus.oidc."tenant.with.dot".tenant-paths"#,
-                    "/api/quoted/*",
-                )
-                .with(
-                    r#"quarkus.oidc."tenant.with.dot".client-id"#,
-                    "quoted-client",
-                )
-                .with(
-                    r#"quarkus.oidc."tenant.with.dot".roles.role-claim-path"#,
+                    r#"oidc."tenant.with.dot".roles.role-claim-path"#,
                     "permissions",
                 ),
         )
@@ -3996,8 +3903,7 @@ fn tenants_load_quoted_named_tenant_config() {
         vec!["tenant.with.dot".to_owned()]
     );
 
-    let tenant =
-        OidcConfig::from_config_prefix(&config, r#"quarkus.oidc."tenant.with.dot""#).unwrap();
+    let tenant = OidcConfig::from_config_prefix(&config, r#"oidc."tenant.with.dot""#).unwrap();
     assert_eq!(tenant.tenant_paths, Some("/api/quoted/*".to_owned()));
     assert_eq!(tenant.client_id, Some("quoted-client".to_owned()));
     assert_eq!(tenant.roles.role_claim_path, "permissions");
@@ -4012,8 +3918,8 @@ fn tenants_from_config_rejects_named_id_token_roles_source() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-idtoken-roles", 100)
-                .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
-                .with("quarkus.oidc.tenant-a.roles.source", "idtoken"),
+                .with("oidc.tenant-a.tenant-paths", "/api/a/*")
+                .with("oidc.tenant-a.roles.source", "idtoken"),
         )
         .build();
 
@@ -4023,7 +3929,7 @@ fn tenants_from_config_rejects_named_id_token_roles_source() {
     assert!(matches!(
         error,
         mp_config::ConfigError::Conversion { ref name, .. }
-            if name == "quarkus.oidc.tenant-a.roles.source"
+            if name == "oidc.tenant-a.roles.source"
     ));
     assert!(
         error
@@ -4038,8 +3944,8 @@ fn tenants_from_config_rejects_named_empty_role_claim_path() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-empty-role-claim-path", 100)
-                .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
-                .with("quarkus.oidc.tenant-a.roles.role-claim-path", " , "),
+                .with("oidc.tenant-a.tenant-paths", "/api/a/*")
+                .with("oidc.tenant-a.roles.role-claim-path", " , "),
         )
         .build();
 
@@ -4049,7 +3955,7 @@ fn tenants_from_config_rejects_named_empty_role_claim_path() {
     assert!(
         error
             .to_string()
-            .contains("quarkus.oidc.tenant-a.roles.role-claim-path"),
+            .contains("oidc.tenant-a.roles.role-claim-path"),
         "{error}"
     );
     assert!(
@@ -4065,8 +3971,8 @@ fn tenants_from_config_accepts_named_web_app_application_type() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-web-app", 100)
-                .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
-                .with("quarkus.oidc.tenant-a.application-type", "web-app"),
+                .with("oidc.tenant-a.tenant-paths", "/api/a/*")
+                .with("oidc.tenant-a.application-type", "web-app"),
         )
         .build();
 
@@ -4078,8 +3984,8 @@ fn tenants_from_config_rejects_named_token_binding_certificate() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-token-binding", 100)
-                .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
-                .with("quarkus.oidc.tenant-a.token.binding.certificate", "true"),
+                .with("oidc.tenant-a.tenant-paths", "/api/a/*")
+                .with("oidc.tenant-a.token.binding.certificate", "true"),
         )
         .build();
 
@@ -4089,7 +3995,7 @@ fn tenants_from_config_rejects_named_token_binding_certificate() {
     assert!(matches!(
         error,
         mp_config::ConfigError::Conversion { ref name, .. }
-            if name == "quarkus.oidc.tenant-a.token.binding.certificate"
+            if name == "oidc.tenant-a.token.binding.certificate"
     ));
     assert!(
         error
@@ -4104,8 +4010,8 @@ fn tenants_from_config_rejects_named_decrypt_access_token() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-decrypt-access-token", 100)
-                .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
-                .with("quarkus.oidc.tenant-a.token.decrypt-access-token", "true"),
+                .with("oidc.tenant-a.tenant-paths", "/api/a/*")
+                .with("oidc.tenant-a.token.decrypt-access-token", "true"),
         )
         .build();
 
@@ -4115,7 +4021,7 @@ fn tenants_from_config_rejects_named_decrypt_access_token() {
     assert!(matches!(
         error,
         mp_config::ConfigError::Conversion { ref name, .. }
-            if name == "quarkus.oidc.tenant-a.token.decrypt-access-token"
+            if name == "oidc.tenant-a.token.decrypt-access-token"
     ));
     assert!(
         error
@@ -4130,17 +4036,14 @@ fn tenants_detect_named_tenant_credentials_config() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-credentials", 100)
-                .with("quarkus.oidc.tenant-a.credentials.secret", "tenant-secret")
-                .with(
-                    "quarkus.oidc.tenant-a.credentials.client-secret.method",
-                    "post",
-                ),
+                .with("oidc.tenant-a.credentials.secret", "tenant-secret")
+                .with("oidc.tenant-a.credentials.client-secret.method", "post"),
         )
         .build();
 
     assert_eq!(named_tenant_names(&config), vec!["tenant-a".to_owned()]);
 
-    let tenant = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a")
+    let tenant = OidcConfig::from_config_prefix(&config, "oidc.tenant-a")
         .expect("tenant credentials should load");
     assert_eq!(
         tenant.credentials,
@@ -4159,12 +4062,9 @@ fn tenants_detect_named_tenant_introspection_credentials_config() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-introspection-credentials", 100)
+                .with("oidc.tenant-a.introspection-credentials.name", "introspect")
                 .with(
-                    "quarkus.oidc.tenant-a.introspection-credentials.name",
-                    "introspect",
-                )
-                .with(
-                    "quarkus.oidc.tenant-a.introspection-credentials.secret",
+                    "oidc.tenant-a.introspection-credentials.secret",
                     "introspect-secret",
                 ),
         )
@@ -4172,7 +4072,7 @@ fn tenants_detect_named_tenant_introspection_credentials_config() {
 
     assert_eq!(named_tenant_names(&config), vec!["tenant-a".to_owned()]);
 
-    let tenant = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a")
+    let tenant = OidcConfig::from_config_prefix(&config, "oidc.tenant-a")
         .expect("tenant introspection credentials should load");
     assert_eq!(
         tenant.introspection_credentials,
@@ -4188,8 +4088,7 @@ fn tenants_detect_named_tenant_introspection_credentials_config() {
 fn tenants_detect_default_tenant_roles_config() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("tenant-roles", 100)
-                .with("quarkus.oidc.roles.role-claim-path", "permissions"),
+            MapSource::new("tenant-roles", 100).with("oidc.roles.role-claim-path", "permissions"),
         )
         .build();
 
@@ -4204,13 +4103,34 @@ fn tenants_detect_default_tenant_roles_config() {
 }
 
 #[test]
+fn tenants_detect_default_tenant_authentication_config() {
+    let config = Config::builder()
+        .add_source(
+            MapSource::new("tenant-authentication", 100)
+                .with("oidc.authentication.redirect-path", "/login/callback"),
+        )
+        .build();
+
+    let tenants = Tenants::from_config(&config)
+        .expect("default tenant authentication config should load")
+        .build();
+    let default_tenant = tenants
+        .default_tenant
+        .expect("authentication config should create default tenant");
+
+    assert_eq!(
+        default_tenant.config.authentication.redirect_path,
+        "/login/callback"
+    );
+    assert!(named_tenant_names(&config).is_empty());
+}
+
+#[test]
 fn tenants_detect_default_tenant_introspection_credentials_config() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("tenant-introspection-credentials", 100).with(
-                "quarkus.oidc.introspection-credentials.secret",
-                "introspect-secret",
-            ),
+            MapSource::new("tenant-introspection-credentials", 100)
+                .with("oidc.introspection-credentials.secret", "introspect-secret"),
         )
         .build();
 
@@ -4236,8 +4156,8 @@ fn tenants_load_tenant_id_header_from_config() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-header", 100)
-                .with("quarkus.oidc.tenant-id-header", "x-oidc-tenant")
-                .with("quarkus.oidc.tenant-a.tenant-id", "orders"),
+                .with("oidc.tenant-id-header", "x-oidc-tenant")
+                .with("oidc.tenant-a.tenant-id", "orders"),
         )
         .build();
 
@@ -4255,8 +4175,7 @@ fn tenants_load_tenant_id_header_from_config() {
 fn tenants_reject_invalid_tenant_id_header_from_config() {
     let config = Config::builder()
         .add_source(
-            MapSource::new("tenant-header", 100)
-                .with("quarkus.oidc.tenant-id-header", "not a header"),
+            MapSource::new("tenant-header", 100).with("oidc.tenant-id-header", "not a header"),
         )
         .build();
 
@@ -4268,7 +4187,7 @@ fn tenants_reject_invalid_tenant_id_header_from_config() {
     assert!(matches!(
         error,
         mp_config::ConfigError::Conversion { name, .. }
-            if name == "quarkus.oidc.tenant-id-header"
+            if name == "oidc.tenant-id-header"
     ));
 }
 
@@ -4277,7 +4196,7 @@ async fn tenants_from_config_apply_http_authorization() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-authz", 100)
-                .with("quarkus.oidc.tenant-a.tenant-paths", "/tenant-a/*")
+                .with("oidc.tenant-a.tenant-paths", "/tenant-a/*")
                 .with(
                     "quarkus.http.auth.permission.public.paths",
                     "/tenant-a/public",
@@ -4319,12 +4238,12 @@ async fn tenants_discover_from_config_builds_named_public_key_tenant() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-public-key-discovery", 100)
-                .with("quarkus.oidc.tenant-a.public-key", PUBLIC_RSA_KEY)
+                .with("oidc.tenant-a.public-key", PUBLIC_RSA_KEY)
                 .with(
-                    "quarkus.oidc.tenant-a.auth-server-url",
+                    "oidc.tenant-a.auth-server-url",
                     "https://issuer.example/realms/app",
                 )
-                .with("quarkus.oidc.tenant-a.token.audience", "orders-api"),
+                .with("oidc.tenant-a.token.audience", "orders-api"),
         )
         .build();
     let token = jwt_rs256(TestClaims {

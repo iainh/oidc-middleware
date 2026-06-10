@@ -84,7 +84,7 @@ impl JwtValidator {
         }
     }
 
-    /// Builds a JWT validator backed by `quarkus.oidc.public-key`.
+    /// Builds a JWT validator backed by `oidc.public-key`.
     pub fn public_key(public_key: &str, config: &OidcConfig) -> BuildResult<Self> {
         let mut validation = Validation::new(public_key_algorithm(config));
         apply_validation_config(&mut validation, config);

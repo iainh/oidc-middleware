@@ -66,32 +66,33 @@ pub(crate) fn config_map_entry_name(name: &str) -> Option<String> {
 
 pub(crate) fn has_default_tenant_config(config: &Config) -> bool {
     config.property_names().into_iter().any(|key| {
-        key == "quarkus.oidc.enabled"
-            || key == "quarkus.oidc.tenant-enabled"
-            || key == "quarkus.oidc.auth-server-url"
-            || key == "quarkus.oidc.provider"
-            || key == "quarkus.oidc.connection-timeout"
-            || key == "quarkus.oidc.discovery-enabled"
-            || key == "quarkus.oidc.discovery-path"
-            || key == "quarkus.oidc.jwks-path"
-            || key == "quarkus.oidc.authorization-path"
-            || key == "quarkus.oidc.token-path"
-            || key == "quarkus.oidc.registration-path"
-            || key == "quarkus.oidc.revoke-path"
-            || key == "quarkus.oidc.introspection-path"
-            || key == "quarkus.oidc.user-info-path"
-            || key == "quarkus.oidc.end-session-path"
-            || key == "quarkus.oidc.client-id"
-            || key == "quarkus.oidc.client-name"
-            || key == "quarkus.oidc.tenant-id"
-            || key == "quarkus.oidc.tenant-id-header"
-            || key == "quarkus.oidc.tenant-paths"
-            || key == "quarkus.oidc.public-key"
-            || key == "quarkus.oidc.application-type"
-            || key.starts_with("quarkus.oidc.credentials.")
-            || key.starts_with("quarkus.oidc.introspection-credentials.")
-            || key.starts_with("quarkus.oidc.token.")
-            || key.starts_with("quarkus.oidc.roles.")
+        key == "oidc.enabled"
+            || key == "oidc.tenant-enabled"
+            || key == "oidc.auth-server-url"
+            || key == "oidc.provider"
+            || key == "oidc.connection-timeout"
+            || key == "oidc.discovery-enabled"
+            || key == "oidc.discovery-path"
+            || key == "oidc.jwks-path"
+            || key == "oidc.authorization-path"
+            || key == "oidc.token-path"
+            || key == "oidc.registration-path"
+            || key == "oidc.revoke-path"
+            || key == "oidc.introspection-path"
+            || key == "oidc.user-info-path"
+            || key == "oidc.end-session-path"
+            || key == "oidc.client-id"
+            || key == "oidc.client-name"
+            || key == "oidc.tenant-id"
+            || key == "oidc.tenant-id-header"
+            || key == "oidc.tenant-paths"
+            || key == "oidc.public-key"
+            || key == "oidc.application-type"
+            || key.starts_with("oidc.authentication.")
+            || key.starts_with("oidc.credentials.")
+            || key.starts_with("oidc.introspection-credentials.")
+            || key.starts_with("oidc.token.")
+            || key.starts_with("oidc.roles.")
     })
 }
 
@@ -112,7 +113,7 @@ pub(crate) struct NamedTenantConfig {
 pub(crate) fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
     let mut names = BTreeSet::new();
     for key in config.property_names() {
-        let Some(rest) = key.strip_prefix("quarkus.oidc.") else {
+        let Some(rest) = key.strip_prefix("oidc.") else {
             continue;
         };
         let Some((name, prefix_segment, property)) = named_tenant_key_parts(rest) else {
@@ -141,13 +142,14 @@ pub(crate) fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
                 | "tenant-paths"
                 | "public-key"
                 | "application-type"
-        ) || property.starts_with("token.")
+        ) || property.starts_with("authentication.")
+            || property.starts_with("token.")
             || property.starts_with("credentials.")
             || property.starts_with("introspection-credentials.")
             || property.starts_with("roles.");
         if !matches!(
             name.as_str(),
-            "credentials" | "introspection-credentials" | "token" | "roles"
+            "authentication" | "credentials" | "introspection-credentials" | "token" | "roles"
         ) && tenant_property
         {
             names.insert(NamedTenantConfig {

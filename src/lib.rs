@@ -28,19 +28,19 @@
 //!
 //! ## MicroProfile and Quarkus mapping
 //!
-//! Quarkus OIDC is configured under `quarkus.oidc.*`. This crate follows that
+//! Quarkus OIDC is configured under `oidc.*`. This crate follows that
 //! naming model through [`OidcConfig::from_config`], while keeping runtime
 //! behaviour explicit and testable:
 //!
-//! - `quarkus.oidc.auth-server-url` maps to [`OidcConfig::auth_server_url`].
-//! - `quarkus.oidc.provider` maps to [`OidcConfig::provider`].
-//! - `quarkus.oidc.client-id` maps to [`OidcConfig::client_id`].
-//! - `quarkus.oidc.application-type` maps to [`OidcConfig::application_type`].
-//! - `quarkus.oidc.authentication.*` configures browser redirects for
+//! - `oidc.auth-server-url` maps to [`OidcConfig::auth_server_url`].
+//! - `oidc.provider` maps to [`OidcConfig::provider`].
+//! - `oidc.client-id` maps to [`OidcConfig::client_id`].
+//! - `oidc.application-type` maps to [`OidcConfig::application_type`].
+//! - `oidc.authentication.*` configures browser redirects for
 //!   `web-app` applications. `web-app` middleware expects a
 //!   [`tower_sessions::Session`] extension supplied by `tower-sessions`.
-//! - `quarkus.oidc.enabled=false` disables authentication for the layer.
-//! - `quarkus.oidc.tenant-enabled=false` rejects requests as tenant-disabled.
+//! - `oidc.enabled=false` disables authentication for the layer.
+//! - `oidc.tenant-enabled=false` rejects requests as tenant-disabled.
 
 pub use oidc_middleware_macros::{authenticated, roles_allowed};
 

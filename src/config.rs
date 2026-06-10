@@ -10,7 +10,7 @@ const DEFAULT_ROLE_CLAIM_PATH: &str = "groups,realm_access.roles";
 
 /// OIDC configuration loaded from the MicroProfile-style config model.
 #[derive(Clone, Debug, ConfigProperties, Eq, PartialEq)]
-#[config(prefix = "quarkus.oidc", rename_all = "kebab-case")]
+#[config(prefix = "oidc", rename_all = "kebab-case")]
 pub struct OidcConfig {
     /// Enables or disables the OIDC middleware.
     #[config(default = "true")]
@@ -81,7 +81,7 @@ pub struct OidcConfig {
 }
 
 impl OidcConfig {
-    /// Loads `quarkus.oidc.*` properties from an [`mp_config::Config`].
+    /// Loads `oidc.*` properties from an [`mp_config::Config`].
     pub fn from_config(config: &Config) -> mp_config::Result<Self> {
         <Self as ConfigProperties>::from_config(config)
     }
@@ -121,7 +121,7 @@ impl Default for OidcConfig {
     }
 }
 
-/// Browser authentication settings loaded from `quarkus.oidc.authentication.*`.
+/// Browser authentication settings loaded from `oidc.authentication.*`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcAuthenticationConfig {
     /// Redirect URI path or absolute URI used for authorization-code callbacks.
@@ -189,7 +189,7 @@ impl ConfigProperties for OidcAuthenticationConfig {
     }
 }
 
-/// Client credential configuration loaded from `quarkus.oidc.credentials.*`.
+/// Client credential configuration loaded from `oidc.credentials.*`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OidcCredentialsConfig {
     /// Client secret used with `client-id` for provider authentication.
@@ -415,7 +415,7 @@ impl ConfigProperties for OidcIntrospectionCredentialsConfig {
     }
 }
 
-/// Token validation configuration loaded from `quarkus.oidc.token.*`.
+/// Token validation configuration loaded from `oidc.token.*`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcTokenConfig {
     /// Expected token issuer. Defaults to `auth-server-url` when unset.
@@ -493,7 +493,7 @@ impl Default for OidcTokenConfig {
     }
 }
 
-/// Token binding validation configuration loaded from `quarkus.oidc.token.binding.*`.
+/// Token binding validation configuration loaded from `oidc.token.binding.*`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OidcTokenBindingConfig {
     /// Require an access-token `cnf` claim matching the client certificate.
@@ -648,7 +648,7 @@ impl mp_config::FromConfigValue for RolesSource {
     }
 }
 
-/// Role extraction configuration loaded from `quarkus.oidc.roles.*`.
+/// Role extraction configuration loaded from `oidc.roles.*`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcRolesConfig {
     /// Token or response source used to extract roles.
