@@ -199,14 +199,36 @@ impl Default for OidcConfig {
 }
 
 /// Client credential configuration loaded from `quarkus.oidc.credentials.*`.
-#[derive(Clone, Debug, ConfigProperties, Default, Eq, PartialEq)]
-#[config(rename_all = "kebab-case")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OidcCredentialsConfig {
     /// Client secret used with `client-id` for provider authentication.
     pub secret: Option<String>,
     /// Client-secret authentication method.
-    #[config(nested)]
     pub client_secret: OidcClientSecretConfig,
+}
+
+impl ConfigProperties for OidcCredentialsConfig {
+    fn from_config(config: &Config) -> mp_config::Result<Self> {
+        Self::from_config_prefix(config, "")
+    }
+
+    fn from_config_prefix(config: &Config, prefix: &str) -> mp_config::Result<Self> {
+        let key = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+
+        Ok(Self {
+            secret: load_optional_non_empty_string(config, &key("secret"))?,
+            client_secret: OidcClientSecretConfig::from_config_prefix(
+                config,
+                &key("client-secret"),
+            )?,
+        })
+    }
 }
 
 impl OidcCredentialsConfig {
@@ -218,14 +240,33 @@ impl OidcCredentialsConfig {
 }
 
 /// Client-secret authentication settings.
-#[derive(Clone, Debug, ConfigProperties, Default, Eq, PartialEq)]
-#[config(rename_all = "kebab-case")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OidcClientSecretConfig {
     /// Client secret value used when `credentials.secret` is not configured.
     pub value: Option<String>,
     /// How the client secret is sent to the provider.
-    #[config(default)]
     pub method: ClientSecretMethod,
+}
+
+impl ConfigProperties for OidcClientSecretConfig {
+    fn from_config(config: &Config) -> mp_config::Result<Self> {
+        Self::from_config_prefix(config, "")
+    }
+
+    fn from_config_prefix(config: &Config, prefix: &str) -> mp_config::Result<Self> {
+        let key = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+
+        Ok(Self {
+            value: load_optional_non_empty_string(config, &key("value"))?,
+            method: config.get_optional(&key("method"))?.unwrap_or_default(),
+        })
+    }
 }
 
 /// Client-secret authentication method.
@@ -311,15 +352,13 @@ impl mp_config::FromConfigValue for WellKnownProvider {
 }
 
 /// Introspection endpoint-specific credentials.
-#[derive(Clone, Debug, ConfigProperties, Eq, PartialEq)]
-#[config(rename_all = "kebab-case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcIntrospectionCredentialsConfig {
     /// User name used for introspection endpoint Basic authentication.
     pub name: Option<String>,
     /// Secret used for introspection endpoint Basic authentication.
     pub secret: Option<String>,
     /// Include the configured OIDC client id in the introspection form body.
-    #[config(default = "true")]
     pub include_client_id: bool,
 }
 
@@ -330,6 +369,30 @@ impl Default for OidcIntrospectionCredentialsConfig {
             secret: None,
             include_client_id: true,
         }
+    }
+}
+
+impl ConfigProperties for OidcIntrospectionCredentialsConfig {
+    fn from_config(config: &Config) -> mp_config::Result<Self> {
+        Self::from_config_prefix(config, "")
+    }
+
+    fn from_config_prefix(config: &Config, prefix: &str) -> mp_config::Result<Self> {
+        let key = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+
+        Ok(Self {
+            name: load_optional_non_empty_string(config, &key("name"))?,
+            secret: load_optional_non_empty_string(config, &key("secret"))?,
+            include_client_id: config
+                .get_optional(&key("include-client-id"))?
+                .unwrap_or(true),
+        })
     }
 }
 
@@ -4467,6 +4530,58 @@ dQIDAQAB
     }
 
     #[test]
+    fn config_rejects_empty_credentials_secret() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-credentials-secret", 100)
+                    .with("quarkus.oidc.credentials.secret", " "),
+            )
+            .build();
+
+        let error = OidcConfig::from_config(&config)
+            .expect_err("empty credentials secret should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.oidc.credentials.secret"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("value must not be empty when configured"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_empty_client_secret_value() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-client-secret-value", 100)
+                    .with("quarkus.oidc.credentials.client-secret.value", " "),
+            )
+            .build();
+
+        let error = OidcConfig::from_config(&config)
+            .expect_err("empty client secret value should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.oidc.credentials.client-secret.value"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("value must not be empty when configured"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn config_loads_introspection_credentials() {
         let config = Config::builder()
             .add_source(
@@ -4492,6 +4607,58 @@ dQIDAQAB
                 secret: Some("introspect-secret".to_owned()),
                 include_client_id: false,
             }
+        );
+    }
+
+    #[test]
+    fn config_rejects_empty_introspection_credentials_name() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-introspection-name", 100)
+                    .with("quarkus.oidc.introspection-credentials.name", " "),
+            )
+            .build();
+
+        let error = OidcConfig::from_config(&config)
+            .expect_err("empty introspection credentials name should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.oidc.introspection-credentials.name"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("value must not be empty when configured"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_empty_introspection_credentials_secret() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-introspection-secret", 100)
+                    .with("quarkus.oidc.introspection-credentials.secret", " "),
+            )
+            .build();
+
+        let error = OidcConfig::from_config(&config)
+            .expect_err("empty introspection credentials secret should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.oidc.introspection-credentials.secret"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("value must not be empty when configured"),
+            "{error}"
         );
     }
 
