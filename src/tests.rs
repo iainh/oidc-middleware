@@ -1783,16 +1783,19 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
 
 #[tokio::test]
 async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
-    let token = jwt_with_kid(
+    let token = jwt_with_kid_and_secret(
         "test-key",
-        TestClaims {
-            sub: "alice",
-            iss: "https://issuer.example/realms/app",
-            aud: "orders-web",
-            exp: 4_102_444_800,
-            groups: Vec::new(),
-            realm_access: RealmAccessClaims { roles: Vec::new() },
-        },
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com",
+            "email_verified": true
+        }),
     );
     let token_endpoint = one_shot_token_endpoint("opaque-access-token".to_owned(), Some(token));
     let oidc = Oidc::builder(OidcConfig {
@@ -1823,8 +1826,15 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
     let app = Router::new()
         .route(
             "/protected",
-            get(|Extension(principal): Extension<Principal>| async move {
-                principal.subject().to_owned()
+            get(|session: OidcSession| async move {
+                format!(
+                    "{}:{}",
+                    session.principal().subject(),
+                    session
+                        .id_token()
+                        .and_then(IdToken::email)
+                        .unwrap_or("missing-email")
+                )
             }),
         )
         .layer(oidc.layer())
@@ -1886,7 +1896,7 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
         .await
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response_body(response).await, "alice");
+    assert_eq!(response_body(response).await, "alice:alice@example.com");
 }
 
 #[test]

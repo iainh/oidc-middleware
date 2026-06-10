@@ -1,6 +1,6 @@
 use crate::claims::extract_roles;
 use crate::validation_claims::{TokenClaims, principal_name};
-use crate::{Error, Result};
+use crate::{Error, IdToken, Result};
 use axum::extract::FromRequestParts;
 use http::request::Parts;
 use std::sync::Arc;
@@ -209,9 +209,10 @@ where
 /// context without conflating access-token authorization with future
 /// ID-token/profile data.
 #[cfg(feature = "web-app")]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OidcSession {
     principal: Principal,
+    id_token: Option<IdToken>,
 }
 
 #[cfg(feature = "web-app")]
@@ -219,6 +220,11 @@ impl OidcSession {
     /// Returns the normalized principal restored from the authenticated request.
     pub fn principal(&self) -> &Principal {
         &self.principal
+    }
+
+    /// Returns the validated ID token restored from the web-app session.
+    pub fn id_token(&self) -> Option<&IdToken> {
+        self.id_token.as_ref()
     }
 
     /// Consumes the session wrapper and returns the normalized principal.
@@ -249,7 +255,10 @@ where
             .extensions
             .get::<Principal>()
             .cloned()
-            .map(|principal| Self { principal })
+            .map(|principal| Self {
+                principal,
+                id_token: parts.extensions.get::<IdToken>().cloned(),
+            })
             .ok_or(Error::Forbidden)
     }
 }

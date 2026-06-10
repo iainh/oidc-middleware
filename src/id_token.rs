@@ -1,5 +1,5 @@
 use crate::claims::deserialize_audience;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -94,7 +94,7 @@ impl IdToken {
 /// Standard claims are modelled directly. Additional provider-specific claims
 /// are preserved in [`IdTokenClaims::extra`] so applications can map them into
 /// their own user types.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct IdTokenClaims {
     /// Subject identifier.
     #[serde(default)]

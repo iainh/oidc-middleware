@@ -221,13 +221,17 @@ impl Oidc {
         request: &mut Request<Body>,
         web_app: &WebApp,
     ) -> Result<WebAppPrincipal> {
-        if let Some(principal) = web_app.session_principal(request).await? {
+        if let Some(session) = web_app.session_context(request).await? {
             trace!(
                 path = %request.uri().path(),
-                groups = principal.groups().count(),
+                groups = session.principal.groups().count(),
+                has_id_token = session.id_token.is_some(),
                 "restored principal from web-app session"
             );
-            request.extensions_mut().insert(principal.clone());
+            request.extensions_mut().insert(session.principal);
+            if let Some(id_token) = session.id_token {
+                request.extensions_mut().insert(id_token);
+            }
             return Ok(WebAppPrincipal::Authenticated);
         }
 

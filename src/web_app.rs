@@ -1,5 +1,7 @@
 use crate::provider::provider_endpoint_url;
-use crate::{BuildError, Error, OidcConfig, Principal, Result, TokenValidator};
+use crate::{
+    BuildError, Error, IdToken, IdTokenClaims, OidcConfig, Principal, Result, TokenValidator,
+};
 use axum::body::Body;
 use axum::response::Response;
 use base64::Engine;
@@ -14,6 +16,7 @@ use tracing::{debug, trace};
 use url::form_urlencoded;
 
 const PRINCIPAL_KEY: &str = "oidc.principal";
+const ID_TOKEN_KEY: &str = "oidc.id-token";
 const STATE_KEY: &str = "oidc.state";
 const ORIGINAL_URI_KEY: &str = "oidc.original-uri";
 
@@ -105,24 +108,32 @@ impl WebApp {
         path_matches(&self.redirect_path, request.uri().path())
     }
 
-    pub(crate) async fn session_principal(
+    pub(crate) async fn session_context(
         &self,
         request: &mut Request<Body>,
-    ) -> Result<Option<Principal>> {
+    ) -> Result<Option<WebAppSession>> {
         let Some(session) = session(request) else {
             trace!(path = %request.uri().path(), "web-app request has no session extension");
             return Ok(None);
         };
-        let stored = session
+        let stored_principal = session
             .get::<StoredPrincipal>(PRINCIPAL_KEY)
+            .await
+            .map_err(session_error)?;
+        let stored_id_token = session
+            .get::<StoredIdToken>(ID_TOKEN_KEY)
             .await
             .map_err(session_error)?;
         trace!(
             path = %request.uri().path(),
-            has_principal = stored.is_some(),
+            has_principal = stored_principal.is_some(),
+            has_id_token = stored_id_token.is_some(),
             "checked web-app session for stored principal"
         );
-        Ok(stored.map(StoredPrincipal::into_principal))
+        Ok(stored_principal.map(|principal| WebAppSession {
+            principal: principal.into_principal(),
+            id_token: stored_id_token.map(StoredIdToken::into_id_token),
+        }))
     }
 
     pub(crate) async fn authorization_redirect(
@@ -206,15 +217,30 @@ impl WebApp {
             has_id_token = token_response.id_token.is_some(),
             "OIDC token endpoint returned callback tokens"
         );
-        let token = token_response
-            .id_token
-            .as_deref()
-            .unwrap_or(&token_response.access_token);
-        let principal = validator.validate(Arc::from(token.to_owned())).await?;
+        let validated_id_token = match token_response.id_token.as_deref() {
+            Some(raw) => Some(validate_id_token(raw, validator.clone()).await?),
+            None => None,
+        };
+        let principal = match validator
+            .validate(Arc::from(token_response.access_token.clone()))
+            .await
+        {
+            Ok(principal) => principal,
+            Err(error) => match &validated_id_token {
+                Some((_, principal)) => principal.clone(),
+                None => return Err(error),
+            },
+        };
         session
             .insert(PRINCIPAL_KEY, StoredPrincipal::from_principal(&principal))
             .await
             .map_err(session_error)?;
+        if let Some((id_token, _)) = &validated_id_token {
+            session
+                .insert(ID_TOKEN_KEY, StoredIdToken::from_id_token(id_token))
+                .await
+                .map_err(session_error)?;
+        }
 
         trace!(
             groups = principal.groups().count(),
@@ -281,6 +307,45 @@ impl WebApp {
         trace!(redirect_uri = %redirect_uri, "built OIDC redirect URI from request headers");
         Ok(redirect_uri)
     }
+}
+
+pub(crate) struct WebAppSession {
+    pub(crate) principal: Principal,
+    pub(crate) id_token: Option<IdToken>,
+}
+
+async fn validate_id_token(
+    token: &str,
+    validator: Arc<dyn TokenValidator>,
+) -> Result<(IdToken, Principal)> {
+    let principal = validator.validate(Arc::from(token.to_owned())).await?;
+    let claims = decode_id_token_claims(token)?;
+    Ok((IdToken::with_raw(claims, token), principal))
+}
+
+fn decode_id_token_claims(token: &str) -> Result<IdTokenClaims> {
+    let mut parts = token.split('.');
+    let Some(_header) = parts.next() else {
+        return Err(Error::TokenRejected("ID token is missing a header".into()));
+    };
+    let Some(payload) = parts.next() else {
+        return Err(Error::TokenRejected("ID token is missing a payload".into()));
+    };
+    if parts.next().is_none() {
+        return Err(Error::TokenRejected(
+            "ID token is missing a signature".into(),
+        ));
+    }
+    if parts.next().is_some() {
+        return Err(Error::TokenRejected(
+            "ID token has too many segments".into(),
+        ));
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|error| Error::TokenRejected(Box::new(error)))?;
+    serde_json::from_slice::<IdTokenClaims>(&decoded)
+        .map_err(|error| Error::TokenRejected(Box::new(error)))
 }
 
 fn endpoint(
@@ -366,6 +431,28 @@ struct StoredPrincipal {
     issuer: Option<String>,
     audience: Vec<String>,
     groups: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredIdToken {
+    claims: IdTokenClaims,
+    raw: Option<String>,
+}
+
+impl StoredIdToken {
+    fn from_id_token(id_token: &IdToken) -> Self {
+        Self {
+            claims: id_token.claims().clone(),
+            raw: id_token.raw().map(ToOwned::to_owned),
+        }
+    }
+
+    fn into_id_token(self) -> IdToken {
+        match self.raw {
+            Some(raw) => IdToken::with_raw(self.claims, raw),
+            None => IdToken::new(self.claims),
+        }
+    }
 }
 
 impl StoredPrincipal {
