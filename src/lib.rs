@@ -435,6 +435,12 @@ pub struct OidcTokenConfig {
     pub token_type: Option<String>,
     /// Required JWT signature algorithm.
     pub signature_algorithm: Option<TokenSignatureAlgorithm>,
+    /// Private key location used to decrypt encrypted JWT tokens.
+    pub decryption_key_location: Option<String>,
+    /// Decrypt encrypted ID tokens.
+    pub decrypt_id_token: Option<bool>,
+    /// Decrypt encrypted access tokens.
+    pub decrypt_access_token: bool,
     /// Require the token to include a `sub` claim.
     pub subject_required: bool,
     /// Require the token to include an `iat` claim.
@@ -475,6 +481,9 @@ impl Default for OidcTokenConfig {
             audience: None,
             token_type: None,
             signature_algorithm: None,
+            decryption_key_location: None,
+            decrypt_id_token: None,
+            decrypt_access_token: false,
             subject_required: false,
             issued_at_required: true,
             required_claims: HashMap::new(),
@@ -573,6 +582,14 @@ impl ConfigProperties for OidcTokenConfig {
             audience,
             token_type,
             signature_algorithm: config.get_optional(&key("signature-algorithm"))?,
+            decryption_key_location: load_optional_non_empty_string(
+                config,
+                &key("decryption-key-location"),
+            )?,
+            decrypt_id_token: config.get_optional(&key("decrypt-id-token"))?,
+            decrypt_access_token: config
+                .get_optional(&key("decrypt-access-token"))?
+                .unwrap_or_default(),
             subject_required: config
                 .get_optional(&key("subject-required"))?
                 .unwrap_or_default(),
@@ -2629,6 +2646,8 @@ impl Oidc {
             "quarkus.oidc.application-type",
             "quarkus.oidc.roles.source",
             "quarkus.oidc.token.binding.certificate",
+            "quarkus.oidc.token.decrypt-access-token",
+            "quarkus.oidc.token.decrypt-id-token",
         )?
         .authorization_from_config(config)
     }
@@ -2715,6 +2734,8 @@ fn oidc_builder_from_config(
     application_type_property: &str,
     roles_source_property: &str,
     token_binding_certificate_property: &str,
+    token_decrypt_access_token_property: &str,
+    token_decrypt_id_token_property: &str,
 ) -> mp_config::Result<OidcBuilder> {
     let public_key = config.public_key.clone();
     let mut builder = Oidc::builder(config);
@@ -2726,6 +2747,11 @@ fn oidc_builder_from_config(
     validate_service_token_binding_certificate(
         &builder.config,
         token_binding_certificate_property,
+    )?;
+    validate_service_token_decryption(
+        &builder.config,
+        token_decrypt_access_token_property,
+        token_decrypt_id_token_property,
     )?;
     if let Some(public_key) = public_key {
         builder = builder.public_key(&public_key).map_err(|error| {
@@ -2778,6 +2804,30 @@ fn validate_service_token_binding_certificate(
             message: "`token.binding.certificate` requires client certificate thumbprint extraction, which is not implemented for bearer-service middleware".to_owned(),
         });
     }
+    Ok(())
+}
+
+fn validate_service_token_decryption(
+    config: &OidcConfig,
+    decrypt_access_token_property: &str,
+    decrypt_id_token_property: &str,
+) -> mp_config::Result<()> {
+    if config.token.decrypt_access_token {
+        return Err(mp_config::ConfigError::Conversion {
+            name: decrypt_access_token_property.to_owned(),
+            value: "true".to_owned(),
+            message: "`token.decrypt-access-token` requires JWE access-token decryption, which is not implemented for bearer-service middleware".to_owned(),
+        });
+    }
+
+    if config.token.decrypt_id_token == Some(true) {
+        return Err(mp_config::ConfigError::Conversion {
+            name: decrypt_id_token_property.to_owned(),
+            value: "true".to_owned(),
+            message: "`token.decrypt-id-token` requires web-app ID token decryption, which is not implemented for bearer-service middleware".to_owned(),
+        });
+    }
+
     Ok(())
 }
 
@@ -3338,6 +3388,8 @@ impl Tenants {
                 "quarkus.oidc.application-type",
                 "quarkus.oidc.roles.source",
                 "quarkus.oidc.token.binding.certificate",
+                "quarkus.oidc.token.decrypt-access-token",
+                "quarkus.oidc.token.decrypt-id-token",
             )?
             .authorization_from_config(config)?
             .build();
@@ -3354,6 +3406,8 @@ impl Tenants {
                 &format!("{prefix}.application-type"),
                 &format!("{prefix}.roles.source"),
                 &format!("{prefix}.token.binding.certificate"),
+                &format!("{prefix}.token.decrypt-access-token"),
+                &format!("{prefix}.token.decrypt-id-token"),
             )?
             .authorization_from_config(config)?
             .build();
@@ -3530,6 +3584,8 @@ async fn discover_tenants_from_config(
             "quarkus.oidc.application-type",
             "quarkus.oidc.roles.source",
             "quarkus.oidc.token.binding.certificate",
+            "quarkus.oidc.token.decrypt-access-token",
+            "quarkus.oidc.token.decrypt-id-token",
         )?
         .authorization_from_config(config)?;
         let default_tenant = discover_oidc_builder(default_tenant, client.as_ref()).await?;
@@ -3546,6 +3602,8 @@ async fn discover_tenants_from_config(
             &format!("{prefix}.application-type"),
             &format!("{prefix}.roles.source"),
             &format!("{prefix}.token.binding.certificate"),
+            &format!("{prefix}.token.decrypt-access-token"),
+            &format!("{prefix}.token.decrypt-id-token"),
         )?
         .authorization_from_config(config)?;
         let oidc = discover_oidc_builder(oidc, client.as_ref()).await?;
@@ -4530,6 +4588,12 @@ dQIDAQAB
                     .with("quarkus.oidc.token.audience", "orders-api")
                     .with("quarkus.oidc.token.token-type", "bearer")
                     .with("quarkus.oidc.token.signature-algorithm", "rs256")
+                    .with(
+                        "quarkus.oidc.token.decryption-key-location",
+                        "/etc/oidc/decryption.pem",
+                    )
+                    .with("quarkus.oidc.token.decrypt-id-token", "false")
+                    .with("quarkus.oidc.token.decrypt-access-token", "false")
                     .with("quarkus.oidc.token.subject-required", "true")
                     .with("quarkus.oidc.token.issued-at-required", "false")
                     .with("quarkus.oidc.token.required-claims.org_id", "org_xyz")
@@ -4608,6 +4672,9 @@ dQIDAQAB
                     audience: Some("orders-api".to_owned()),
                     token_type: Some("bearer".to_owned()),
                     signature_algorithm: Some(TokenSignatureAlgorithm::Rs256),
+                    decryption_key_location: Some("/etc/oidc/decryption.pem".to_owned()),
+                    decrypt_id_token: Some(false),
+                    decrypt_access_token: false,
                     subject_required: true,
                     issued_at_required: false,
                     required_claims: HashMap::from([
@@ -6112,6 +6179,56 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("requires client certificate thumbprint extraction"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn oidc_from_config_rejects_decrypt_access_token() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("decrypt-access-token", 100)
+                    .with("quarkus.oidc.token.decrypt-access-token", "true"),
+            )
+            .build();
+
+        let Err(error) = Oidc::from_config(&config) else {
+            panic!("encrypted access tokens should be rejected until JWE support is implemented");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { ref name, .. }
+                if name == "quarkus.oidc.token.decrypt-access-token"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("requires JWE access-token decryption"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn oidc_from_config_rejects_decrypt_id_token() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("decrypt-id-token", 100)
+                    .with("quarkus.oidc.token.decrypt-id-token", "true"),
+            )
+            .build();
+
+        let Err(error) = Oidc::from_config(&config) else {
+            panic!("encrypted ID tokens should be rejected until web-app support is implemented");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { ref name, .. }
+                if name == "quarkus.oidc.token.decrypt-id-token"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("requires web-app ID token decryption"),
             "{error}"
         );
     }
@@ -8278,6 +8395,32 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("requires client certificate thumbprint extraction"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tenants_from_config_rejects_named_decrypt_access_token() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-decrypt-access-token", 100)
+                    .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
+                    .with("quarkus.oidc.tenant-a.token.decrypt-access-token", "true"),
+            )
+            .build();
+
+        let Err(error) = Tenants::from_config(&config) else {
+            panic!("encrypted access tokens should be rejected for named bearer-service tenants");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { ref name, .. }
+                if name == "quarkus.oidc.tenant-a.token.decrypt-access-token"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("requires JWE access-token decryption"),
             "{error}"
         );
     }

@@ -50,6 +50,10 @@ This crate is in early development. The current implementation includes:
 - Certificate-bound access-token configuration through
   `quarkus.oidc.token.binding.certificate` is rejected until request client
   certificate thumbprints are supported.
+- JWE token decryption configuration through
+  `quarkus.oidc.token.decrypt-access-token` and
+  `quarkus.oidc.token.decrypt-id-token` is rejected until token decryption is
+  supported.
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths`, quoted tenant
   aliases, tenant IDs, static first-path-segment tenant selection, and optional
   header-based (`quarkus.oidc.tenant-id-header`) or issuer-based tenant
