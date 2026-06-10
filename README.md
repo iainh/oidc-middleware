@@ -1,103 +1,41 @@
 # oidc-middleware
 
-`oidc-middleware` is an axum OIDC middleware crate inspired by the Quarkus OIDC
-extension. It uses `mp-config` to load Quarkus-style `oidc.*`
-configuration and exposes tower layers that protect axum routes with
-bearer-token authentication and route-local role checks.
+`oidc-middleware` is an experimental OpenID Connect (OIDC) middleware library for
+Axum applications. It is inspired by the Quarkus OIDC extension: keep provider
+configuration declarative, predictable, and close to the familiar `oidc.*`
+property model, while expressing authorization in idiomatic Rust with Axum
+routes, Tower layers, extractors, and optional handler macros.
 
-This crate is in early development. The current implementation includes:
+The goal is to make common OIDC setups feel straightforward without hiding the
+security decisions that Rust application developers usually want to own.
 
-- `OidcConfig` loaded from `oidc.*` properties, including
-  `client-id`, `client-name`, and well-known `provider` values. `provider=google`
-  supplies the Google issuer URL when `auth-server-url` is not configured.
-  Other provider identifiers require an explicit `auth-server-url` until their
-  issuer URLs are built in.
-- Service and hybrid `oidc.application-type` bearer-token middleware,
-  plus `web-app` authorization-code flow when built through provider discovery
-  or explicit authorization and token endpoint configuration.
-- Web-app session state is stored through `tower-sessions`; applications using
-  `application-type=web-app` must install a `SessionManagerLayer` outside the
-  OIDC layer.
-- `Oidc::layer()` for protecting axum routers.
-- request `Principal` extensions after successful authentication.
-- pluggable bearer-token validation through `TokenValidator`.
-- OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`,
-  including `oidc.discovery-path` and direct `jwks-path` loading when
-  `oidc.discovery-enabled=false`. Provider HTTP clients created by the
-  crate honour `oidc.connection-timeout`. Use
-  `Oidc::discover_from_config` or `Tenants::discover_from_config` to load
-  `mp-config` properties and build provider-backed middleware in one step.
-- Quarkus-style endpoint path configuration for authorization, token,
-  registration, revocation, introspection, user info, and end-session endpoints,
-  plus parsing of the matching discovery metadata.
-- Web-app browser authentication configuration with
-  `oidc.authentication.redirect-path`,
-  `oidc.authentication.restore-path-after-redirect`, and
-  `oidc.authentication.scopes`. The scope list must include `openid`.
-- Local JWT verification with `oidc.public-key`.
-- Audience validation from one or more configured
-  `oidc.token.audience` values.
-- Quarkus `any` issuer and audience bypass values for providers with variable
-  claims.
-- Signature algorithm restrictions with
-  `oidc.token.signature-algorithm`.
-- JWT `typ` header or claim enforcement with `oidc.token.token-type`.
-- Optional `sub` enforcement with `oidc.token.subject-required`.
-- JWT string claim enforcement with `oidc.token.required-claims.*`,
-  including nested claim paths through quoted map keys and space-separated
-  string claim values such as `scope`.
-- JWT lifespan grace and age checks with `oidc.token.lifespan-grace`
-  and `oidc.token.age`, including
-  `oidc.token.issued-at-required`.
-- Principal-name selection with `oidc.token.principal-claim`,
-  including nested claim paths.
-- Token extraction with `oidc.token.header` and case-insensitive
-  `oidc.token.authorization-scheme`, including matching challenge
-  responses.
-- Certificate-bound access-token configuration through
-  `oidc.token.binding.certificate` is rejected until request client
-  certificate thumbprints are supported.
-- JWE token decryption configuration through
-  `oidc.token.decrypt-access-token` and
-  `oidc.token.decrypt-id-token` is rejected until token decryption is
-  supported.
-- Multi-tenant routing with `oidc.<tenant>.tenant-paths`, quoted tenant
-  aliases, tenant IDs, static first-path-segment tenant selection, and optional
-  header-based (`oidc.tenant-id-header`) or issuer-based tenant
-  selection.
-- Refreshable provider JWKS validation when a token references an unknown `kid`,
-  with `oidc.token.forced-jwk-refresh-interval` throttling.
-- Quarkus token introspection configuration flags for JWT, opaque-token, and
-  UserInfo validation modes.
-- OAuth2 token introspection through `IntrospectionValidator`, custom
-  `TokenIntrospector` implementations, or explicit HTTP introspection endpoint
-  builder methods, plus provider-backed installation for
-  `oidc.token.require-jwt-introspection-only` and fallback from JWKS
-  validation when JWT or opaque-token introspection is enabled. HTTP
-  introspection uses `oidc.client-id` with
-  `oidc.credentials.secret` for Basic authentication by default, or
-  form-post or query credentials with
-  `oidc.credentials.client-secret.method`. Endpoint-specific
-  introspection Basic credentials can be set with
-  `oidc.introspection-credentials.*`.
-- UserInfo-backed opaque-token validation through `UserInfoValidator`, custom
-  `UserInfoProvider` implementations, or provider-backed installation for
-  `oidc.token.verify-access-token-with-user-info`.
-- HS256 and static JWKS validation with issuer, audience, groups, and Keycloak
-  realm roles.
-- Configurable role extraction with `oidc.roles.role-claim-path`,
-  including quoted namespace paths and default Keycloak
-  `resource_access/<client-id>/roles` support, plus
-  `oidc.roles.role-claim-separator` and access-token or UserInfo
-  role sources with `oidc.roles.source`.
-- Axum-native route authorization with `RequireAuthenticatedLayer` and
-  `RequireRolesLayer::{any, all}`. Keep OIDC provider and token validation
-  configuration under `oidc.*`, then express authorization where Rust
-  developers expect it: on the routes and routers being protected.
-- `#[roles_allowed(...)]` and `#[authenticated]` handler macros for
-  Quarkus-style authorization checks with the `OidcPrincipal` extractor,
-  including `**` for any authenticated principal.
-- Quarkus-style handling for disabled OIDC and disabled tenants.
+## Project status
+
+This project is experimental and not yet a security-audited authentication
+library. You should review the implementation, configuration model, dependency
+set, and threat assumptions before using it in production. The onus is on each
+application developer to decide whether the crate meets their security,
+compliance, operational, and provider-compatibility requirements.
+
+## What it provides
+
+- Axum and Tower middleware for protecting routers and routes.
+- Quarkus-inspired `oidc.*` configuration through `mp-config`.
+- Bearer-token authentication for service APIs.
+- Browser `web-app` authorization-code flow with `tower-sessions`.
+- Static public-key, JWKS, refreshable JWKS, introspection, and UserInfo-backed
+  validation options.
+- Multi-tenant OIDC routing by path, tenant ID header, or token issuer.
+- Route-local authorization with `RequireAuthenticatedLayer` and
+  `RequireRolesLayer`.
+- Optional `#[authenticated]` and `#[roles_allowed]` handler macros.
+- Feature flags for applications that want to reduce dependency and exploit
+  surface.
+
+## Quick start
+
+For tests, examples, and local development, you can inject a custom token
+validator and protect only the routes that require identity:
 
 ```rust
 use axum::{Router, routing::get};
@@ -122,20 +60,121 @@ let app = Router::new()
     .merge(protected);
 ```
 
+Provider-backed applications usually start from `Oidc::from_config`,
+`Oidc::discover_from_config`, or `Tenants::discover_from_config`, then apply the
+resulting layer to the protected part of the router.
+
 ## Examples
 
-The `examples/` directory contains compileable, focused usage samples:
+Start with the focused examples in [`examples/`](examples/). They are intended
+to be easier to evaluate than a single large demo application.
 
-- `bearer_service.rs`: protect an Axum API with bearer-token authentication.
-- `route_authorization.rs`: apply `RequireAuthenticatedLayer` and
-  `RequireRolesLayer` at route boundaries.
-- `handler_macros.rs`: use `#[authenticated]` and `#[roles_allowed]` on
-  handlers.
-- `mp_config.rs`: load `oidc.*` settings through `mp-config`.
-- `provider_discovery.rs`: build JWKS-backed JWT validation from provider
-  discovery.
-- `local_public_key.rs`: validate JWTs with an out-of-band public key.
-- `introspection.rs`: validate opaque tokens with token introspection.
-- `user_info.rs`: validate bearer tokens through UserInfo.
-- `web_app.rs`: configure browser login with `tower-sessions`.
-- `multi_tenant.rs`: select tenant-specific OIDC middleware by path.
+- [`bearer_service.rs`](examples/bearer_service.rs): Protect an Axum API with
+  bearer-token authentication.
+- [`route_authorization.rs`](examples/route_authorization.rs): Apply
+  `RequireAuthenticatedLayer` and `RequireRolesLayer` at route boundaries.
+- [`handler_macros.rs`](examples/handler_macros.rs): Use `#[authenticated]` and
+  `#[roles_allowed]` on handlers.
+- [`mp_config.rs`](examples/mp_config.rs): Load `oidc.*` settings through
+  `mp-config`.
+- [`provider_discovery.rs`](examples/provider_discovery.rs): Build JWKS-backed
+  JWT validation from provider discovery.
+- [`local_public_key.rs`](examples/local_public_key.rs): Validate JWTs with an
+  out-of-band public key.
+- [`introspection.rs`](examples/introspection.rs): Validate opaque tokens with
+  token introspection.
+- [`user_info.rs`](examples/user_info.rs): Validate bearer tokens through
+  UserInfo.
+- [`web_app.rs`](examples/web_app.rs): Configure browser login with
+  `tower-sessions`.
+- [`multi_tenant.rs`](examples/multi_tenant.rs): Select tenant-specific OIDC
+  middleware by path.
+
+## Quarkus inspiration, Rust shape
+
+Quarkus is the main design reference for configuration. This crate follows the
+same broad vocabulary, including settings such as `oidc.auth-server-url`,
+`oidc.client-id`, `oidc.application-type`, `oidc.roles.*`, and `oidc.token.*`.
+
+The runtime shape is intentionally Rust-oriented. Authentication is a Tower
+layer. Authorization is applied where Axum developers expect to see it: on the
+route, router, or handler being protected. Public routes should usually stay
+outside `Oidc::layer`; protected routes fail closed when credentials are missing
+or rejected.
+
+## Configuration highlights
+
+The current implementation supports:
+
+- Service and hybrid `oidc.application-type` bearer-token middleware.
+- Browser `web-app` login when provider discovery or explicit authorization and
+  token endpoints are configured.
+- OIDC provider discovery from `oidc.auth-server-url` and discovered `jwks_uri`.
+- Direct `oidc.jwks-path` loading when `oidc.discovery-enabled=false`.
+- Local JWT verification with `oidc.public-key`.
+- Audience, issuer, token type, subject, required-claim, token-age, and
+  signature-algorithm checks.
+- Configurable principal-name and role extraction, including Keycloak-style
+  resource roles.
+- Token introspection for opaque-token and fallback validation modes.
+- UserInfo-backed token validation and UserInfo-backed role loading.
+- Disabled-OIDC and disabled-tenant behaviour modelled after Quarkus.
+
+Unsupported or intentionally rejected settings include certificate-bound access
+tokens and JWE token decryption. Those configuration values currently fail at
+startup rather than pretending to enforce unsupported security controls.
+
+## Feature flags
+
+Default features preserve the full convenience API:
+
+```toml
+[dependencies]
+oidc-middleware = { version = "0.1" }
+```
+
+Applications that provide their own validators can opt into a smaller dependency
+surface:
+
+```toml
+[dependencies]
+oidc-middleware = { version = "0.1", default-features = false }
+```
+
+Available features:
+
+- `http-client`: Enables `reqwest`-backed provider discovery, HTTP
+  introspection, HTTP UserInfo, and remote JWKS loading.
+- `jwt`: Enables `jsonwebtoken`, `JwtValidator`, JWKS support, and static
+  public-key validation.
+- `macros`: Enables the optional handler authorization macros.
+- `web-app`: Enables browser login support with `tower-sessions`; this also
+  enables `http-client` and `jwt`.
+
+With `default-features = false`, the crate keeps the Axum middleware, config
+model, route authorization layers, custom validator traits, introspection model,
+and UserInfo model, while avoiding the optional HTTP client, TLS, JWT, proc
+macro, session, random-state, and URL-parsing stacks.
+
+## Design guidance
+
+A typical API should:
+
+1. Load or construct `OidcConfig`.
+2. Install a validator with provider discovery, a static key, introspection,
+   UserInfo, or a custom `TokenValidator`.
+3. Apply `Oidc::layer()` only to protected routes.
+4. Use `RequireAuthenticatedLayer`, `RequireRolesLayer`, or handler macros for
+   authorization.
+5. Keep health checks, static assets, and public callbacks outside protected
+   routers unless they should also require authentication.
+
+This keeps provider setup declarative while keeping authorization visible in the
+Axum router.
+
+## Licence
+
+Licensed under either of:
+
+- Apache License, Version 2.0
+- MIT licence
