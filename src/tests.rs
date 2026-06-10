@@ -838,6 +838,39 @@ async fn valid_bearer_token_adds_principal_extension() {
 }
 
 #[tokio::test]
+async fn oidc_session_extractor_reads_authenticated_principal() {
+    let app = Router::new()
+        .route(
+            "/session",
+            get(|session: OidcSession| async move { session.principal().subject().to_owned() }),
+        )
+        .layer(oidc().layer());
+
+    let response = app
+        .oneshot(request("/session", Some("Bearer test-token")))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "alice");
+}
+
+#[tokio::test]
+async fn oidc_session_extractor_rejects_missing_principal() {
+    let app = Router::new().route(
+        "/session",
+        get(|session: OidcSession| async move { session.principal().subject().to_owned() }),
+    );
+
+    let response = app
+        .oneshot(request("/session", None))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn tenant_disabled_returns_not_found() {
     let response = app(Oidc::builder(OidcConfig {
         tenant_enabled: false,

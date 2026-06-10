@@ -201,3 +201,55 @@ where
             .ok_or(Error::Forbidden)
     }
 }
+
+/// Axum extractor for authenticated web-app session context.
+///
+/// Today this exposes the same normalized [`Principal`] as [`OidcPrincipal`].
+/// It is a distinct type so browser-login handlers can depend on session
+/// context without conflating access-token authorization with future
+/// ID-token/profile data.
+#[cfg(feature = "web-app")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcSession {
+    principal: Principal,
+}
+
+#[cfg(feature = "web-app")]
+impl OidcSession {
+    /// Returns the normalized principal restored from the authenticated request.
+    pub fn principal(&self) -> &Principal {
+        &self.principal
+    }
+
+    /// Consumes the session wrapper and returns the normalized principal.
+    pub fn into_principal(self) -> Principal {
+        self.principal
+    }
+}
+
+#[cfg(feature = "web-app")]
+impl OidcAuthorize for OidcSession {
+    fn principal(&self) -> &Principal {
+        &self.principal
+    }
+}
+
+#[cfg(feature = "web-app")]
+impl<S> FromRequestParts<S> for OidcSession
+where
+    S: Send + Sync,
+{
+    type Rejection = Error;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Principal>()
+            .cloned()
+            .map(|principal| Self { principal })
+            .ok_or(Error::Forbidden)
+    }
+}
