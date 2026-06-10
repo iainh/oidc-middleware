@@ -443,8 +443,11 @@ pub struct OidcTokenConfig {
     pub required_claims: HashMap<String, Vec<String>>,
     /// Claim used as the authenticated principal name.
     pub principal_claim: Option<String>,
-    /// Custom HTTP header that contains the bearer token.
-    pub header: Option<String>,
+    /// HTTP header that contains the bearer token.
+    ///
+    /// `Authorization` uses the configured authorization scheme. Other
+    /// headers carry the raw token value.
+    pub header: String,
     /// HTTP Authorization header scheme.
     pub authorization_scheme: String,
     /// Grace period applied to token expiry and issued-at checks.
@@ -474,7 +477,7 @@ impl Default for OidcTokenConfig {
             issued_at_required: true,
             required_claims: HashMap::new(),
             principal_claim: None,
-            header: None,
+            header: "Authorization".to_owned(),
             authorization_scheme: "Bearer".to_owned(),
             lifespan_grace: None,
             age: None,
@@ -502,16 +505,16 @@ impl ConfigProperties for OidcTokenConfig {
         };
 
         let token_header_key = key("header");
-        let header = config.get_optional::<String>(&token_header_key)?;
-        if let Some(header) = &header {
-            http::HeaderName::from_str(header).map_err(|error| {
-                mp_config::ConfigError::Conversion {
-                    name: token_header_key.clone(),
-                    value: header.clone(),
-                    message: error.to_string(),
-                }
-            })?;
-        }
+        let header = config
+            .get_optional::<String>(&token_header_key)?
+            .unwrap_or_else(|| "Authorization".to_owned());
+        http::HeaderName::from_str(&header).map_err(|error| {
+            mp_config::ConfigError::Conversion {
+                name: token_header_key.clone(),
+                value: header.clone(),
+                message: error.to_string(),
+            }
+        })?;
         let authorization_scheme_key = key("authorization-scheme");
         let authorization_scheme = config
             .get_optional(&authorization_scheme_key)?
@@ -4038,58 +4041,41 @@ fn is_http_token_char(byte: u8) -> bool {
 }
 
 fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc<str>> {
-    if let Some(header_name) = &config.header {
-        let header_name = http::HeaderName::from_str(header_name)
-            .map_err(|_| Error::InvalidAuthorizationHeader)?;
-        let Some(header) = request.headers().get(&header_name) else {
-            return Err(Error::MissingBearerToken);
-        };
-        if header_name == AUTHORIZATION {
-            return bearer_token_from_authorization_header(header, &config.authorization_scheme);
-        }
-        let token = header
-            .to_str()
-            .map_err(|_| Error::InvalidAuthorizationHeader)?
-            .trim();
-        if token.is_empty() {
-            return Err(Error::InvalidAuthorizationHeader);
-        }
-        return Ok(Arc::from(token));
-    }
-
-    let Some(header) = request.headers().get(AUTHORIZATION) else {
+    let header_name = http::HeaderName::from_str(&config.header)
+        .map_err(|_| Error::InvalidAuthorizationHeader)?;
+    let Some(header) = request.headers().get(&header_name) else {
         return Err(Error::MissingBearerToken);
     };
-
-    bearer_token_from_authorization_header(header, &config.authorization_scheme)
+    if header_name == AUTHORIZATION {
+        return bearer_token_from_authorization_header(header, &config.authorization_scheme);
+    }
+    let token = header
+        .to_str()
+        .map_err(|_| Error::InvalidAuthorizationHeader)?
+        .trim();
+    if token.is_empty() {
+        return Err(Error::InvalidAuthorizationHeader);
+    }
+    Ok(Arc::from(token))
 }
 
 fn unverified_token_from_request<'a>(
     request: &'a Request<Body>,
     config: &OidcTokenConfig,
 ) -> Option<&'a str> {
-    if let Some(header_name) = &config.header {
-        let header_name = http::HeaderName::from_str(header_name).ok()?;
-        let header = request.headers().get(&header_name)?;
-        if header_name == AUTHORIZATION {
-            return header
-                .to_str()
-                .ok()
-                .and_then(|value| token_with_scheme(value, &config.authorization_scheme))
-                .filter(|token| !token.is_empty());
-        }
+    let header_name = http::HeaderName::from_str(&config.header).ok()?;
+    let header = request.headers().get(&header_name)?;
+    if header_name == AUTHORIZATION {
         return header
             .to_str()
             .ok()
-            .map(str::trim)
+            .and_then(|value| token_with_scheme(value, &config.authorization_scheme))
             .filter(|token| !token.is_empty());
     }
-
-    request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|header| header.to_str().ok())
-        .and_then(|value| token_with_scheme(value, &config.authorization_scheme))
+    header
+        .to_str()
+        .ok()
+        .map(str::trim)
         .filter(|token| !token.is_empty())
 }
 
@@ -4578,7 +4564,7 @@ dQIDAQAB
                         ),
                     ]),
                     principal_claim: Some("email".to_owned()),
-                    header: Some("x-access-token".to_owned()),
+                    header: "x-access-token".to_owned(),
                     authorization_scheme: "Token".to_owned(),
                     lifespan_grace: Some(5),
                     age: Some(Duration::from_secs(60)),
@@ -4931,6 +4917,17 @@ dQIDAQAB
     }
 
     #[test]
+    fn config_defaults_token_header_to_authorization() {
+        let config = Config::builder()
+            .add_source(MapSource::new("test", 100))
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert_eq!(oidc.token.header, "Authorization");
+    }
+
+    #[test]
     fn config_rejects_invalid_authorization_scheme() {
         for scheme in ["Bearer Token", "Bearer/Token"] {
             let config = Config::builder()
@@ -5114,7 +5111,7 @@ dQIDAQAB
     async fn configured_token_header_is_accepted() {
         let response = app(Oidc::builder(OidcConfig {
             token: OidcTokenConfig {
-                header: Some("x-access-token".to_owned()),
+                header: "x-access-token".to_owned(),
                 ..OidcTokenConfig::default()
             },
             ..OidcConfig::default()
@@ -5136,7 +5133,7 @@ dQIDAQAB
     async fn configured_authorization_token_header_uses_scheme() {
         let response = app(Oidc::builder(OidcConfig {
             token: OidcTokenConfig {
-                header: Some("Authorization".to_owned()),
+                header: "Authorization".to_owned(),
                 ..OidcTokenConfig::default()
             },
             ..OidcConfig::default()
@@ -5154,7 +5151,7 @@ dQIDAQAB
     async fn configured_authorization_token_header_respects_custom_scheme() {
         let response = app(Oidc::builder(OidcConfig {
             token: OidcTokenConfig {
-                header: Some("Authorization".to_owned()),
+                header: "Authorization".to_owned(),
                 authorization_scheme: "Token".to_owned(),
                 ..OidcTokenConfig::default()
             },
@@ -8587,7 +8584,7 @@ dQIDAQAB
                     Oidc::builder(OidcConfig {
                         auth_server_url: Some("https://issuer.example/realms/b".to_owned()),
                         token: OidcTokenConfig {
-                            header: Some("x-access-token".to_owned()),
+                            header: "x-access-token".to_owned(),
                             ..OidcTokenConfig::default()
                         },
                         ..OidcConfig::default()
