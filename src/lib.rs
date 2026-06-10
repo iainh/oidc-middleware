@@ -2435,6 +2435,7 @@ impl Oidc {
         oidc_builder_from_config(
             OidcConfig::from_config(config)?,
             "quarkus.oidc.public-key",
+            "quarkus.oidc.application-type",
             "quarkus.oidc.roles.source",
         )?
         .authorization_from_config(config)
@@ -2500,6 +2501,7 @@ impl Oidc {
 fn oidc_builder_from_config(
     config: OidcConfig,
     public_key_property: &str,
+    application_type_property: &str,
     roles_source_property: &str,
 ) -> mp_config::Result<OidcBuilder> {
     let public_key = config.public_key.clone();
@@ -2507,6 +2509,7 @@ fn oidc_builder_from_config(
     if !builder.config.enabled {
         return Ok(builder);
     }
+    validate_service_application_type(&builder.config, application_type_property)?;
     validate_service_roles_source(&builder.config, roles_source_property)?;
     if let Some(public_key) = public_key {
         builder = builder.public_key(&public_key).map_err(|error| {
@@ -2518,6 +2521,20 @@ fn oidc_builder_from_config(
         })?;
     }
     Ok(builder)
+}
+
+fn validate_service_application_type(
+    config: &OidcConfig,
+    property_name: &str,
+) -> mp_config::Result<()> {
+    if config.application_type == ApplicationType::WebApp {
+        return Err(mp_config::ConfigError::Conversion {
+            name: property_name.to_owned(),
+            value: "web-app".to_owned(),
+            message: "`web-app` application type requires authorization-code flow support, which is not implemented for bearer-service middleware".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_service_roles_source(
@@ -3066,6 +3083,7 @@ impl Tenants {
             let default_tenant = oidc_builder_from_config(
                 default_config,
                 "quarkus.oidc.public-key",
+                "quarkus.oidc.application-type",
                 "quarkus.oidc.roles.source",
             )?
             .authorization_from_config(config)?
@@ -3079,6 +3097,7 @@ impl Tenants {
             let oidc = oidc_builder_from_config(
                 tenant_config,
                 &format!("{prefix}.public-key"),
+                &format!("{prefix}.application-type"),
                 &format!("{prefix}.roles.source"),
             )?
             .authorization_from_config(config)?
@@ -4373,6 +4392,17 @@ dQIDAQAB
     }
 
     #[test]
+    fn config_loads_hybrid_application_type() {
+        let config = Config::builder()
+            .add_source(MapSource::new("test", 100).with("quarkus.oidc.application-type", "hybrid"))
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert_eq!(oidc.application_type, ApplicationType::Hybrid);
+    }
+
+    #[test]
     fn config_rejects_invalid_token_header() {
         let config = Config::builder()
             .add_source(
@@ -5420,6 +5450,45 @@ dQIDAQAB
                 .contains("`idtoken` roles require web-app ID token support"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn oidc_from_config_rejects_web_app_application_type() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("web-app", 100)
+                    .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
+                    .with("quarkus.oidc.application-type", "web-app"),
+            )
+            .build();
+
+        let Err(error) = Oidc::from_config(&config) else {
+            panic!("web-app should be rejected for bearer-service middleware");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { ref name, .. }
+                if name == "quarkus.oidc.application-type"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("`web-app` application type requires authorization-code flow support"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn oidc_from_config_accepts_hybrid_application_type() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("hybrid", 100)
+                    .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
+                    .with("quarkus.oidc.application-type", "hybrid"),
+            )
+            .build();
+
+        let _builder = Oidc::from_config(&config).expect("hybrid should support bearer middleware");
     }
 
     #[tokio::test]
@@ -7214,6 +7283,32 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("`idtoken` roles require web-app ID token support"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tenants_from_config_rejects_named_web_app_application_type() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-web-app", 100)
+                    .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
+                    .with("quarkus.oidc.tenant-a.application-type", "web-app"),
+            )
+            .build();
+
+        let Err(error) = Tenants::from_config(&config) else {
+            panic!("web-app should be rejected for named bearer-service tenants");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { ref name, .. }
+                if name == "quarkus.oidc.tenant-a.application-type"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("`web-app` application type requires authorization-code flow support"),
             "{error}"
         );
     }

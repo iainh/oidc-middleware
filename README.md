@@ -10,6 +10,8 @@ This crate is in early development. The current implementation includes:
 - `OidcConfig` loaded from `quarkus.oidc.*` properties, including well-known
   `provider`, `client-id` and `client-name` values, with `Oidc::from_config`
   also applying configured `quarkus.http.auth.permission.*` policies.
+- Service and hybrid `quarkus.oidc.application-type` bearer-token middleware;
+  pure `web-app` authorization-code flow is rejected until implemented.
 - `Oidc::layer()` for protecting axum routers.
 - request `Principal` extensions after successful authentication.
 - pluggable bearer-token validation through `TokenValidator`.
