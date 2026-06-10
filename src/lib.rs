@@ -439,10 +439,13 @@ impl ConfigProperties for OidcTokenConfig {
             }
         }
 
+        let token_type = load_optional_non_empty_string(config, &key("token-type"))?;
+        let principal_claim = load_optional_non_empty_string(config, &key("principal-claim"))?;
+
         Ok(Self {
             issuer: config.get_optional(&key("issuer"))?,
             audience,
-            token_type: config.get_optional(&key("token-type"))?,
+            token_type,
             signature_algorithm: config.get_optional(&key("signature-algorithm"))?,
             subject_required: config
                 .get_optional(&key("subject-required"))?
@@ -451,7 +454,7 @@ impl ConfigProperties for OidcTokenConfig {
                 .get_optional(&key("issued-at-required"))?
                 .unwrap_or(true),
             required_claims: load_required_claims(config, &key("required-claims"))?,
-            principal_claim: config.get_optional(&key("principal-claim"))?,
+            principal_claim,
             header,
             authorization_scheme,
             lifespan_grace: config.get_optional(&key("lifespan-grace"))?,
@@ -3434,6 +3437,20 @@ fn load_role_mapping(config: &Config, key: &str) -> mp_config::Result<Vec<String
         });
     }
     Ok(mapped_roles)
+}
+
+fn load_optional_non_empty_string(config: &Config, key: &str) -> mp_config::Result<Option<String>> {
+    let value = config.get_optional::<String>(key)?;
+    if let Some(value) = &value {
+        if value.trim().is_empty() {
+            return Err(mp_config::ConfigError::Conversion {
+                name: key.to_owned(),
+                value: value.clone(),
+                message: "value must not be empty when configured".to_owned(),
+            });
+        }
+    }
+    Ok(value)
 }
 
 fn load_required_claims(
@@ -6561,6 +6578,55 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("token audience must include at least one audience"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_empty_token_type() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-token-type", 100).with("quarkus.oidc.token.token-type", " "),
+            )
+            .build();
+
+        let error =
+            OidcConfig::from_config(&config).expect_err("empty token type should be rejected");
+
+        assert!(
+            error.to_string().contains("quarkus.oidc.token.token-type"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("value must not be empty when configured"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_empty_principal_claim() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-principal-claim", 100)
+                    .with("quarkus.oidc.token.principal-claim", " "),
+            )
+            .build();
+
+        let error =
+            OidcConfig::from_config(&config).expect_err("empty principal claim should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.oidc.token.principal-claim"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("value must not be empty when configured"),
             "{error}"
         );
     }
