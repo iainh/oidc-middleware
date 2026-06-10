@@ -3394,7 +3394,17 @@ fn load_required_claims(
             continue;
         };
 
-        claims.insert(claim_name, split_csv(&config.get::<String>(&key)?));
+        let value = config.get::<String>(&key)?;
+        let expected_values = split_csv(&value);
+        if expected_values.is_empty() {
+            return Err(mp_config::ConfigError::Conversion {
+                name: key,
+                value,
+                message: "required claims must include at least one expected value".to_owned(),
+            });
+        }
+
+        claims.insert(claim_name, expected_values);
     }
 
     Ok(claims)
@@ -6420,6 +6430,32 @@ dQIDAQAB
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn config_rejects_empty_required_claim_values() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-required-claims", 100)
+                    .with("quarkus.oidc.token.required-claims.scope", " , "),
+            )
+            .build();
+
+        let error = OidcConfig::from_config(&config)
+            .expect_err("empty required claim values should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.oidc.token.required-claims.scope"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("required claims must include at least one expected value"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
