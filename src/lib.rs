@@ -85,6 +85,7 @@ mod claims;
 mod config;
 mod config_helpers;
 mod error;
+mod id_token;
 mod introspection;
 #[cfg(feature = "jwt")]
 mod jwks;
@@ -112,6 +113,7 @@ pub use config::{
     WellKnownProvider,
 };
 pub use error::{BuildError, Error};
+pub use id_token::{IdToken, IdTokenClaims};
 pub use introspection::{
     IntrospectionFallbackValidator, IntrospectionResponse, IntrospectionValidator,
     TokenIntrospector,

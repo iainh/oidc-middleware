@@ -584,6 +584,57 @@ fn config_rejects_invalid_authorization_scheme() {
     }
 }
 
+#[test]
+fn id_token_claims_parse_standard_and_extra_claims() {
+    let claims = IdTokenClaims::from_json(
+        r#"{
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": ["client-a", "client-b"],
+            "exp": 4102444800,
+            "iat": 1700000000,
+            "auth_time": 1699999999,
+            "nonce": "nonce-123",
+            "azp": "client-a",
+            "email": "alice@example.com",
+            "email_verified": true,
+            "tenant": "north"
+        }"#,
+    )
+    .expect("ID token claims should parse");
+
+    let token = IdToken::with_raw(claims, "raw-token");
+
+    assert_eq!(token.subject(), Some("alice"));
+    assert_eq!(token.issuer(), Some("https://issuer.example/realms/app"));
+    assert_eq!(
+        token.audience().collect::<Vec<_>>(),
+        ["client-a", "client-b"]
+    );
+    assert_eq!(token.expires_at(), Some(4_102_444_800));
+    assert_eq!(token.issued_at(), Some(1_700_000_000));
+    assert_eq!(token.nonce(), Some("nonce-123"));
+    assert_eq!(token.authorized_party(), Some("client-a"));
+    assert_eq!(token.email(), Some("alice@example.com"));
+    assert_eq!(token.email_verified(), Some(true));
+    assert_eq!(
+        token.claim("tenant").and_then(serde_json::Value::as_str),
+        Some("north")
+    );
+    assert_eq!(token.raw(), Some("raw-token"));
+}
+
+#[test]
+fn id_token_claims_parse_string_audience() {
+    let claims = IdTokenClaims::from_json(r#"{"sub":"alice","aud":"client-a"}"#)
+        .expect("ID token claims should parse");
+
+    let token = IdToken::new(claims);
+
+    assert_eq!(token.audience().collect::<Vec<_>>(), ["client-a"]);
+    assert_eq!(token.raw(), None);
+}
+
 #[tokio::test]
 async fn disabled_oidc_allows_request_without_bearer_token() {
     let response = public_app(
