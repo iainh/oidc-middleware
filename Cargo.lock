@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "oidc-middleware"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "oidc-middleware-macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",

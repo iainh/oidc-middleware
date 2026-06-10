@@ -9,6 +9,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::trace;
 
+pub(crate) const MAX_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_AUTHORIZATION_HEADER_BYTES: usize = MAX_TOKEN_BYTES + 128;
+
 pub(crate) fn validate_authorization_scheme(
     property_name: &str,
     value: &str,
@@ -41,6 +44,7 @@ pub(crate) fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) ->
         );
         return Err(Error::MissingBearerToken);
     };
+    validate_header_size(header)?;
     if header_name == AUTHORIZATION {
         trace!(
             authorization_scheme = %config.authorization_scheme,
@@ -52,6 +56,7 @@ pub(crate) fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) ->
         .to_str()
         .map_err(|_| Error::InvalidAuthorizationHeader)?
         .trim();
+    validate_token_shape(token)?;
     if token.is_empty() {
         trace!(configured_header = %config.header, "configured token header was empty");
         return Err(Error::InvalidAuthorizationHeader);
@@ -66,18 +71,21 @@ pub(crate) fn unverified_token_from_request<'a>(
 ) -> Option<&'a str> {
     let header_name = http::HeaderName::from_str(&config.header).ok()?;
     let header = request.headers().get(&header_name)?;
+    if header.as_bytes().len() > MAX_AUTHORIZATION_HEADER_BYTES {
+        return None;
+    }
     if header_name == AUTHORIZATION {
         return header
             .to_str()
             .ok()
             .and_then(|value| token_with_scheme(value, &config.authorization_scheme))
-            .filter(|token| !token.is_empty());
+            .filter(|token| token_has_valid_shape(token));
     }
     header
         .to_str()
         .ok()
         .map(str::trim)
-        .filter(|token| !token.is_empty())
+        .filter(|token| token_has_valid_shape(token))
 }
 
 fn bearer_token_from_authorization_header(
@@ -88,10 +96,32 @@ fn bearer_token_from_authorization_header(
         .to_str()
         .map_err(|_| Error::InvalidAuthorizationHeader)?;
     let token = token_with_scheme(value, authorization_scheme)
-        .filter(|token| !token.is_empty())
+        .filter(|token| token_has_valid_shape(token))
         .ok_or(Error::InvalidAuthorizationHeader)?;
 
     Ok(Arc::from(token))
+}
+
+fn validate_header_size(header: &HeaderValue) -> Result<()> {
+    if header.as_bytes().len() <= MAX_AUTHORIZATION_HEADER_BYTES {
+        return Ok(());
+    }
+
+    Err(Error::AuthorizationHeaderTooLarge)
+}
+
+fn validate_token_shape(token: &str) -> Result<()> {
+    if token_has_valid_shape(token) {
+        return Ok(());
+    }
+
+    Err(Error::InvalidAuthorizationHeader)
+}
+
+fn token_has_valid_shape(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_TOKEN_BYTES
+        && !token.bytes().any(|byte| byte.is_ascii_whitespace())
 }
 
 fn token_with_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
@@ -104,7 +134,13 @@ fn token_with_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
 }
 
 pub(crate) fn unverified_token_issuer(token: &str) -> Option<String> {
+    if !token_has_valid_shape(token) {
+        return None;
+    }
     let payload = token.split('.').nth(1)?;
+    if payload.len() > MAX_TOKEN_BYTES {
+        return None;
+    }
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims = serde_json::from_slice::<Value>(&decoded).ok()?;
     claims

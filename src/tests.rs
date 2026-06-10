@@ -629,6 +629,38 @@ async fn invalid_bearer_token_is_challenged() {
 }
 
 #[tokio::test]
+async fn oversized_authorization_header_is_rejected_before_validation() {
+    let mut token = String::with_capacity(crate::token::MAX_TOKEN_BYTES + 1);
+    token.extend(std::iter::repeat_n('a', crate::token::MAX_TOKEN_BYTES + 1));
+    let authorization = format!("Bearer {token}");
+
+    let response = app(oidc())
+        .oneshot(request("/protected", Some(&authorization)))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get(WWW_AUTHENTICATE).unwrap(),
+        HeaderValue::from_static(r#"Bearer error="invalid_request""#)
+    );
+}
+
+#[tokio::test]
+async fn bearer_token_with_embedded_whitespace_is_rejected() {
+    let response = app(oidc())
+        .oneshot(request("/protected", Some("Bearer test-token extra")))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get(WWW_AUTHENTICATE).unwrap(),
+        HeaderValue::from_static(r#"Bearer error="invalid_request""#)
+    );
+}
+
+#[tokio::test]
 async fn configured_authorization_scheme_is_accepted() {
     let response = app(Oidc::builder(OidcConfig {
         token: OidcTokenConfig {

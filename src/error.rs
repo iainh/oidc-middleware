@@ -20,6 +20,8 @@ pub enum Error {
     MissingBearerToken,
     /// The `Authorization` header was not valid UTF-8 or not in bearer format.
     InvalidAuthorizationHeader,
+    /// The configured token header exceeded the maximum accepted size.
+    AuthorizationHeaderTooLarge,
     /// The selected tenant is disabled.
     ///
     /// This maps to `404 Not Found`, mirroring the common Quarkus behaviour of
@@ -44,6 +46,7 @@ impl Error {
             Self::Session(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::MissingBearerToken
             | Self::InvalidAuthorizationHeader
+            | Self::AuthorizationHeaderTooLarge
             | Self::TokenRejected(_) => StatusCode::UNAUTHORIZED,
         }
     }
@@ -55,7 +58,9 @@ impl Error {
     fn challenge_with_scheme(&self, scheme: &str) -> HeaderValue {
         let value = match self {
             Self::MissingBearerToken | Self::TenantDisabled | Self::Forbidden => scheme.to_owned(),
-            Self::InvalidAuthorizationHeader => format!(r#"{scheme} error="invalid_request""#),
+            Self::InvalidAuthorizationHeader | Self::AuthorizationHeaderTooLarge => {
+                format!(r#"{scheme} error="invalid_request""#)
+            }
             Self::TokenRejected(_) => format!(r#"{scheme} error="invalid_token""#),
             Self::Session(_) => scheme.to_owned(),
         };
@@ -79,6 +84,7 @@ impl fmt::Display for Error {
         match self {
             Self::MissingBearerToken => write!(f, "missing bearer token"),
             Self::InvalidAuthorizationHeader => write!(f, "invalid authorization header"),
+            Self::AuthorizationHeaderTooLarge => write!(f, "authorization token header too large"),
             Self::TenantDisabled => write!(f, "OIDC tenant is disabled"),
             Self::Forbidden => write!(f, "authenticated principal is not allowed"),
             Self::TokenRejected(source) => write!(f, "token rejected: {source}"),
