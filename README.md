@@ -21,7 +21,9 @@ This crate is in early development. The current implementation includes:
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`,
   including `quarkus.oidc.discovery-path` and direct `jwks-path` loading when
   `quarkus.oidc.discovery-enabled=false`. Provider HTTP clients created by the
-  crate honour `quarkus.oidc.connection-timeout`.
+  crate honour `quarkus.oidc.connection-timeout`. Use
+  `Oidc::discover_from_config` or `Tenants::discover_from_config` to load
+  `mp-config` properties and build provider-backed middleware in one step.
 - Quarkus-style endpoint path configuration for authorization, token,
   registration, revocation, introspection, user info, and end-session endpoints,
   plus parsing of the matching discovery metadata.

@@ -990,6 +990,8 @@ impl IntoResponse for Error {
 /// Error type returned while building provider-backed middleware.
 #[derive(Debug)]
 pub enum BuildError {
+    /// Loading `mp-config` backed OIDC configuration failed.
+    Config(mp_config::ConfigError),
     /// Provider discovery requires `quarkus.oidc.auth-server-url`.
     MissingAuthServerUrl,
     /// The configured well-known provider has no built-in issuer URL yet.
@@ -1011,6 +1013,7 @@ pub enum BuildError {
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config(source) => write!(f, "OIDC configuration failed: {source}"),
             Self::MissingAuthServerUrl => write!(
                 f,
                 "OIDC provider discovery requires `quarkus.oidc.auth-server-url`"
@@ -1041,6 +1044,7 @@ impl fmt::Display for BuildError {
 impl StdError for BuildError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
+            Self::Config(source) => Some(source),
             Self::InvalidPublicKey(source) => Some(source.as_ref()),
             Self::Http(source) => Some(source),
             _ => None,
@@ -1051,6 +1055,12 @@ impl StdError for BuildError {
 impl From<reqwest::Error> for BuildError {
     fn from(source: reqwest::Error) -> Self {
         Self::Http(source)
+    }
+}
+
+impl From<mp_config::ConfigError> for BuildError {
+    fn from(source: mp_config::ConfigError) -> Self {
+        Self::Config(source)
     }
 }
 
@@ -2586,6 +2596,25 @@ impl Oidc {
         .authorization_from_config(config)
     }
 
+    /// Loads configuration, discovers the provider, and builds the middleware.
+    ///
+    /// This is the config-driven path for bearer-service middleware: local
+    /// `public-key` validation is installed without network access, while
+    /// provider-backed configurations fetch discovery metadata and keys.
+    pub async fn discover_from_config(config: &Config) -> BuildResult<Oidc> {
+        Self::from_config(config)?.discover().await
+    }
+
+    /// Loads configuration, then discovers the provider with a caller-supplied client.
+    pub async fn discover_from_config_with_client(
+        config: &Config,
+        client: reqwest::Client,
+    ) -> BuildResult<Oidc> {
+        Self::from_config(config)?
+            .discover_with_client(client)
+            .await
+    }
+
     /// Returns a tower layer suitable for `Router::layer`.
     pub fn layer(self) -> OidcLayer {
         OidcLayer { oidc: self }
@@ -3276,6 +3305,24 @@ impl Tenants {
         Ok(builder)
     }
 
+    /// Loads configured tenants, discovers their providers, and builds the registry.
+    ///
+    /// The default tenant uses `quarkus.oidc.*`; named tenants use
+    /// `quarkus.oidc.<tenant>.*`. Local `public-key` tenants are built without
+    /// network access, while provider-backed tenants fetch discovery metadata
+    /// and keys.
+    pub async fn discover_from_config(config: &Config) -> BuildResult<Tenants> {
+        discover_tenants_from_config(config, None).await
+    }
+
+    /// Loads configured tenants and discovers providers with a caller-supplied client.
+    pub async fn discover_from_config_with_client(
+        config: &Config,
+        client: reqwest::Client,
+    ) -> BuildResult<Tenants> {
+        discover_tenants_from_config(config, Some(client)).await
+    }
+
     /// Returns a tower layer suitable for `Router::layer`.
     pub fn layer(self) -> TenantsLayer {
         TenantsLayer { tenants: self }
@@ -3395,6 +3442,66 @@ impl TenantsBuilder {
             header_name: self.header_name,
             resolve_with_issuer: self.resolve_with_issuer,
         }
+    }
+}
+
+async fn discover_tenants_from_config(
+    config: &Config,
+    client: Option<reqwest::Client>,
+) -> BuildResult<Tenants> {
+    let mut builder = Tenants::builder().resolve_with_issuer(
+        config
+            .get_optional::<bool>("quarkus.oidc.resolve-tenants-with-issuer")?
+            .unwrap_or_default(),
+    );
+    if let Some(header_name) = config.get_optional::<String>("quarkus.oidc.tenant-id-header")? {
+        let parsed = http::HeaderName::from_str(&header_name).map_err(|error| {
+            mp_config::ConfigError::Conversion {
+                name: "quarkus.oidc.tenant-id-header".to_owned(),
+                value: header_name,
+                message: error.to_string(),
+            }
+        })?;
+        builder = builder.tenant_header(parsed);
+    }
+    if has_default_tenant_config(config) {
+        let default_config = OidcConfig::from_config(config)?;
+        let default_tenant = oidc_builder_from_config(
+            default_config,
+            "quarkus.oidc.public-key",
+            "quarkus.oidc.application-type",
+            "quarkus.oidc.roles.source",
+        )?
+        .authorization_from_config(config)?;
+        let default_tenant = discover_oidc_builder(default_tenant, client.as_ref()).await?;
+        builder = builder.default_tenant(default_tenant);
+    }
+
+    for tenant in named_tenant_configs(config) {
+        let prefix = format!("quarkus.oidc.{}", tenant.prefix_segment);
+        let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
+        validate_configured_tenant_paths(&tenant_config, &format!("{prefix}.tenant-paths"))?;
+        let oidc = oidc_builder_from_config(
+            tenant_config,
+            &format!("{prefix}.public-key"),
+            &format!("{prefix}.application-type"),
+            &format!("{prefix}.roles.source"),
+        )?
+        .authorization_from_config(config)?;
+        let oidc = discover_oidc_builder(oidc, client.as_ref()).await?;
+        builder = builder.tenant(tenant.name, oidc);
+    }
+
+    Ok(builder.build())
+}
+
+async fn discover_oidc_builder(
+    builder: OidcBuilder,
+    client: Option<&reqwest::Client>,
+) -> BuildResult<Oidc> {
+    match client {
+        Some(client) => builder.discover_with_client(client.clone()).await,
+        None => builder.discover().await,
     }
 }
 
@@ -5745,6 +5852,56 @@ dQIDAQAB
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oidc_discover_from_config_builds_public_key_validator() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("public-key-discovery", 100)
+                    .with("quarkus.oidc.public-key", PUBLIC_RSA_KEY)
+                    .with(
+                        "quarkus.oidc.auth-server-url",
+                        "https://issuer.example/realms/app",
+                    )
+                    .with("quarkus.oidc.token.audience", "orders-api"),
+            )
+            .build();
+        let token = jwt_rs256(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec!["admin"],
+            realm_access: RealmAccessClaims {
+                roles: vec!["user"],
+            },
+        });
+
+        let response = claims_app(
+            Oidc::discover_from_config(&config)
+                .await
+                .expect("public key config should build without provider discovery"),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oidc_discover_from_config_requires_auth_server_url_for_provider_discovery() {
+        let config = Config::builder()
+            .add_source(MapSource::new("provider-discovery", 100))
+            .build();
+
+        let error = match Oidc::discover_from_config(&config).await {
+            Ok(_) => panic!("provider discovery should require an auth-server-url"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, BuildError::MissingAuthServerUrl));
     }
 
     #[tokio::test]
@@ -8153,6 +8310,46 @@ dQIDAQAB
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn tenants_discover_from_config_builds_named_public_key_tenant() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-public-key-discovery", 100)
+                    .with("quarkus.oidc.tenant-a.public-key", PUBLIC_RSA_KEY)
+                    .with(
+                        "quarkus.oidc.tenant-a.auth-server-url",
+                        "https://issuer.example/realms/app",
+                    )
+                    .with("quarkus.oidc.tenant-a.token.audience", "orders-api"),
+            )
+            .build();
+        let token = jwt_rs256(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec!["admin"],
+            realm_access: RealmAccessClaims {
+                roles: vec!["user"],
+            },
+        });
+
+        let response = tenant_app(
+            Tenants::discover_from_config(&config)
+                .await
+                .expect("public key tenant config should build without provider discovery"),
+        )
+        .oneshot(request(
+            "/tenant-a/protected",
+            Some(&format!("Bearer {token}")),
+        ))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body(response).await, "alice");
     }
 
     #[tokio::test]
