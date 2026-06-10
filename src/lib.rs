@@ -351,6 +351,15 @@ impl mp_config::FromConfigValue for WellKnownProvider {
     }
 }
 
+impl WellKnownProvider {
+    fn auth_server_url(self) -> Option<&'static str> {
+        match self {
+            Self::Google => Some("https://accounts.google.com"),
+            _ => None,
+        }
+    }
+}
+
 /// Introspection endpoint-specific credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcIntrospectionCredentialsConfig {
@@ -2788,11 +2797,8 @@ impl OidcBuilder {
             return Ok(self.build());
         }
 
-        let auth_server_url = self
-            .config
-            .auth_server_url
-            .clone()
-            .ok_or(BuildError::MissingAuthServerUrl)?;
+        let auth_server_url =
+            auth_server_url_from_config(&self.config).ok_or(BuildError::MissingAuthServerUrl)?;
         if !self.config.discovery_enabled {
             if self.config.token.require_jwt_introspection_only {
                 let introspection_path = self
@@ -3990,6 +3996,15 @@ fn unverified_token_issuer(token: &str) -> Option<String> {
 
 fn discovery_url(auth_server_url: &str, discovery_path: &str) -> BuildResult<reqwest::Url> {
     provider_endpoint_url(auth_server_url, discovery_path)
+}
+
+fn auth_server_url_from_config(config: &OidcConfig) -> Option<String> {
+    config.auth_server_url.clone().or_else(|| {
+        config
+            .provider
+            .and_then(WellKnownProvider::auth_server_url)
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn provider_endpoint_url(auth_server_url: &str, path: &str) -> BuildResult<reqwest::Url> {
@@ -7377,6 +7392,44 @@ dQIDAQAB
                 .expect("discovery URL should parse")
                 .as_str(),
             "https://issuer.example/realms/app/custom-discovery"
+        );
+    }
+
+    #[test]
+    fn provider_google_supplies_auth_server_url() {
+        let config = OidcConfig {
+            provider: Some(WellKnownProvider::Google),
+            ..OidcConfig::default()
+        };
+
+        assert_eq!(
+            auth_server_url_from_config(&config).as_deref(),
+            Some("https://accounts.google.com")
+        );
+        assert_eq!(
+            discovery_url(
+                auth_server_url_from_config(&config)
+                    .expect("google provider should supply auth-server-url")
+                    .as_str(),
+                ".well-known/openid-configuration",
+            )
+            .expect("discovery URL should parse")
+            .as_str(),
+            "https://accounts.google.com/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
+    fn explicit_auth_server_url_overrides_provider() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            provider: Some(WellKnownProvider::Google),
+            ..OidcConfig::default()
+        };
+
+        assert_eq!(
+            auth_server_url_from_config(&config).as_deref(),
+            Some("https://issuer.example/realms/app")
         );
     }
 

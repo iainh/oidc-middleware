@@ -7,9 +7,11 @@ a tower layer that protects axum routes with bearer-token authentication.
 
 This crate is in early development. The current implementation includes:
 
-- `OidcConfig` loaded from `quarkus.oidc.*` properties, including well-known
-  `provider`, `client-id` and `client-name` values, with `Oidc::from_config`
-  also applying configured `quarkus.http.auth.permission.*` policies.
+- `OidcConfig` loaded from `quarkus.oidc.*` properties, including
+  `client-id`, `client-name`, and well-known `provider` values. `provider=google`
+  supplies the Google issuer URL when `auth-server-url` is not configured, and
+  `Oidc::from_config` also applies configured
+  `quarkus.http.auth.permission.*` policies.
 - Service and hybrid `quarkus.oidc.application-type` bearer-token middleware;
   pure `web-app` authorization-code flow is rejected until implemented.
 - `Oidc::layer()` for protecting axum routers.
