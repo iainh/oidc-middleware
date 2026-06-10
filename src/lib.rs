@@ -427,9 +427,21 @@ impl ConfigProperties for OidcTokenConfig {
             .unwrap_or_else(|| "Bearer".to_owned());
         validate_authorization_scheme(&authorization_scheme_key, &authorization_scheme)?;
 
+        let audience_key = key("audience");
+        let audience = config.get_optional::<String>(&audience_key)?;
+        if let Some(value) = &audience {
+            if split_csv(value).is_empty() {
+                return Err(mp_config::ConfigError::Conversion {
+                    name: audience_key,
+                    value: value.clone(),
+                    message: "token audience must include at least one audience".to_owned(),
+                });
+            }
+        }
+
         Ok(Self {
             issuer: config.get_optional(&key("issuer"))?,
-            audience: config.get_optional(&key("audience"))?,
+            audience,
             token_type: config.get_optional(&key("token-type"))?,
             signature_algorithm: config.get_optional(&key("signature-algorithm"))?,
             subject_required: config
@@ -6454,6 +6466,30 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("required claims must include at least one expected value"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_empty_token_audience() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-token-audience", 100)
+                    .with("quarkus.oidc.token.audience", " , "),
+            )
+            .build();
+
+        let error =
+            OidcConfig::from_config(&config).expect_err("empty token audience should be rejected");
+
+        assert!(
+            error.to_string().contains("quarkus.oidc.token.audience"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("token audience must include at least one audience"),
             "{error}"
         );
     }
