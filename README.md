@@ -29,6 +29,8 @@ compliance, operational, and provider-compatibility requirements.
 - Route-local authorization with `RequireAuthenticatedLayer` and
   `RequireRolesLayer`.
 - Optional `#[authenticated]` and `#[roles_allowed]` handler macros.
+- Application-specific identity extractors that can derive authorization and
+  conversion from the OIDC principal or web session.
 - Feature flags for applications that want to reduce dependency and exploit
   surface.
 
@@ -73,8 +75,9 @@ to be easier to evaluate than a single large demo application.
   bearer-token authentication.
 - [`route_authorization.rs`](examples/route_authorization.rs): Apply
   `RequireAuthenticatedLayer` and `RequireRolesLayer` at route boundaries.
-- [`handler_macros.rs`](examples/handler_macros.rs): Use `#[authenticated]` and
-  `#[roles_allowed]` on handlers.
+- [`handler_macros.rs`](examples/handler_macros.rs): Use `#[authenticated]`,
+  `#[roles_allowed]`, and a derived application-specific user extractor on
+  handlers.
 - [`mp_config.rs`](examples/mp_config.rs): Load `oidc.*` settings through
   `mp-config`.
 - [`provider_discovery.rs`](examples/provider_discovery.rs): Build JWKS-backed
@@ -86,7 +89,8 @@ to be easier to evaluate than a single large demo application.
 - [`user_info.rs`](examples/user_info.rs): Validate bearer tokens through
   UserInfo.
 - [`web_app.rs`](examples/web_app.rs): Configure browser login with
-  `tower-sessions`.
+  `tower-sessions`; web-app handlers can extract `OidcSession` to access the
+  principal and validated ID token claims.
 - [`multi_tenant.rs`](examples/multi_tenant.rs): Select tenant-specific OIDC
   middleware by path.
 
@@ -101,6 +105,84 @@ layer. Authorization is applied where Axum developers expect to see it: on the
 route, router, or handler being protected. Public routes should usually stay
 outside `Oidc::layer`; protected routes fail closed when credentials are missing
 or rejected.
+
+## Application identity
+
+Handlers can extract the library-provided `OidcPrincipal` directly:
+
+```rust
+use oidc_middleware::{Error, OidcPrincipal};
+
+async fn profile(principal: OidcPrincipal) -> Result<String, Error> {
+    Ok(format!("profile for {}", principal.subject()))
+}
+```
+
+For larger applications, prefer an application-specific extractor so handler
+signatures use your domain language. With the `macros` feature enabled, derive
+`OidcAuthorize` and `FromOidcPrincipal` for bearer-token routes:
+
+```rust
+use oidc_middleware::{FromOidcPrincipal, OidcAuthorize, Principal};
+
+#[derive(Clone, OidcAuthorize, FromOidcPrincipal)]
+struct User {
+    #[oidc(principal)]
+    principal: Principal,
+    #[oidc(subject)]
+    account_id: String,
+}
+```
+
+The handler macros can then authorize against that local type:
+
+```rust
+use oidc_middleware::{Error, roles_allowed};
+
+#[roles_allowed("admin", principal = user)]
+async fn account(user: User) -> Result<String, Error> {
+    Ok(format!("account {}", user.account_id))
+}
+```
+
+For browser `web-app` flows, extract `OidcSession` when the handler needs both
+the access-token principal and the validated ID token:
+
+```rust
+use oidc_middleware::{Error, OidcSession};
+
+async fn dashboard(session: OidcSession) -> Result<String, Error> {
+    let email = session
+        .id_token()
+        .and_then(|token| token.claim("email"))
+        .and_then(|claim| claim.as_str())
+        .unwrap_or(session.subject());
+
+    Ok(format!("dashboard for {email}"))
+}
+```
+
+If you want the same domain-style handler signatures for browser routes, derive
+`FromOidcSession` and map selected ID token claims into your own type:
+
+```rust
+use oidc_middleware::{FromOidcSession, IdToken, OidcAuthorize, Principal};
+
+#[derive(Clone, OidcAuthorize, FromOidcSession)]
+struct WebUser {
+    #[oidc(principal)]
+    principal: Principal,
+    #[oidc(subject)]
+    account_id: String,
+    #[oidc(id_token)]
+    id_token: Option<IdToken>,
+    #[oidc(id_token_claim = "email")]
+    email: Option<String>,
+}
+```
+
+This keeps OIDC mechanics at the edge of the application while letting route
+handlers receive the identity shape the rest of the codebase understands.
 
 ## Configuration highlights
 
@@ -130,7 +212,7 @@ Default features preserve the full convenience API:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.1" }
+oidc-middleware = { version = "0.2" }
 ```
 
 Applications that provide their own validators can opt into a smaller dependency
@@ -138,7 +220,7 @@ surface:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.1", default-features = false }
+oidc-middleware = { version = "0.2", default-features = false }
 ```
 
 Available features:

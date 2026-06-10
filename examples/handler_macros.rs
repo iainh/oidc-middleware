@@ -4,12 +4,10 @@
 //! when a permission belongs directly to a handler and you want Quarkus-style
 //! annotations near the function body.
 
-use axum::extract::FromRequestParts;
 use axum::{Router, routing::get};
-use http::request::Parts;
 use oidc_middleware::{
-    Error, Oidc, OidcAuthorize, OidcConfig, OidcPrincipal, Principal, StaticTokenValidator,
-    authenticated, roles_allowed,
+    Error, FromOidcPrincipal, Oidc, OidcAuthorize, OidcConfig, OidcPrincipal, Principal,
+    StaticTokenValidator, authenticated, roles_allowed,
 };
 
 fn main() {
@@ -41,34 +39,12 @@ async fn admin(principal: OidcPrincipal) -> Result<String, Error> {
     Ok(format!("admin view for {}", principal.subject()))
 }
 
-#[derive(Clone)]
+#[derive(Clone, OidcAuthorize, FromOidcPrincipal)]
 struct User {
+    #[oidc(principal)]
     principal: Principal,
+    #[oidc(subject)]
     account_id: String,
-}
-
-impl OidcAuthorize for User {
-    fn principal(&self) -> &Principal {
-        &self.principal
-    }
-}
-
-impl<S> FromRequestParts<S> for User
-where
-    S: Send + Sync,
-{
-    type Rejection = Error;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let principal = OidcPrincipal::from_request_parts(parts, state)
-            .await?
-            .into_inner();
-        let account_id = format!("acct-{}", principal.subject());
-        Ok(Self {
-            principal,
-            account_id,
-        })
-    }
 }
 
 #[roles_allowed("admin", principal = user)]
