@@ -1798,6 +1798,75 @@ impl TokenValidator for UserInfoValidator {
     }
 }
 
+/// Token validator that validates a bearer token first, then loads roles from UserInfo.
+#[derive(Clone)]
+pub struct UserInfoRolesValidator {
+    token_validator: Arc<dyn TokenValidator>,
+    provider: Arc<dyn UserInfoProvider>,
+    role_claim_paths: Arc<[String]>,
+    role_claim_separator: Arc<str>,
+}
+
+impl UserInfoRolesValidator {
+    /// Builds a validator that preserves token validation and sources roles from UserInfo.
+    pub fn new<V, P>(token_validator: V, provider: P, config: &OidcConfig) -> Self
+    where
+        V: TokenValidator,
+        P: UserInfoProvider,
+    {
+        Self::from_parts(Arc::new(token_validator), Arc::new(provider), config)
+    }
+
+    fn from_parts(
+        token_validator: Arc<dyn TokenValidator>,
+        provider: Arc<dyn UserInfoProvider>,
+        config: &OidcConfig,
+    ) -> Self {
+        Self {
+            token_validator,
+            provider,
+            role_claim_paths: Arc::from(role_claim_paths_for_source(config, RolesSource::UserInfo)),
+            role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
+        }
+    }
+}
+
+impl TokenValidator for UserInfoRolesValidator {
+    fn validate(&self, token: Arc<str>) -> ValidationFuture {
+        let token_validator = self.token_validator.clone();
+        let provider = self.provider.clone();
+        let role_claim_paths = self.role_claim_paths.clone();
+        let role_claim_separator = self.role_claim_separator.clone();
+
+        Box::pin(async move {
+            let principal = token_validator.validate(token.clone()).await?;
+            let claims = provider
+                .user_info(token)
+                .await
+                .map_err(Error::TokenRejected)?
+                .into_claims();
+
+            if let Some(user_info_subject) = claims.sub.as_deref() {
+                if user_info_subject != principal.subject() {
+                    return Err(Error::TokenRejected(
+                        "UserInfo subject did not match access token subject".into(),
+                    ));
+                }
+            }
+
+            Ok(Principal {
+                subject: principal.subject,
+                issuer: principal.issuer,
+                audience: principal.audience,
+                groups: extract_roles(&claims.extra, &role_claim_paths, &role_claim_separator)
+                    .into_iter()
+                    .map(Arc::from)
+                    .collect(),
+            })
+        })
+    }
+}
+
 #[derive(Clone)]
 struct HttpUserInfoProvider {
     client: reqwest::Client,
@@ -2602,6 +2671,13 @@ impl OidcBuilder {
                     .map(OidcBuilder::build);
             }
 
+            if self.uses_user_info_roles() {
+                self.config
+                    .user_info_path
+                    .as_ref()
+                    .ok_or(BuildError::MissingUserInfoEndpoint)?;
+            }
+
             let jwks_path = self
                 .config
                 .jwks_path
@@ -2649,6 +2725,13 @@ impl OidcBuilder {
                 .map(OidcBuilder::build);
         }
 
+        if self.uses_user_info_roles() {
+            metadata
+                .userinfo_endpoint
+                .as_ref()
+                .ok_or(BuildError::MissingUserInfoEndpoint)?;
+        }
+
         let jwks: JwkSet = client
             .get(&metadata.jwks_uri)
             .send()
@@ -2674,8 +2757,9 @@ impl OidcBuilder {
 
         let validation_config = provider_validation_config(&self.config, &metadata);
         let jwt = JwtValidator::jwks(jwks, &validation_config);
-        self.validator =
-            Some(self.jwt_with_metadata_introspection(jwt, metadata, reqwest::Client::new()));
+        let client = reqwest::Client::new();
+        let validator = self.jwt_with_metadata_introspection(jwt, metadata.clone(), client.clone());
+        self.validator = Some(self.with_metadata_user_info_roles(validator, metadata, client));
         self.build()
     }
 
@@ -2705,33 +2789,45 @@ impl OidcBuilder {
             },
             &validation_config,
         );
-        self.validator = Some(self.jwt_with_metadata_introspection(jwt, metadata, client));
+        let validator = self.jwt_with_metadata_introspection(jwt, metadata.clone(), client.clone());
+        self.validator = Some(self.with_metadata_user_info_roles(validator, metadata, client));
         self.build()
     }
 
     fn install_jwks_with_optional_introspection(&mut self, jwks: JwkSet, client: reqwest::Client) {
         let jwt = JwtValidator::jwks(jwks, &self.config);
+        let user_info_endpoint = self.user_info_endpoint_from_config();
         let Some(introspection_path) = self.config.introspection_path.as_deref() else {
-            self.validator = Some(Arc::new(jwt));
+            self.validator = Some(self.with_user_info_roles_from_config(Arc::new(jwt), client));
             return;
         };
         let Some(auth_server_url) = self.config.auth_server_url.as_deref() else {
-            self.validator = Some(Arc::new(jwt));
+            self.validator = Some(self.with_user_info_roles_from_config(Arc::new(jwt), client));
             return;
         };
         let Ok(endpoint) = provider_endpoint_url(auth_server_url, introspection_path) else {
-            self.validator = Some(Arc::new(jwt));
+            self.validator = Some(self.with_user_info_roles_from_config(Arc::new(jwt), client));
             return;
         };
         let introspection = IntrospectionValidator::new(
-            http_token_introspector(&self.config, client, endpoint.to_string()),
+            http_token_introspector(&self.config, client.clone(), endpoint.to_string()),
             &self.config,
         );
-        self.validator = Some(Arc::new(IntrospectionFallbackValidator::new(
+        let validator = Arc::new(IntrospectionFallbackValidator::new(
             jwt,
             introspection,
             &self.config,
-        )));
+        ));
+        self.validator = Some(match user_info_endpoint {
+            Some(endpoint) if self.uses_user_info_roles() => {
+                Arc::new(UserInfoRolesValidator::from_parts(
+                    validator,
+                    Arc::new(HttpUserInfoProvider { client, endpoint }),
+                    &self.config,
+                ))
+            }
+            _ => validator,
+        });
     }
 
     fn jwt_with_metadata_introspection<J>(
@@ -2782,6 +2878,56 @@ impl OidcBuilder {
             HttpUserInfoProvider { client, endpoint },
             &validation_config,
         )));
+    }
+
+    fn uses_user_info_roles(&self) -> bool {
+        self.config.roles.source == RolesSource::UserInfo
+            && !self.config.token.verify_access_token_with_user_info
+    }
+
+    fn user_info_endpoint_from_config(&self) -> Option<String> {
+        let auth_server_url = self.config.auth_server_url.as_deref()?;
+        let user_info_path = self.config.user_info_path.as_deref()?;
+        provider_endpoint_url(auth_server_url, user_info_path)
+            .ok()
+            .map(Into::into)
+    }
+
+    fn with_user_info_roles_from_config(
+        &self,
+        validator: Arc<dyn TokenValidator>,
+        client: reqwest::Client,
+    ) -> Arc<dyn TokenValidator> {
+        if !self.uses_user_info_roles() {
+            return validator;
+        }
+        let Some(endpoint) = self.user_info_endpoint_from_config() else {
+            return validator;
+        };
+        Arc::new(UserInfoRolesValidator::from_parts(
+            validator,
+            Arc::new(HttpUserInfoProvider { client, endpoint }),
+            &self.config,
+        ))
+    }
+
+    fn with_metadata_user_info_roles(
+        &self,
+        validator: Arc<dyn TokenValidator>,
+        metadata: ProviderMetadata,
+        client: reqwest::Client,
+    ) -> Arc<dyn TokenValidator> {
+        if !self.uses_user_info_roles() {
+            return validator;
+        }
+        let Some(endpoint) = metadata.userinfo_endpoint else {
+            return validator;
+        };
+        Arc::new(UserInfoRolesValidator::from_parts(
+            validator,
+            Arc::new(HttpUserInfoProvider { client, endpoint }),
+            &self.config,
+        ))
     }
 
     /// Finishes the OIDC middleware.
@@ -5008,6 +5154,107 @@ dQIDAQAB
     }
 
     #[tokio::test]
+    async fn user_info_roles_validator_preserves_jwt_validation() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: None,
+                ..OidcTokenConfig::default()
+            },
+            roles: OidcRolesConfig {
+                source: RolesSource::UserInfo,
+                ..OidcRolesConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: vec!["token-role"],
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+        let validator = UserInfoRolesValidator::new(
+            JwtValidator::hs256("secret", &config),
+            |_token: Arc<str>| async move {
+                Ok(UserInfoResponse::from_json(
+                    r#"{
+                        "sub": "alice",
+                        "groups": ["orders-admin", "orders-user"]
+                    }"#,
+                )
+                .expect("UserInfo response should parse"))
+            },
+            &config,
+        );
+
+        let principal = validator
+            .validate(Arc::from(token))
+            .await
+            .expect("JWT and UserInfo roles should validate");
+
+        assert_eq!(principal.subject(), "alice");
+        assert_eq!(
+            principal.groups().collect::<Vec<_>>(),
+            vec!["orders-admin", "orders-user"]
+        );
+    }
+
+    #[tokio::test]
+    async fn user_info_roles_validator_rejects_subject_mismatch() {
+        let config = OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            token: OidcTokenConfig {
+                issuer: None,
+                audience: Some("orders-api".to_owned()),
+                token_type: None,
+                ..OidcTokenConfig::default()
+            },
+            roles: OidcRolesConfig {
+                source: RolesSource::UserInfo,
+                ..OidcRolesConfig::default()
+            },
+            ..OidcConfig::default()
+        };
+        let token = jwt(TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        });
+        let validator = UserInfoRolesValidator::new(
+            JwtValidator::hs256("secret", &config),
+            |_token: Arc<str>| async move {
+                Ok(UserInfoResponse::from_json(
+                    r#"{
+                        "sub": "bob",
+                        "groups": ["orders-admin"]
+                    }"#,
+                )
+                .expect("UserInfo response should parse"))
+            },
+            &config,
+        );
+
+        let error = validator
+            .validate(Arc::from(token))
+            .await
+            .expect_err("UserInfo subject mismatch should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("UserInfo subject did not match access token subject"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn oidc_from_config_uses_public_key_for_local_jwt_verification() {
         let config = Config::builder()
             .add_source(
@@ -6631,6 +6878,27 @@ dQIDAQAB
         .await;
         let Err(error) = result else {
             panic!("UserInfo validation requires user-info-path");
+        };
+
+        assert!(matches!(error, BuildError::MissingUserInfoEndpoint));
+    }
+
+    #[tokio::test]
+    async fn discovery_disabled_requires_user_info_path_for_user_info_roles() {
+        let result = Oidc::builder(OidcConfig {
+            auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
+            discovery_enabled: false,
+            jwks_path: Some("certs".to_owned()),
+            roles: OidcRolesConfig {
+                source: RolesSource::UserInfo,
+                ..OidcRolesConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .discover()
+        .await;
+        let Err(error) = result else {
+            panic!("UserInfo roles require user-info-path");
         };
 
         assert!(matches!(error, BuildError::MissingUserInfoEndpoint));

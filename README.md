@@ -68,8 +68,8 @@ This crate is in early development. The current implementation includes:
 - Configurable role extraction with `quarkus.oidc.roles.role-claim-path`,
   including quoted namespace paths and default Keycloak
   `resource_access/<client-id>/roles` support, plus
-  `quarkus.oidc.roles.role-claim-separator` and
-  `quarkus.oidc.roles.source`.
+  `quarkus.oidc.roles.role-claim-separator` and access-token or UserInfo
+  role sources with `quarkus.oidc.roles.source`.
 - Quarkus-style `quarkus.http.auth.permission.*` path policies for `permit`,
   `deny`, `authenticated`, named `roles-allowed` policies including the `**`
   authenticated role, method-specific matches, `quarkus.http.root-path`
