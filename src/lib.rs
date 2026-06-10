@@ -464,6 +464,8 @@ pub struct OidcTokenConfig {
     pub allow_opaque_token_introspection: bool,
     /// Verify opaque access tokens by calling the UserInfo endpoint.
     pub verify_access_token_with_user_info: bool,
+    /// Token binding validation configuration.
+    pub binding: OidcTokenBindingConfig,
 }
 
 impl Default for OidcTokenConfig {
@@ -486,7 +488,37 @@ impl Default for OidcTokenConfig {
             require_jwt_introspection_only: false,
             allow_opaque_token_introspection: true,
             verify_access_token_with_user_info: false,
+            binding: OidcTokenBindingConfig::default(),
         }
+    }
+}
+
+/// Token binding validation configuration loaded from `quarkus.oidc.token.binding.*`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OidcTokenBindingConfig {
+    /// Require an access-token `cnf` claim matching the client certificate.
+    pub certificate: bool,
+}
+
+impl ConfigProperties for OidcTokenBindingConfig {
+    fn from_config(config: &Config) -> mp_config::Result<Self> {
+        Self::from_config_prefix(config, "")
+    }
+
+    fn from_config_prefix(config: &Config, prefix: &str) -> mp_config::Result<Self> {
+        let key = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+
+        Ok(Self {
+            certificate: config
+                .get_optional(&key("certificate"))?
+                .unwrap_or_default(),
+        })
     }
 }
 
@@ -568,6 +600,7 @@ impl ConfigProperties for OidcTokenConfig {
             verify_access_token_with_user_info: config
                 .get_optional(&key("verify-access-token-with-user-info"))?
                 .unwrap_or_default(),
+            binding: OidcTokenBindingConfig::from_config_prefix(config, &key("binding"))?,
         })
     }
 }
@@ -2595,6 +2628,7 @@ impl Oidc {
             "quarkus.oidc.public-key",
             "quarkus.oidc.application-type",
             "quarkus.oidc.roles.source",
+            "quarkus.oidc.token.binding.certificate",
         )?
         .authorization_from_config(config)
     }
@@ -2680,6 +2714,7 @@ fn oidc_builder_from_config(
     public_key_property: &str,
     application_type_property: &str,
     roles_source_property: &str,
+    token_binding_certificate_property: &str,
 ) -> mp_config::Result<OidcBuilder> {
     let public_key = config.public_key.clone();
     let mut builder = Oidc::builder(config);
@@ -2688,6 +2723,10 @@ fn oidc_builder_from_config(
     }
     validate_service_application_type(&builder.config, application_type_property)?;
     validate_service_roles_source(&builder.config, roles_source_property)?;
+    validate_service_token_binding_certificate(
+        &builder.config,
+        token_binding_certificate_property,
+    )?;
     if let Some(public_key) = public_key {
         builder = builder.public_key(&public_key).map_err(|error| {
             mp_config::ConfigError::Conversion {
@@ -2723,6 +2762,20 @@ fn validate_service_roles_source(
             name: property_name.to_owned(),
             value: "idtoken".to_owned(),
             message: "`idtoken` roles require web-app ID token support, which is not implemented for bearer-service middleware".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_service_token_binding_certificate(
+    config: &OidcConfig,
+    property_name: &str,
+) -> mp_config::Result<()> {
+    if config.token.binding.certificate {
+        return Err(mp_config::ConfigError::Conversion {
+            name: property_name.to_owned(),
+            value: "true".to_owned(),
+            message: "`token.binding.certificate` requires client certificate thumbprint extraction, which is not implemented for bearer-service middleware".to_owned(),
         });
     }
     Ok(())
@@ -3284,6 +3337,7 @@ impl Tenants {
                 "quarkus.oidc.public-key",
                 "quarkus.oidc.application-type",
                 "quarkus.oidc.roles.source",
+                "quarkus.oidc.token.binding.certificate",
             )?
             .authorization_from_config(config)?
             .build();
@@ -3299,6 +3353,7 @@ impl Tenants {
                 &format!("{prefix}.public-key"),
                 &format!("{prefix}.application-type"),
                 &format!("{prefix}.roles.source"),
+                &format!("{prefix}.token.binding.certificate"),
             )?
             .authorization_from_config(config)?
             .build();
@@ -3474,6 +3529,7 @@ async fn discover_tenants_from_config(
             "quarkus.oidc.public-key",
             "quarkus.oidc.application-type",
             "quarkus.oidc.roles.source",
+            "quarkus.oidc.token.binding.certificate",
         )?
         .authorization_from_config(config)?;
         let default_tenant = discover_oidc_builder(default_tenant, client.as_ref()).await?;
@@ -3489,6 +3545,7 @@ async fn discover_tenants_from_config(
             &format!("{prefix}.public-key"),
             &format!("{prefix}.application-type"),
             &format!("{prefix}.roles.source"),
+            &format!("{prefix}.token.binding.certificate"),
         )?
         .authorization_from_config(config)?;
         let oidc = discover_oidc_builder(oidc, client.as_ref()).await?;
@@ -4497,6 +4554,7 @@ dQIDAQAB
                         "quarkus.oidc.token.verify-access-token-with-user-info",
                         "true",
                     )
+                    .with("quarkus.oidc.token.binding.certificate", "true")
                     .with(
                         "quarkus.oidc.roles.role-claim-path",
                         "resource_access.api.roles",
@@ -4573,6 +4631,7 @@ dQIDAQAB
                     require_jwt_introspection_only: true,
                     allow_opaque_token_introspection: false,
                     verify_access_token_with_user_info: true,
+                    binding: OidcTokenBindingConfig { certificate: true },
                 },
                 roles: OidcRolesConfig {
                     source: RolesSource::UserInfo,
@@ -4634,6 +4693,17 @@ dQIDAQAB
         let oidc = OidcConfig::from_config(&config).expect("config should load");
 
         assert_eq!(oidc.roles.source, RolesSource::IdToken);
+    }
+
+    #[test]
+    fn config_defaults_token_binding_certificate_to_false() {
+        let config = Config::builder()
+            .add_source(MapSource::new("test", 100))
+            .build();
+
+        let oidc = OidcConfig::from_config(&config).expect("config should load");
+
+        assert!(!oidc.token.binding.certificate);
     }
 
     #[test]
@@ -6017,6 +6087,31 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("`web-app` application type requires authorization-code flow support"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn oidc_from_config_rejects_token_binding_certificate() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("token-binding", 100)
+                    .with("quarkus.oidc.token.binding.certificate", "true"),
+            )
+            .build();
+
+        let Err(error) = Oidc::from_config(&config) else {
+            panic!("certificate-bound tokens should be rejected for bearer-service middleware");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { ref name, .. }
+                if name == "quarkus.oidc.token.binding.certificate"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("requires client certificate thumbprint extraction"),
             "{error}"
         );
     }
@@ -8157,6 +8252,32 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("`web-app` application type requires authorization-code flow support"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tenants_from_config_rejects_named_token_binding_certificate() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-token-binding", 100)
+                    .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
+                    .with("quarkus.oidc.tenant-a.token.binding.certificate", "true"),
+            )
+            .build();
+
+        let Err(error) = Tenants::from_config(&config) else {
+            panic!("certificate-bound tokens should be rejected for named bearer-service tenants");
+        };
+        assert!(matches!(
+            error,
+            mp_config::ConfigError::Conversion { ref name, .. }
+                if name == "quarkus.oidc.tenant-a.token.binding.certificate"
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("requires client certificate thumbprint extraction"),
             "{error}"
         );
     }

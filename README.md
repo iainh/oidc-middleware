@@ -47,6 +47,9 @@ This crate is in early development. The current implementation includes:
 - Token extraction with `quarkus.oidc.token.header` and case-insensitive
   `quarkus.oidc.token.authorization-scheme`, including matching challenge
   responses.
+- Certificate-bound access-token configuration through
+  `quarkus.oidc.token.binding.certificate` is rejected until request client
+  certificate thumbprints are supported.
 - Multi-tenant routing with `quarkus.oidc.<tenant>.tenant-paths`, quoted tenant
   aliases, tenant IDs, static first-path-segment tenant selection, and optional
   header-based (`quarkus.oidc.tenant-id-header`) or issuer-based tenant
