@@ -121,3 +121,21 @@ let app = Router::new()
     .route("/health", get(|| async { "ok" }))
     .merge(protected);
 ```
+
+## Examples
+
+The `examples/` directory contains compileable, focused usage samples:
+
+- `bearer_service.rs`: protect an Axum API with bearer-token authentication.
+- `route_authorization.rs`: apply `RequireAuthenticatedLayer` and
+  `RequireRolesLayer` at route boundaries.
+- `handler_macros.rs`: use `#[authenticated]` and `#[roles_allowed]` on
+  handlers.
+- `mp_config.rs`: load `oidc.*` settings through `mp-config`.
+- `provider_discovery.rs`: build JWKS-backed JWT validation from provider
+  discovery.
+- `local_public_key.rs`: validate JWTs with an out-of-band public key.
+- `introspection.rs`: validate opaque tokens with token introspection.
+- `user_info.rs`: validate bearer tokens through UserInfo.
+- `web_app.rs`: configure browser login with `tower-sessions`.
+- `multi_tenant.rs`: select tenant-specific OIDC middleware by path.
