@@ -5,8 +5,8 @@ use axum::http::{Request, StatusCode, header::AUTHORIZATION};
 use axum::routing::get;
 use http::request::Parts;
 use oidc_middleware::{
-    Error, Oidc, OidcAuthorize, OidcConfig, OidcPrincipal, Principal, StaticTokenValidator,
-    authenticated, roles_allowed,
+    Error, FromOidcPrincipal, FromOidcSession, IdToken, Oidc, OidcAuthorize, OidcConfig,
+    OidcPrincipal, Principal, StaticTokenValidator, authenticated, roles_allowed,
 };
 use tower::ServiceExt;
 
@@ -67,6 +67,37 @@ async fn user_admin(user: User) -> Result<&'static str, Error> {
 async fn user_profile(user: User) -> Result<&'static str, Error> {
     assert_eq!(user.subject, "alice");
     Ok("user-profile")
+}
+
+#[derive(Clone, OidcAuthorize, FromOidcPrincipal)]
+struct DerivedUser {
+    #[oidc(principal)]
+    principal: Principal,
+    #[oidc(subject)]
+    subject: String,
+}
+
+#[roles_allowed("admin", principal = user)]
+async fn derived_user_admin(user: DerivedUser) -> Result<&'static str, Error> {
+    assert_eq!(user.subject, "alice");
+    Ok("derived-user-admin")
+}
+
+#[derive(Clone, OidcAuthorize, FromOidcSession)]
+struct DerivedSessionUser {
+    #[oidc(principal)]
+    principal: Principal,
+    #[oidc(subject)]
+    subject: String,
+    #[oidc(id_token)]
+    id_token: Option<IdToken>,
+}
+
+#[authenticated(principal = user)]
+async fn derived_session_user_profile(user: DerivedSessionUser) -> Result<&'static str, Error> {
+    assert_eq!(user.subject, "alice");
+    assert!(user.id_token.is_none());
+    Ok("derived-session-user-profile")
 }
 
 #[tokio::test]
@@ -162,6 +193,29 @@ async fn authenticated_macro_accepts_application_user() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn roles_allowed_macro_accepts_derived_application_user() {
+    let response = app(["admin"])
+        .oneshot(request_to("/derived-user-admin", Some("Bearer test-token")))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn authenticated_macro_accepts_derived_session_user() {
+    let response = app(["user"])
+        .oneshot(request_to(
+            "/derived-session-user-profile",
+            Some("Bearer test-token"),
+        ))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 fn app(groups: impl IntoIterator<Item = &'static str>) -> Router {
     Router::new()
         .route("/admin", get(admin))
@@ -169,6 +223,11 @@ fn app(groups: impl IntoIterator<Item = &'static str>) -> Router {
         .route("/authenticated-macro", get(authenticated_macro))
         .route("/user-admin", get(user_admin))
         .route("/user-profile", get(user_profile))
+        .route("/derived-user-admin", get(derived_user_admin))
+        .route(
+            "/derived-session-user-profile",
+            get(derived_session_user_profile),
+        )
         .layer(
             Oidc::builder(OidcConfig::default())
                 .validator(StaticTokenValidator::principal(

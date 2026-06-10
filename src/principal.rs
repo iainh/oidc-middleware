@@ -197,6 +197,22 @@ impl OidcIdentity for OidcPrincipal {
     }
 }
 
+/// Builds an application-specific value from an authenticated principal.
+///
+/// This is the trait implemented by `#[derive(FromOidcPrincipal)]`. Implement
+/// it manually when constructing the application type requires database access
+/// or other fallible domain logic.
+pub trait FromOidcPrincipal: Sized {
+    /// Builds `Self` from the normalized authenticated principal.
+    fn from_principal(principal: Principal) -> Self;
+}
+
+impl FromOidcPrincipal for OidcPrincipal {
+    fn from_principal(principal: Principal) -> Self {
+        Self(principal)
+    }
+}
+
 impl std::ops::Deref for OidcPrincipal {
     type Target = Principal;
 
@@ -266,6 +282,24 @@ impl OidcAuthorize for OidcSession {
 impl OidcIdentity for OidcSession {
     fn id_token(&self) -> Option<&IdToken> {
         self.id_token.as_ref()
+    }
+}
+
+/// Builds an application-specific value from authenticated web-app session context.
+///
+/// This is the trait implemented by `#[derive(FromOidcSession)]`. Implement it
+/// manually when constructing the application type requires fallible domain
+/// lookup or additional session validation.
+#[cfg(feature = "web-app")]
+pub trait FromOidcSession: Sized {
+    /// Builds `Self` from the authenticated OIDC session context.
+    fn from_session(session: OidcSession) -> Self;
+}
+
+#[cfg(feature = "web-app")]
+impl FromOidcSession for OidcSession {
+    fn from_session(session: OidcSession) -> Self {
+        session
     }
 }
 

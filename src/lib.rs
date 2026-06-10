@@ -78,7 +78,9 @@
 //! More complete runnable patterns live in the `examples/` directory.
 
 #[cfg(feature = "macros")]
-pub use oidc_middleware_macros::{authenticated, roles_allowed};
+pub use oidc_middleware_macros::{
+    FromOidcPrincipal, FromOidcSession, OidcAuthorize, authenticated, roles_allowed,
+};
 
 mod authorization;
 mod claims;
@@ -123,9 +125,9 @@ pub use jwks::{JwksProvider, JwksRefreshFuture};
 #[cfg(feature = "jwt")]
 pub use jwt::JwtValidator;
 pub use oidc::{Oidc, OidcBuilder, OidcLayer, OidcService};
+pub use principal::{FromOidcPrincipal, OidcAuthorize, OidcIdentity, OidcPrincipal, Principal};
 #[cfg(feature = "web-app")]
-pub use principal::OidcSession;
-pub use principal::{OidcAuthorize, OidcIdentity, OidcPrincipal, Principal};
+pub use principal::{FromOidcSession, OidcSession};
 pub use provider::ProviderMetadata;
 pub use tenants::{Tenants, TenantsBuilder, TenantsLayer, TenantsService};
 pub use user_info::{

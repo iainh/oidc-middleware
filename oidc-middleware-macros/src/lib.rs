@@ -8,7 +8,10 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{FnArg, Ident, ItemFn, LitStr, Pat, ReturnType, Token, parse_macro_input};
+use syn::{
+    Data, DeriveInput, Field, Fields, FnArg, Ident, ItemFn, LitStr, Pat, ReturnType, Token,
+    parse_macro_input, parse_quote,
+};
 
 /// Adds a Quarkus-style role check to an Axum handler.
 ///
@@ -71,6 +74,35 @@ pub fn authenticated(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
         &mut function,
     ))
+}
+
+/// Derives `OidcAuthorize` for an application-specific type.
+///
+/// Mark the field containing `oidc_middleware::Principal` with
+/// `#[oidc(principal)]`. A field named `principal` is also accepted.
+#[proc_macro_derive(OidcAuthorize, attributes(oidc))]
+pub fn derive_oidc_authorize(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    TokenStream::from(expand_oidc_authorize(&input))
+}
+
+/// Derives conversion from `Principal` plus an Axum extractor implementation.
+///
+/// Supported field annotations are `#[oidc(principal)]` and `#[oidc(subject)]`.
+#[proc_macro_derive(FromOidcPrincipal, attributes(oidc))]
+pub fn derive_from_oidc_principal(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    TokenStream::from(expand_from_oidc_principal(&input))
+}
+
+/// Derives conversion from `OidcSession` plus an Axum extractor implementation.
+///
+/// Supported field annotations are `#[oidc(principal)]`, `#[oidc(subject)]`,
+/// `#[oidc(id_token)]`, and `#[oidc(id_token_claim = "...")]`.
+#[proc_macro_derive(FromOidcSession, attributes(oidc))]
+pub fn derive_from_oidc_session(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    TokenStream::from(expand_from_oidc_session(&input))
 }
 
 struct RolesAllowedArgs {
@@ -239,4 +271,262 @@ fn find_argument<'a>(function: &'a ItemFn, name: &Ident) -> Option<&'a Ident> {
         };
         (ident.ident == *name).then_some(&ident.ident)
     })
+}
+
+#[derive(Clone)]
+enum OidcFieldKind {
+    Principal,
+    Subject,
+    IdToken,
+    IdTokenClaim(LitStr),
+}
+
+struct OidcField<'a> {
+    field: &'a Field,
+    ident: &'a Ident,
+    kind: OidcFieldKind,
+}
+
+fn expand_oidc_authorize(input: &DeriveInput) -> TokenStream2 {
+    let fields = match oidc_fields(input) {
+        Ok(fields) => fields,
+        Err(error) => return error.to_compile_error(),
+    };
+    let Some(principal) = fields
+        .iter()
+        .find(|field| matches!(field.kind, OidcFieldKind::Principal))
+    else {
+        return syn::Error::new_spanned(
+            input,
+            "OidcAuthorize derive requires a field marked #[oidc(principal)] or named `principal`",
+        )
+        .to_compile_error();
+    };
+    let principal_ident = principal.ident;
+    let name = &input.ident;
+    let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
+
+    quote! {
+        impl #impl_generics ::oidc_middleware::OidcAuthorize for #name #type_generics #where_clause {
+            fn principal(&self) -> &::oidc_middleware::Principal {
+                &self.#principal_ident
+            }
+        }
+    }
+}
+
+fn expand_from_oidc_principal(input: &DeriveInput) -> TokenStream2 {
+    let fields = match oidc_fields(input) {
+        Ok(fields) => fields,
+        Err(error) => return error.to_compile_error(),
+    };
+    let initializers = match principal_initializers(input, &fields) {
+        Ok(initializers) => initializers,
+        Err(error) => return error.to_compile_error(),
+    };
+    let name = &input.ident;
+    let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
+    let mut request_generics = input.generics.clone();
+    request_generics.params.push(parse_quote!(S));
+    request_generics
+        .make_where_clause()
+        .predicates
+        .push(parse_quote!(S: Send + Sync));
+    let (request_impl_generics, _, request_where_clause) = request_generics.split_for_impl();
+
+    quote! {
+        impl #impl_generics ::oidc_middleware::FromOidcPrincipal for #name #type_generics #where_clause {
+            fn from_principal(principal: ::oidc_middleware::Principal) -> Self {
+                Self { #(#initializers),* }
+            }
+        }
+
+        impl #request_impl_generics ::axum::extract::FromRequestParts<S> for #name #type_generics #request_where_clause {
+            type Rejection = ::oidc_middleware::Error;
+
+            async fn from_request_parts(
+                parts: &mut ::axum::http::request::Parts,
+                state: &S,
+            ) -> ::std::result::Result<Self, Self::Rejection> {
+                let principal = ::oidc_middleware::OidcPrincipal::from_request_parts(parts, state)
+                    .await?
+                    .into_inner();
+                Ok(<Self as ::oidc_middleware::FromOidcPrincipal>::from_principal(principal))
+            }
+        }
+    }
+}
+
+fn expand_from_oidc_session(input: &DeriveInput) -> TokenStream2 {
+    let fields = match oidc_fields(input) {
+        Ok(fields) => fields,
+        Err(error) => return error.to_compile_error(),
+    };
+    let initializers = match session_initializers(input, &fields) {
+        Ok(initializers) => initializers,
+        Err(error) => return error.to_compile_error(),
+    };
+    let name = &input.ident;
+    let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
+    let mut request_generics = input.generics.clone();
+    request_generics.params.push(parse_quote!(S));
+    request_generics
+        .make_where_clause()
+        .predicates
+        .push(parse_quote!(S: Send + Sync));
+    let (request_impl_generics, _, request_where_clause) = request_generics.split_for_impl();
+
+    quote! {
+        impl #impl_generics ::oidc_middleware::FromOidcSession for #name #type_generics #where_clause {
+            fn from_session(session: ::oidc_middleware::OidcSession) -> Self {
+                Self { #(#initializers),* }
+            }
+        }
+
+        impl #request_impl_generics ::axum::extract::FromRequestParts<S> for #name #type_generics #request_where_clause {
+            type Rejection = ::oidc_middleware::Error;
+
+            async fn from_request_parts(
+                parts: &mut ::axum::http::request::Parts,
+                state: &S,
+            ) -> ::std::result::Result<Self, Self::Rejection> {
+                let session = ::oidc_middleware::OidcSession::from_request_parts(parts, state).await?;
+                Ok(<Self as ::oidc_middleware::FromOidcSession>::from_session(session))
+            }
+        }
+    }
+}
+
+fn principal_initializers(
+    input: &DeriveInput,
+    fields: &[OidcField<'_>],
+) -> syn::Result<Vec<TokenStream2>> {
+    fields
+        .iter()
+        .map(|field| {
+            let ident = field.ident;
+            match &field.kind {
+                OidcFieldKind::Principal => Ok(quote! { #ident: principal.clone() }),
+                OidcFieldKind::Subject => Ok(quote! { #ident: principal.subject().to_owned() }),
+                OidcFieldKind::IdToken | OidcFieldKind::IdTokenClaim(_) => Err(
+                    syn::Error::new_spanned(
+                        field.field,
+                        "ID token fields require #[derive(FromOidcSession)]",
+                    ),
+                ),
+            }
+        })
+        .collect::<syn::Result<Vec<_>>>()
+        .and_then(|initializers| {
+            if fields.iter().any(|field| matches!(field.kind, OidcFieldKind::Principal)) {
+                Ok(initializers)
+            } else {
+                Err(syn::Error::new_spanned(
+                    input,
+                    "FromOidcPrincipal derive requires a field marked #[oidc(principal)] or named `principal`",
+                ))
+            }
+        })
+}
+
+fn session_initializers(
+    input: &DeriveInput,
+    fields: &[OidcField<'_>],
+) -> syn::Result<Vec<TokenStream2>> {
+    fields
+        .iter()
+        .map(|field| {
+            let ident = field.ident;
+            match &field.kind {
+                OidcFieldKind::Principal => Ok(quote! { #ident: session.principal().clone() }),
+                OidcFieldKind::Subject => Ok(quote! { #ident: session.principal().subject().to_owned() }),
+                OidcFieldKind::IdToken => Ok(quote! { #ident: session.id_token().cloned() }),
+                OidcFieldKind::IdTokenClaim(claim) => Ok(quote! {
+                    #ident: session
+                        .id_token()
+                        .and_then(|token| token.claim(#claim))
+                        .and_then(|value| value.as_str())
+                        .map(::std::string::ToString::to_string)
+                }),
+            }
+        })
+        .collect::<syn::Result<Vec<_>>>()
+        .and_then(|initializers| {
+            if fields.iter().any(|field| matches!(field.kind, OidcFieldKind::Principal)) {
+                Ok(initializers)
+            } else {
+                Err(syn::Error::new_spanned(
+                    input,
+                    "FromOidcSession derive requires a field marked #[oidc(principal)] or named `principal`",
+                ))
+            }
+        })
+}
+
+fn oidc_fields(input: &DeriveInput) -> syn::Result<Vec<OidcField<'_>>> {
+    let Data::Struct(data) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            input,
+            "OIDC derives support named structs only",
+        ));
+    };
+    let Fields::Named(fields) = &data.fields else {
+        return Err(syn::Error::new_spanned(
+            input,
+            "OIDC derives support named structs only",
+        ));
+    };
+
+    fields
+        .named
+        .iter()
+        .map(|field| {
+            let ident = field.ident.as_ref().expect("named fields have identifiers");
+            Ok(OidcField {
+                field,
+                ident,
+                kind: oidc_field_kind(field, ident)?,
+            })
+        })
+        .collect()
+}
+
+fn oidc_field_kind(field: &Field, ident: &Ident) -> syn::Result<OidcFieldKind> {
+    let mut kind = None;
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("oidc"))
+    {
+        attr.parse_nested_meta(|meta| {
+            let next = if meta.path.is_ident("principal") {
+                OidcFieldKind::Principal
+            } else if meta.path.is_ident("subject") {
+                OidcFieldKind::Subject
+            } else if meta.path.is_ident("id_token") {
+                OidcFieldKind::IdToken
+            } else if meta.path.is_ident("id_token_claim") {
+                let value = meta.value()?;
+                OidcFieldKind::IdTokenClaim(value.parse()?)
+            } else {
+                return Err(meta.error("unsupported oidc field attribute"));
+            };
+            if kind.is_some() {
+                return Err(meta.error("only one oidc field attribute is allowed per field"));
+            }
+            kind = Some(next);
+            Ok(())
+        })?;
+    }
+
+    Ok(kind.unwrap_or_else(|| inferred_field_kind(ident)))
+}
+
+fn inferred_field_kind(ident: &Ident) -> OidcFieldKind {
+    match ident.to_string().as_str() {
+        "principal" => OidcFieldKind::Principal,
+        "subject" | "user_id" => OidcFieldKind::Subject,
+        "id_token" => OidcFieldKind::IdToken,
+        name => OidcFieldKind::IdTokenClaim(LitStr::new(name, ident.span())),
+    }
 }
