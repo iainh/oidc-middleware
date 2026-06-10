@@ -14,19 +14,21 @@ keywords = ["axum", "oidc", "oauth2", "microprofile"]
 categories = ["web-programming::http-server", "authentication"]
 
 [features]
-default = ["macros", "web-app"]
+default = ["http-client", "jwt", "macros", "web-app"]
+http-client = ["dep:reqwest", "dep:url"]
+jwt = ["dep:jsonwebtoken"]
 macros = ["dep:oidc-middleware-macros"]
-web-app = ["dep:getrandom", "dep:tower-sessions", "dep:url"]
+web-app = ["http-client", "jwt", "dep:getrandom", "dep:tower-sessions"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["json"] }
 base64 = "0.22"
 getrandom = { version = "0.2", optional = true }
 http = "1"
-jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"], optional = true }
 mp-config = { path = "../mp-config" }
 oidc-middleware-macros = { version = "0.1.0", path = "oidc-middleware-macros", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = "1"
 tower-layer = "0.3"

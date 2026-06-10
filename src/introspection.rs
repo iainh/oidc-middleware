@@ -1,3 +1,5 @@
+#[cfg(feature = "http-client")]
+use crate::ClientSecretMethod;
 use crate::claims::deserialize_audience;
 use crate::validation_claims::{
     TokenClaims, validate_introspection_audience, validate_introspection_issuer,
@@ -5,8 +7,8 @@ use crate::validation_claims::{
     validate_token_type,
 };
 use crate::{
-    BoxError, ClientSecretMethod, Error, IntrospectionFuture, OidcConfig, Principal, RolesSource,
-    TokenValidator, ValidationFuture, role_claim_paths_for_source,
+    BoxError, Error, IntrospectionFuture, OidcConfig, Principal, RolesSource, TokenValidator,
+    ValidationFuture, role_claim_paths_for_source,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -288,6 +290,7 @@ impl TokenValidator for IntrospectionValidator {
     }
 }
 
+#[cfg(feature = "http-client")]
 #[derive(Clone)]
 pub(crate) struct HttpTokenIntrospector {
     pub(crate) client: reqwest::Client,
@@ -299,6 +302,7 @@ pub(crate) struct HttpTokenIntrospector {
     pub(crate) include_client_id: bool,
 }
 
+#[cfg(feature = "http-client")]
 impl TokenIntrospector for HttpTokenIntrospector {
     fn introspect(&self, token: Arc<str>) -> IntrospectionFuture {
         let client = self.client.clone();
@@ -339,6 +343,7 @@ impl TokenIntrospector for HttpTokenIntrospector {
     }
 }
 
+#[cfg(feature = "http-client")]
 pub(crate) fn http_token_introspector(
     config: &OidcConfig,
     client: reqwest::Client,
@@ -379,6 +384,7 @@ pub(crate) fn http_token_introspector(
     }
 }
 
+#[cfg(feature = "http-client")]
 pub(crate) fn introspection_request<'a>(
     client: &'a reqwest::Client,
     endpoint: &'a str,
@@ -418,6 +424,7 @@ pub(crate) fn introspection_request<'a>(
     }
 }
 
+#[cfg(feature = "http-client")]
 #[derive(Clone, Copy)]
 pub(crate) struct IntrospectionRequestAuth<'a> {
     pub(crate) client_id: Option<&'a str>,

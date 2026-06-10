@@ -147,6 +147,7 @@ pub enum BuildError {
         message: String,
     },
     /// Fetching provider metadata or keys failed.
+    #[cfg(feature = "http-client")]
     Http(reqwest::Error),
 }
 
@@ -191,6 +192,7 @@ impl fmt::Display for BuildError {
             ),
             Self::InvalidPublicKey(source) => write!(f, "invalid OIDC public key: {source}"),
             Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
+            #[cfg(feature = "http-client")]
             Self::Http(source) => write!(f, "OIDC provider request failed: {source}"),
         }
     }
@@ -201,12 +203,14 @@ impl StdError for BuildError {
         match self {
             Self::Config(source) => Some(source),
             Self::InvalidPublicKey(source) => Some(source.as_ref()),
+            #[cfg(feature = "http-client")]
             Self::Http(source) => Some(source),
             _ => None,
         }
     }
 }
 
+#[cfg(feature = "http-client")]
 impl From<reqwest::Error> for BuildError {
     fn from(source: reqwest::Error) -> Self {
         Self::Http(source)

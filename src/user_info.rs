@@ -6,7 +6,9 @@ use crate::{
     BoxError, Error, OidcConfig, Principal, RolesSource, TokenValidator, UserInfoFuture,
     ValidationFuture, role_claim_paths_for_source,
 };
+#[cfg(feature = "http-client")]
 use http::HeaderValue;
+#[cfg(feature = "http-client")]
 use http::header::AUTHORIZATION;
 use serde::Deserialize;
 use serde_json::Value;
@@ -250,18 +252,21 @@ impl TokenValidator for UserInfoRolesValidator {
     }
 }
 
+#[cfg(feature = "http-client")]
 #[derive(Clone)]
 pub(crate) struct HttpUserInfoProvider {
     client: reqwest::Client,
     endpoint: String,
 }
 
+#[cfg(feature = "http-client")]
 impl HttpUserInfoProvider {
     pub(crate) fn new(client: reqwest::Client, endpoint: String) -> Self {
         Self { client, endpoint }
     }
 }
 
+#[cfg(feature = "http-client")]
 impl UserInfoProvider for HttpUserInfoProvider {
     fn user_info(&self, token: Arc<str>) -> UserInfoFuture {
         let client = self.client.clone();

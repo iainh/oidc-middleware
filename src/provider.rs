@@ -1,3 +1,4 @@
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 use crate::{BuildError, OidcConfig};
 use serde::Deserialize;
 
@@ -44,6 +45,7 @@ impl ProviderMetadata {
     }
 }
 
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 pub(crate) fn discovery_url(
     auth_server_url: &str,
     discovery_path: &str,
@@ -51,6 +53,7 @@ pub(crate) fn discovery_url(
     provider_endpoint_url(auth_server_url, discovery_path)
 }
 
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 pub(crate) fn auth_server_url_from_config(config: &OidcConfig) -> crate::BuildResult<String> {
     if let Some(auth_server_url) = &config.auth_server_url {
         return Ok(auth_server_url.clone());
@@ -66,6 +69,7 @@ pub(crate) fn auth_server_url_from_config(config: &OidcConfig) -> crate::BuildRe
     Err(BuildError::MissingAuthServerUrl)
 }
 
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 pub(crate) fn provider_endpoint_url(
     auth_server_url: &str,
     path: &str,
@@ -85,6 +89,7 @@ pub(crate) fn provider_endpoint_url(
     })
 }
 
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 pub(crate) fn provider_validation_config(
     config: &OidcConfig,
     metadata: &ProviderMetadata,

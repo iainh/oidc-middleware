@@ -1,22 +1,37 @@
+#[cfg(feature = "http-client")]
+use crate::BuildError;
+#[cfg(any(feature = "http-client", feature = "jwt"))]
+use crate::BuildResult;
+#[cfg(all(feature = "http-client", feature = "jwt"))]
+use crate::IntrospectionFallbackValidator;
+#[cfg(feature = "jwt")]
+use crate::JwtValidator;
+#[cfg(any(all(feature = "http-client", feature = "jwt"), feature = "web-app"))]
+use crate::ProviderMetadata;
+#[cfg(all(feature = "http-client", feature = "jwt"))]
+use crate::UserInfoRolesValidator;
+#[cfg(feature = "http-client")]
 use crate::introspection::http_token_introspector;
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 use crate::jwks::HttpJwksProvider;
-use crate::provider::{
-    auth_server_url_from_config, discovery_url, provider_endpoint_url, provider_validation_config,
-};
+#[cfg(all(feature = "http-client", feature = "jwt"))]
+use crate::provider::{auth_server_url_from_config, provider_validation_config};
+#[cfg(all(feature = "http-client", feature = "jwt"))]
+use crate::provider::{discovery_url, provider_endpoint_url};
 use crate::token::bearer_token;
+#[cfg(feature = "http-client")]
 use crate::user_info::HttpUserInfoProvider;
 use crate::validator::RejectAllTokens;
 #[cfg(feature = "web-app")]
 use crate::web_app::WebApp;
 use crate::{
-    ApplicationType, BuildError, BuildResult, Error, IntrospectionFallbackValidator,
-    IntrospectionValidator, JwtValidator, OidcConfig, Principal, ProviderMetadata, Result,
-    RolesSource, TokenIntrospector, TokenValidator, UserInfoProvider, UserInfoRolesValidator,
-    UserInfoValidator,
+    ApplicationType, Error, IntrospectionValidator, OidcConfig, Principal, Result, RolesSource,
+    TokenIntrospector, TokenValidator, UserInfoProvider, UserInfoValidator,
 };
 use axum::body::Body;
 use axum::response::Response;
 use http::Request;
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 use jsonwebtoken::jwk::JwkSet;
 use mp_config::Config;
 use std::convert::Infallible;
@@ -95,11 +110,13 @@ impl Oidc {
     /// This is the config-driven path for bearer-service and web-app middleware:
     /// local `public-key` validation is installed without network access, while
     /// provider-backed configurations fetch discovery metadata and keys.
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     pub async fn discover_from_config(config: &Config) -> BuildResult<Oidc> {
         Self::from_config(config)?.discover().await
     }
 
     /// Loads configuration, then discovers the provider with a caller-supplied client.
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     pub async fn discover_from_config_with_client(
         config: &Config,
         client: reqwest::Client,
@@ -273,7 +290,10 @@ pub(crate) fn oidc_builder_from_config(
     token_decrypt_id_token_property: &str,
 ) -> mp_config::Result<OidcBuilder> {
     let public_key = config.public_key.clone();
+    #[cfg(feature = "jwt")]
     let mut builder = Oidc::builder(config);
+    #[cfg(not(feature = "jwt"))]
+    let builder = Oidc::builder(config);
     if !builder.config.enabled {
         debug!("OIDC builder loaded disabled configuration; provider validation setup is skipped");
         return Ok(builder);
@@ -289,17 +309,30 @@ pub(crate) fn oidc_builder_from_config(
         token_decrypt_id_token_property,
     )?;
     if let Some(public_key) = public_key {
-        debug!(
-            property = public_key_property,
-            "installing configured public-key validator"
-        );
-        builder = builder.public_key(&public_key).map_err(|error| {
-            mp_config::ConfigError::Conversion {
+        #[cfg(not(feature = "jwt"))]
+        {
+            return Err(mp_config::ConfigError::Conversion {
                 name: public_key_property.to_owned(),
                 value: public_key,
-                message: error.to_string(),
-            }
-        })?;
+                message: "configured public-key validation requires the `jwt` crate feature"
+                    .to_owned(),
+            });
+        }
+
+        #[cfg(feature = "jwt")]
+        {
+            debug!(
+                property = public_key_property,
+                "installing configured public-key validator"
+            );
+            builder = builder.public_key(&public_key).map_err(|error| {
+                mp_config::ConfigError::Conversion {
+                    name: public_key_property.to_owned(),
+                    value: public_key,
+                    message: error.to_string(),
+                }
+            })?;
+        }
     }
     Ok(builder)
 }
@@ -358,6 +391,7 @@ fn validate_service_token_decryption(
     Ok(())
 }
 
+#[cfg(feature = "http-client")]
 fn oidc_http_client(config: &OidcConfig) -> BuildResult<reqwest::Client> {
     trace!(
         timeout_ms = config.connection_timeout.as_millis(),
@@ -401,6 +435,7 @@ impl OidcBuilder {
     /// Static public keys avoid network access at startup, but they do not
     /// rotate automatically. Prefer discovery or refreshable JWKS when the
     /// provider rotates signing keys.
+    #[cfg(feature = "jwt")]
     pub fn public_key(mut self, public_key: &str) -> BuildResult<Self> {
         debug!("installing static public-key JWT validator");
         self.validator = Some(Arc::new(JwtValidator::public_key(
@@ -432,12 +467,14 @@ impl OidcBuilder {
     /// This is useful when discovery is disabled or the provider exposes a
     /// non-standard introspection endpoint. Client credentials come from
     /// `oidc.credentials.*` and `oidc.introspection-credentials.*`.
+    #[cfg(feature = "http-client")]
     pub fn introspection_endpoint(self, endpoint: &str) -> BuildResult<Self> {
         let client = oidc_http_client(&self.config)?;
         self.introspection_endpoint_with_client(endpoint, client)
     }
 
     /// Installs an HTTP token introspection validator using a caller-supplied client.
+    #[cfg(feature = "http-client")]
     pub fn introspection_endpoint_with_client(
         mut self,
         endpoint: &str,
@@ -470,12 +507,14 @@ impl OidcBuilder {
     }
 
     /// Installs an HTTP UserInfo-backed token validator.
+    #[cfg(feature = "http-client")]
     pub fn user_info_endpoint(self, endpoint: &str) -> BuildResult<Self> {
         let client = oidc_http_client(&self.config)?;
         self.user_info_endpoint_with_client(endpoint, client)
     }
 
     /// Installs an HTTP UserInfo-backed token validator using a caller-supplied client.
+    #[cfg(feature = "http-client")]
     pub fn user_info_endpoint_with_client(
         mut self,
         endpoint: &str,
@@ -498,12 +537,14 @@ impl OidcBuilder {
     /// Discovery is the recommended production path. It derives endpoints from
     /// the issuer, uses JWKS for JWT validation by default, and switches to
     /// introspection or UserInfo when the token configuration asks for it.
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     pub async fn discover(self) -> BuildResult<Oidc> {
         let client = oidc_http_client(&self.config)?;
         self.discover_with_client(client).await
     }
 
     /// Discovers provider metadata using a caller-supplied HTTP client.
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     pub async fn discover_with_client(self, client: reqwest::Client) -> BuildResult<Oidc> {
         if !self.config.enabled {
             debug!("OIDC discovery skipped because middleware is disabled");
@@ -646,6 +687,7 @@ impl OidcBuilder {
     ///
     /// Use this when another startup component owns discovery caching, retries,
     /// or trust policy but you still want this crate's validation behaviour.
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     pub fn provider_metadata(
         mut self,
         metadata: ProviderMetadata,
@@ -683,6 +725,7 @@ impl OidcBuilder {
     /// The validator refreshes keys when a token references an unknown `kid`,
     /// throttled by `oidc.token.forced-jwk-refresh-interval`. This handles key
     /// rotation without refreshing on every rejected token.
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     pub fn provider_metadata_refreshing(
         mut self,
         metadata: ProviderMetadata,
@@ -719,6 +762,7 @@ impl OidcBuilder {
         Ok(self.build())
     }
 
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     fn install_jwks_with_optional_introspection(&mut self, jwks: JwkSet, client: reqwest::Client) {
         debug!("installing JWKS validator with optional introspection fallback");
         let jwt = JwtValidator::jwks(jwks, &self.config);
@@ -756,6 +800,7 @@ impl OidcBuilder {
         });
     }
 
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     fn jwt_with_metadata_introspection<J>(
         &self,
         jwt: J,
@@ -784,6 +829,7 @@ impl OidcBuilder {
         ))
     }
 
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     fn install_metadata_introspection(
         &mut self,
         metadata: ProviderMetadata,
@@ -802,6 +848,7 @@ impl OidcBuilder {
         Ok(())
     }
 
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     fn install_metadata_user_info(
         &mut self,
         metadata: ProviderMetadata,
@@ -820,11 +867,13 @@ impl OidcBuilder {
         Ok(())
     }
 
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     fn uses_user_info_roles(&self) -> bool {
         self.config.roles.source == RolesSource::UserInfo
             && !self.config.token.verify_access_token_with_user_info
     }
 
+    #[cfg(feature = "web-app")]
     #[cfg(feature = "web-app")]
     fn install_web_app_from_config(&mut self, client: reqwest::Client) -> BuildResult<()> {
         if self.config.application_type != ApplicationType::WebApp {
@@ -835,7 +884,7 @@ impl OidcBuilder {
         Ok(())
     }
 
-    #[cfg(not(feature = "web-app"))]
+    #[cfg(all(feature = "http-client", feature = "jwt", not(feature = "web-app")))]
     fn install_web_app_from_config(&mut self, _client: reqwest::Client) -> BuildResult<()> {
         if self.config.application_type == ApplicationType::WebApp {
             return Err(BuildError::WebAppFeatureDisabled);
@@ -843,6 +892,7 @@ impl OidcBuilder {
         Ok(())
     }
 
+    #[cfg(feature = "web-app")]
     #[cfg(feature = "web-app")]
     fn install_web_app_from_metadata(
         &mut self,
@@ -862,7 +912,7 @@ impl OidcBuilder {
         Ok(())
     }
 
-    #[cfg(not(feature = "web-app"))]
+    #[cfg(all(feature = "http-client", feature = "jwt", not(feature = "web-app")))]
     fn install_web_app_from_metadata(
         &mut self,
         _metadata: &ProviderMetadata,
@@ -874,6 +924,7 @@ impl OidcBuilder {
         Ok(())
     }
 
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     fn user_info_endpoint_from_config(&self) -> Option<String> {
         let auth_server_url = self.config.auth_server_url.as_deref()?;
         let user_info_path = self.config.user_info_path.as_deref()?;
@@ -882,6 +933,7 @@ impl OidcBuilder {
             .map(Into::into)
     }
 
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     fn with_user_info_roles_from_config(
         &self,
         validator: Arc<dyn TokenValidator>,
@@ -900,6 +952,7 @@ impl OidcBuilder {
         ))
     }
 
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     fn with_metadata_user_info_roles(
         &self,
         validator: Arc<dyn TokenValidator>,

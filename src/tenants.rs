@@ -1,7 +1,9 @@
 use crate::config_helpers::{has_default_tenant_config, named_tenant_configs, split_csv};
 use crate::path::path_match_score;
 use crate::token::{unverified_token_from_request, unverified_token_issuer};
-use crate::{BuildResult, Oidc, OidcBuilder, OidcConfig, oidc_builder_from_config};
+#[cfg(all(feature = "http-client", feature = "jwt"))]
+use crate::{BuildResult, OidcBuilder};
+use crate::{Oidc, OidcConfig, oidc_builder_from_config};
 use axum::body::Body;
 use axum::response::Response;
 use http::Request;
@@ -117,11 +119,13 @@ impl Tenants {
     /// `oidc.<tenant>.*`. Local `public-key` tenants are built without
     /// network access, while provider-backed tenants fetch discovery metadata
     /// and keys.
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     pub async fn discover_from_config(config: &Config) -> BuildResult<Tenants> {
         discover_tenants_from_config(config, None).await
     }
 
     /// Loads configured tenants and discovers providers with a caller-supplied client.
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     pub async fn discover_from_config_with_client(
         config: &Config,
         client: reqwest::Client,
@@ -324,6 +328,7 @@ impl TenantsBuilder {
     }
 }
 
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 async fn discover_tenants_from_config(
     config: &Config,
     client: Option<reqwest::Client>,
@@ -378,6 +383,7 @@ async fn discover_tenants_from_config(
     Ok(builder.build())
 }
 
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 async fn discover_oidc_builder(
     builder: OidcBuilder,
     client: Option<&reqwest::Client>,

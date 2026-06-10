@@ -86,7 +86,9 @@ mod config;
 mod config_helpers;
 mod error;
 mod introspection;
+#[cfg(feature = "jwt")]
 mod jwks;
+#[cfg(feature = "jwt")]
 mod jwt;
 mod oidc;
 mod path;
@@ -114,7 +116,9 @@ pub use introspection::{
     IntrospectionFallbackValidator, IntrospectionResponse, IntrospectionValidator,
     TokenIntrospector,
 };
+#[cfg(feature = "jwt")]
 pub use jwks::{JwksProvider, JwksRefreshFuture};
+#[cfg(feature = "jwt")]
 pub use jwt::JwtValidator;
 pub use oidc::{Oidc, OidcBuilder, OidcLayer, OidcService};
 pub use principal::{OidcPrincipal, Principal};

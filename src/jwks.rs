@@ -40,18 +40,21 @@ where
     }
 }
 
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 #[derive(Clone)]
 pub(crate) struct HttpJwksProvider {
     client: reqwest::Client,
     jwks_uri: String,
 }
 
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 impl HttpJwksProvider {
     pub(crate) fn new(client: reqwest::Client, jwks_uri: String) -> Self {
         Self { client, jwks_uri }
     }
 }
 
+#[cfg(all(feature = "http-client", feature = "jwt"))]
 impl JwksProvider for HttpJwksProvider {
     fn fetch(&self) -> JwksRefreshFuture {
         let client = self.client.clone();

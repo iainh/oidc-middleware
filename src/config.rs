@@ -1,5 +1,6 @@
 use crate::config_helpers::{load_optional_non_empty_string, load_required_claims, split_csv};
 use crate::token::validate_authorization_scheme;
+#[cfg(feature = "jwt")]
 use jsonwebtoken::Algorithm;
 use mp_config::{Config, ConfigProperties};
 use std::collections::HashMap;
@@ -294,6 +295,7 @@ impl ConfigProperties for OidcCredentialsConfig {
 }
 
 impl OidcCredentialsConfig {
+    #[cfg(feature = "http-client")]
     pub(crate) fn effective_client_secret(&self) -> Option<&str> {
         self.secret
             .as_deref()
@@ -418,6 +420,7 @@ impl mp_config::FromConfigValue for WellKnownProvider {
 }
 
 impl WellKnownProvider {
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
     pub(crate) fn auth_server_url(self) -> Option<&'static str> {
         match self {
             Self::Google => Some("https://accounts.google.com"),
@@ -847,6 +850,7 @@ pub enum TokenSignatureAlgorithm {
 }
 
 impl TokenSignatureAlgorithm {
+    #[cfg(feature = "jwt")]
     pub(crate) fn algorithm(self) -> Algorithm {
         match self {
             Self::Rs256 => Algorithm::RS256,
