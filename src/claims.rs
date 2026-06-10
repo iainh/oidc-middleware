@@ -24,15 +24,12 @@ pub(crate) fn apply_role_mappings(
     }
 
     let mapped_roles = principal
-        .groups
-        .iter()
+        .group_arcs()
         .filter_map(|role| role_mappings.get(role.as_ref()))
         .flatten()
         .map(|role| Arc::from(role.clone()))
         .collect::<Vec<_>>();
-    principal.groups.extend(mapped_roles);
-    principal.groups.sort();
-    principal.groups.dedup();
+    principal.add_groups(mapped_roles);
 }
 
 pub(crate) fn claim_path_value<'a>(claims: &'a Value, path: &str) -> Option<&'a Value> {

@@ -49,6 +49,7 @@ mod introspection;
 mod jwks;
 mod jwt;
 mod path;
+mod principal;
 mod provider;
 mod token;
 mod user_info;
@@ -66,6 +67,7 @@ pub use introspection::{
 };
 pub use jwks::{JwksProvider, JwksRefreshFuture};
 pub use jwt::JwtValidator;
+pub use principal::{OidcPrincipal, Principal};
 pub use provider::ProviderMetadata;
 pub use user_info::{
     UserInfoProvider, UserInfoResponse, UserInfoRolesValidator, UserInfoValidator,
@@ -73,15 +75,13 @@ pub use user_info::{
 
 use authorization::AuthRequirement;
 use axum::body::Body;
-use axum::extract::FromRequestParts;
 use axum::response::{IntoResponse, Response};
-use claims::{apply_role_mappings, extract_roles};
+use claims::apply_role_mappings;
 pub(crate) use config::role_claim_paths_for_source;
 use config_helpers::{
     has_authorization_config, has_default_tenant_config, named_tenant_configs, split_csv,
 };
 use http::header::WWW_AUTHENTICATE;
-use http::request::Parts;
 use http::{HeaderValue, Request, StatusCode};
 use introspection::http_token_introspector;
 use jsonwebtoken::jwk::JwkSet;
@@ -103,7 +103,6 @@ use token::{bearer_token, unverified_token_from_request, unverified_token_issuer
 use tower_layer::Layer;
 use tower_service::Service;
 use user_info::HttpUserInfoProvider;
-use validation_claims::{TokenClaims, principal_name};
 
 /// Result type returned by token validators.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -119,139 +118,6 @@ pub type UserInfoFuture =
     Pin<Box<dyn Future<Output = std::result::Result<UserInfoResponse, BoxError>> + Send>>;
 /// Result type returned while building OIDC middleware.
 pub type BuildResult<T> = std::result::Result<T, BuildError>;
-
-/// Authenticated identity stored in request extensions.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Principal {
-    subject: Arc<str>,
-    issuer: Option<Arc<str>>,
-    audience: Vec<Arc<str>>,
-    groups: Vec<Arc<str>>,
-}
-
-impl Principal {
-    /// Creates a principal with the supplied subject.
-    pub fn new(subject: impl Into<String>) -> Self {
-        Self {
-            subject: Arc::from(subject.into()),
-            issuer: None,
-            audience: Vec::new(),
-            groups: Vec::new(),
-        }
-    }
-
-    /// Creates a principal with group memberships.
-    pub fn with_groups(
-        subject: impl Into<String>,
-        groups: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        Self {
-            subject: Arc::from(subject.into()),
-            issuer: None,
-            audience: Vec::new(),
-            groups: groups
-                .into_iter()
-                .map(|group| Arc::from(group.into()))
-                .collect(),
-        }
-    }
-
-    /// Returns the token subject.
-    pub fn subject(&self) -> &str {
-        &self.subject
-    }
-
-    /// Returns the token issuer when present.
-    pub fn issuer(&self) -> Option<&str> {
-        self.issuer.as_deref()
-    }
-
-    /// Returns token audiences.
-    pub fn audience(&self) -> impl Iterator<Item = &str> {
-        self.audience.iter().map(AsRef::as_ref)
-    }
-
-    /// Returns group or role names carried by the token.
-    pub fn groups(&self) -> impl Iterator<Item = &str> {
-        self.groups.iter().map(AsRef::as_ref)
-    }
-
-    /// Returns true when this principal has `group`.
-    pub fn has_group(&self, group: &str) -> bool {
-        self.groups
-            .iter()
-            .any(|candidate| candidate.as_ref() == group)
-    }
-
-    /// Returns true when this principal has at least one of `groups`.
-    pub fn has_any_group<'a>(&self, groups: impl IntoIterator<Item = &'a str>) -> bool {
-        groups.into_iter().any(|group| self.has_group(group))
-    }
-
-    pub(crate) fn from_claims(
-        claims: TokenClaims,
-        role_claim_paths: &[String],
-        role_claim_separator: &str,
-        principal_claim: Option<&str>,
-    ) -> Result<Self> {
-        let subject = principal_name(&claims, principal_claim)?;
-        Ok(Self {
-            subject: Arc::from(subject),
-            issuer: claims.iss.map(Arc::from),
-            audience: claims.aud.into_iter().map(Arc::from).collect(),
-            groups: extract_roles(&claims.extra, role_claim_paths, role_claim_separator)
-                .into_iter()
-                .map(Arc::from)
-                .collect(),
-        })
-    }
-
-    pub(crate) fn with_claim_groups(mut self, groups: Vec<Arc<str>>) -> Self {
-        self.groups = groups;
-        self
-    }
-}
-
-/// Axum extractor for the authenticated OIDC principal.
-///
-/// This is intended for handlers protected by [`Oidc::layer`]. It is also the
-/// expected principal argument for [`roles_allowed`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OidcPrincipal(Principal);
-
-impl OidcPrincipal {
-    /// Consumes the extractor wrapper and returns the principal.
-    pub fn into_inner(self) -> Principal {
-        self.0
-    }
-}
-
-impl std::ops::Deref for OidcPrincipal {
-    type Target = Principal;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<S> FromRequestParts<S> for OidcPrincipal
-where
-    S: Send + Sync,
-{
-    type Rejection = Error;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> std::result::Result<Self, Self::Rejection> {
-        parts
-            .extensions
-            .get::<Principal>()
-            .cloned()
-            .map(Self)
-            .ok_or(Error::Forbidden)
-    }
-}
 
 /// Error type returned while authenticating a request.
 #[derive(Debug)]
