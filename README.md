@@ -15,7 +15,8 @@ This crate is in early development. The current implementation includes:
 - pluggable bearer-token validation through `TokenValidator`.
 - OIDC provider discovery from `auth-server-url` and discovered `jwks_uri`,
   including `quarkus.oidc.discovery-path` and direct `jwks-path` loading when
-  `quarkus.oidc.discovery-enabled=false`.
+  `quarkus.oidc.discovery-enabled=false`. Provider HTTP clients created by the
+  crate honour `quarkus.oidc.connection-timeout`.
 - Quarkus-style endpoint path configuration for authorization, token,
   registration, revocation, introspection, user info, and end-session endpoints,
   plus parsing of the matching discovery metadata.

@@ -106,6 +106,9 @@ pub struct OidcConfig {
     pub auth_server_url: Option<String>,
     /// Well-known OpenID Connect provider identifier.
     pub provider: Option<WellKnownProvider>,
+    /// Timeout for establishing HTTP connections to the provider.
+    #[config(default = "10s")]
+    pub connection_timeout: Duration,
     /// Enables OIDC provider metadata discovery.
     #[config(default = "true")]
     pub discovery_enabled: bool,
@@ -170,6 +173,7 @@ impl Default for OidcConfig {
             resolve_tenants_with_issuer: false,
             auth_server_url: None,
             provider: None,
+            connection_timeout: Duration::from_secs(10),
             discovery_enabled: true,
             discovery_path: ".well-known/openid-configuration".to_owned(),
             jwks_path: None,
@@ -2441,6 +2445,12 @@ fn oidc_builder_from_config(
     Ok(builder)
 }
 
+fn oidc_http_client(config: &OidcConfig) -> BuildResult<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(config.connection_timeout)
+        .build()?)
+}
+
 /// Builder for [`Oidc`].
 pub struct OidcBuilder {
     config: OidcConfig,
@@ -2494,7 +2504,8 @@ impl OidcBuilder {
 
     /// Installs an HTTP token introspection validator.
     pub fn introspection_endpoint(self, endpoint: &str) -> BuildResult<Self> {
-        self.introspection_endpoint_with_client(endpoint, reqwest::Client::new())
+        let client = oidc_http_client(&self.config)?;
+        self.introspection_endpoint_with_client(endpoint, client)
     }
 
     /// Installs an HTTP token introspection validator using a caller-supplied client.
@@ -2525,7 +2536,8 @@ impl OidcBuilder {
 
     /// Installs an HTTP UserInfo-backed token validator.
     pub fn user_info_endpoint(self, endpoint: &str) -> BuildResult<Self> {
-        self.user_info_endpoint_with_client(endpoint, reqwest::Client::new())
+        let client = oidc_http_client(&self.config)?;
+        self.user_info_endpoint_with_client(endpoint, client)
     }
 
     /// Installs an HTTP UserInfo-backed token validator using a caller-supplied client.
@@ -2550,7 +2562,8 @@ impl OidcBuilder {
 
     /// Discovers provider metadata and installs a JWKS-backed JWT validator.
     pub async fn discover(self) -> BuildResult<Oidc> {
-        self.discover_with_client(reqwest::Client::new()).await
+        let client = oidc_http_client(&self.config)?;
+        self.discover_with_client(client).await
     }
 
     /// Discovers provider metadata using a caller-supplied HTTP client.
@@ -3216,6 +3229,7 @@ fn has_default_tenant_config(config: &Config) -> bool {
             || key == "quarkus.oidc.tenant-enabled"
             || key == "quarkus.oidc.auth-server-url"
             || key == "quarkus.oidc.provider"
+            || key == "quarkus.oidc.connection-timeout"
             || key == "quarkus.oidc.discovery-enabled"
             || key == "quarkus.oidc.discovery-path"
             || key == "quarkus.oidc.jwks-path"
@@ -3269,6 +3283,7 @@ fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
                 | "tenant-enabled"
                 | "auth-server-url"
                 | "provider"
+                | "connection-timeout"
                 | "discovery-enabled"
                 | "discovery-path"
                 | "jwks-path"
@@ -3868,6 +3883,7 @@ dQIDAQAB
                         "https://issuer.example/realms/app",
                     )
                     .with("quarkus.oidc.provider", "github")
+                    .with("quarkus.oidc.connection-timeout", "2s")
                     .with("quarkus.oidc.resolve-tenants-with-issuer", "true")
                     .with("quarkus.oidc.discovery-enabled", "false")
                     .with("quarkus.oidc.discovery-path", "custom-discovery")
@@ -3956,6 +3972,7 @@ dQIDAQAB
                 resolve_tenants_with_issuer: true,
                 auth_server_url: Some("https://issuer.example/realms/app".to_owned()),
                 provider: Some(WellKnownProvider::Github),
+                connection_timeout: Duration::from_secs(2),
                 discovery_enabled: false,
                 discovery_path: "custom-discovery".to_owned(),
                 jwks_path: Some("protocol/openid-connect/certs".to_owned()),
@@ -6784,6 +6801,7 @@ dQIDAQAB
                     .with("quarkus.oidc.tenant-paths", "/api/default")
                     .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
                     .with("quarkus.oidc.tenant-a.provider", "google")
+                    .with("quarkus.oidc.tenant-a.connection-timeout", "3s")
                     .with("quarkus.oidc.tenant-a.client-id", "tenant-a-client")
                     .with("quarkus.oidc.tenant-a.client-name", "Tenant A")
                     .with("quarkus.oidc.tenant-a.tenant-id", "orders")
@@ -6800,6 +6818,7 @@ dQIDAQAB
         let tenant_a = OidcConfig::from_config_prefix(&config, "quarkus.oidc.tenant-a").unwrap();
         assert_eq!(tenant_a.tenant_paths, Some("/api/a/*".to_owned()));
         assert_eq!(tenant_a.provider, Some(WellKnownProvider::Google));
+        assert_eq!(tenant_a.connection_timeout, Duration::from_secs(3));
         assert_eq!(tenant_a.client_id, Some("tenant-a-client".to_owned()));
         assert_eq!(tenant_a.client_name, Some("Tenant A".to_owned()));
         assert_eq!(tenant_a.tenant_id, Some("orders".to_owned()));
