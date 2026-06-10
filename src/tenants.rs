@@ -382,8 +382,9 @@ where
                 return inner.call(request).await;
             };
 
-            match tenant.authenticate(&mut request).await {
-                Ok(()) => inner.call(request).await,
+            match tenant.authenticate_or_response(&mut request).await {
+                Ok(Some(response)) => Ok(response),
+                Ok(None) => inner.call(request).await,
                 Err(error) => {
                     Ok(error.into_response_with_scheme(&tenant.config.token.authorization_scheme))
                 }

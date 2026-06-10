@@ -36,6 +36,9 @@
 //! - `quarkus.oidc.provider` maps to [`OidcConfig::provider`].
 //! - `quarkus.oidc.client-id` maps to [`OidcConfig::client_id`].
 //! - `quarkus.oidc.application-type` maps to [`OidcConfig::application_type`].
+//! - `quarkus.oidc.authentication.*` configures browser redirects for
+//!   `web-app` applications. `web-app` middleware expects a
+//!   [`tower_sessions::Session`] extension supplied by `tower-sessions`.
 //! - `quarkus.oidc.enabled=false` disables authentication for the layer.
 //! - `quarkus.oidc.tenant-enabled=false` rejects requests as tenant-disabled.
 
@@ -58,12 +61,14 @@ mod token;
 mod user_info;
 mod validation_claims;
 mod validator;
+mod web_app;
 
 pub use authorization::Authorization;
 pub use config::{
-    ApplicationType, ClientSecretMethod, OidcClientSecretConfig, OidcConfig, OidcCredentialsConfig,
-    OidcIntrospectionCredentialsConfig, OidcRolesConfig, OidcTokenBindingConfig, OidcTokenConfig,
-    RolesSource, TokenSignatureAlgorithm, WellKnownProvider,
+    ApplicationType, ClientSecretMethod, OidcAuthenticationConfig, OidcClientSecretConfig,
+    OidcConfig, OidcCredentialsConfig, OidcIntrospectionCredentialsConfig, OidcRolesConfig,
+    OidcTokenBindingConfig, OidcTokenConfig, RolesSource, TokenSignatureAlgorithm,
+    WellKnownProvider,
 };
 pub use error::{BuildError, Error};
 pub use introspection::{

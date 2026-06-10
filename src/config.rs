@@ -63,6 +63,9 @@ pub struct OidcConfig {
     /// Quarkus-style application type.
     #[config(default)]
     pub application_type: ApplicationType,
+    /// Browser authentication settings used by `web-app` applications.
+    #[config(nested)]
+    pub authentication: OidcAuthenticationConfig,
     /// Client credential settings used for provider calls.
     #[config(nested)]
     pub credentials: OidcCredentialsConfig,
@@ -109,11 +112,80 @@ impl Default for OidcConfig {
             tenant_paths: None,
             public_key: None,
             application_type: ApplicationType::Service,
+            authentication: OidcAuthenticationConfig::default(),
             credentials: OidcCredentialsConfig::default(),
             introspection_credentials: OidcIntrospectionCredentialsConfig::default(),
             token: OidcTokenConfig::default(),
             roles: OidcRolesConfig::default(),
         }
+    }
+}
+
+/// Browser authentication settings loaded from `quarkus.oidc.authentication.*`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcAuthenticationConfig {
+    /// Redirect URI path or absolute URI used for authorization-code callbacks.
+    pub redirect_path: String,
+    /// Return users to their original path after completing the code flow.
+    pub restore_path_after_redirect: bool,
+    /// OIDC scopes requested from the provider.
+    pub scopes: Vec<String>,
+}
+
+impl Default for OidcAuthenticationConfig {
+    fn default() -> Self {
+        Self {
+            redirect_path: "/q/oidc/callback".to_owned(),
+            restore_path_after_redirect: true,
+            scopes: vec!["openid".to_owned()],
+        }
+    }
+}
+
+impl ConfigProperties for OidcAuthenticationConfig {
+    fn from_config(config: &Config) -> mp_config::Result<Self> {
+        Self::from_config_prefix(config, "")
+    }
+
+    fn from_config_prefix(config: &Config, prefix: &str) -> mp_config::Result<Self> {
+        let key = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+
+        let redirect_path = config
+            .get_optional::<String>(&key("redirect-path"))?
+            .unwrap_or_else(|| "/q/oidc/callback".to_owned());
+        if redirect_path.trim().is_empty() {
+            return Err(mp_config::ConfigError::Conversion {
+                name: key("redirect-path"),
+                value: redirect_path,
+                message: "redirect-path must not be empty".to_owned(),
+            });
+        }
+
+        let scopes = config
+            .get_optional::<String>(&key("scopes"))?
+            .map(|scopes| split_csv(&scopes))
+            .unwrap_or_else(|| vec!["openid".to_owned()]);
+        if scopes.is_empty() || !scopes.iter().any(|scope| scope == "openid") {
+            return Err(mp_config::ConfigError::Conversion {
+                name: key("scopes"),
+                value: scopes.join(","),
+                message: "web-app authentication scopes must include `openid`".to_owned(),
+            });
+        }
+
+        Ok(Self {
+            redirect_path,
+            restore_path_after_redirect: config
+                .get_optional(&key("restore-path-after-redirect"))?
+                .unwrap_or(true),
+            scopes,
+        })
     }
 }
 

@@ -13,8 +13,12 @@ This crate is in early development. The current implementation includes:
   Other provider identifiers require an explicit `auth-server-url` until their
   issuer URLs are built in. `Oidc::from_config` also applies configured
   `quarkus.http.auth.permission.*` policies.
-- Service and hybrid `quarkus.oidc.application-type` bearer-token middleware;
-  pure `web-app` authorization-code flow is rejected until implemented.
+- Service and hybrid `quarkus.oidc.application-type` bearer-token middleware,
+  plus `web-app` authorization-code flow when built through provider discovery
+  or explicit authorization and token endpoint configuration.
+- Web-app session state is stored through `tower-sessions`; applications using
+  `application-type=web-app` must install a `SessionManagerLayer` outside the
+  OIDC layer.
 - `Oidc::layer()` for protecting axum routers.
 - request `Principal` extensions after successful authentication.
 - pluggable bearer-token validation through `TokenValidator`.
@@ -27,6 +31,10 @@ This crate is in early development. The current implementation includes:
 - Quarkus-style endpoint path configuration for authorization, token,
   registration, revocation, introspection, user info, and end-session endpoints,
   plus parsing of the matching discovery metadata.
+- Web-app browser authentication configuration with
+  `quarkus.oidc.authentication.redirect-path`,
+  `quarkus.oidc.authentication.restore-path-after-redirect`, and
+  `quarkus.oidc.authentication.scopes`. The scope list must include `openid`.
 - Local JWT verification with `quarkus.oidc.public-key`.
 - Audience validation from one or more configured
   `quarkus.oidc.token.audience` values.

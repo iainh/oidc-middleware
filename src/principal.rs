@@ -96,6 +96,20 @@ impl Principal {
         self
     }
 
+    pub(crate) fn from_parts(
+        subject: String,
+        issuer: Option<String>,
+        audience: Vec<String>,
+        groups: Vec<String>,
+    ) -> Self {
+        Self {
+            subject: Arc::from(subject),
+            issuer: issuer.map(Arc::from),
+            audience: audience.into_iter().map(Arc::from).collect(),
+            groups: groups.into_iter().map(Arc::from).collect(),
+        }
+    }
+
     pub(crate) fn group_arcs(&self) -> impl Iterator<Item = &Arc<str>> {
         self.groups.iter()
     }

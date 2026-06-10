@@ -18,6 +18,8 @@ pub enum Error {
     Forbidden,
     /// The validator rejected the token.
     TokenRejected(BoxError),
+    /// Web-app session handling failed.
+    Session(BoxError),
 }
 
 impl Error {
@@ -25,6 +27,7 @@ impl Error {
         match self {
             Self::TenantDisabled => StatusCode::NOT_FOUND,
             Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Session(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::MissingBearerToken
             | Self::InvalidAuthorizationHeader
             | Self::TokenRejected(_) => StatusCode::UNAUTHORIZED,
@@ -40,6 +43,7 @@ impl Error {
             Self::MissingBearerToken | Self::TenantDisabled | Self::Forbidden => scheme.to_owned(),
             Self::InvalidAuthorizationHeader => format!(r#"{scheme} error="invalid_request""#),
             Self::TokenRejected(_) => format!(r#"{scheme} error="invalid_token""#),
+            Self::Session(_) => scheme.to_owned(),
         };
         HeaderValue::from_str(&value).unwrap_or_else(|_| self.challenge())
     }
@@ -64,6 +68,7 @@ impl fmt::Display for Error {
             Self::TenantDisabled => write!(f, "OIDC tenant is disabled"),
             Self::Forbidden => write!(f, "authenticated principal is not allowed"),
             Self::TokenRejected(source) => write!(f, "token rejected: {source}"),
+            Self::Session(source) => write!(f, "OIDC web-app session failed: {source}"),
         }
     }
 }
@@ -72,6 +77,7 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::TokenRejected(source) => Some(source.as_ref()),
+            Self::Session(source) => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -105,6 +111,12 @@ pub enum BuildError {
     MissingIntrospectionEndpoint,
     /// UserInfo token validation requires a configured or discovered endpoint.
     MissingUserInfoEndpoint,
+    /// Web-app authorization-code redirects require an authorization endpoint.
+    MissingAuthorizationEndpoint,
+    /// Web-app authorization-code callbacks require a token endpoint.
+    MissingTokenEndpoint,
+    /// Web-app authorization-code flow requires `quarkus.oidc.client-id`.
+    MissingClientId,
     /// The configured public key could not be parsed.
     InvalidPublicKey(BoxError),
     /// A configured provider or metadata URL could not be parsed.
@@ -137,6 +149,19 @@ impl fmt::Display for BuildError {
             Self::MissingUserInfoEndpoint => {
                 write!(f, "OIDC UserInfo validation requires a UserInfo endpoint")
             }
+            Self::MissingAuthorizationEndpoint => {
+                write!(
+                    f,
+                    "OIDC web-app authentication requires an authorization endpoint"
+                )
+            }
+            Self::MissingTokenEndpoint => {
+                write!(f, "OIDC web-app authentication requires a token endpoint")
+            }
+            Self::MissingClientId => write!(
+                f,
+                "OIDC web-app authentication requires `quarkus.oidc.client-id`"
+            ),
             Self::InvalidPublicKey(source) => write!(f, "invalid OIDC public key: {source}"),
             Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
             Self::Http(source) => write!(f, "OIDC provider request failed: {source}"),

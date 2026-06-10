@@ -9,6 +9,7 @@ use crate::provider::{
 use crate::token::bearer_token;
 use crate::user_info::HttpUserInfoProvider;
 use crate::validator::RejectAllTokens;
+use crate::web_app::WebApp;
 use crate::{
     ApplicationType, Authorization, BuildError, BuildResult, Error, IntrospectionFallbackValidator,
     IntrospectionValidator, JwtValidator, OidcConfig, Principal, ProviderMetadata, Result,
@@ -28,12 +29,18 @@ use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
 
+enum WebAppPrincipal {
+    Authenticated(Principal),
+    Redirect(Response),
+}
+
 /// OIDC middleware entry point.
 #[derive(Clone)]
 pub struct Oidc {
     pub(crate) config: OidcConfig,
     validator: Arc<dyn TokenValidator>,
     authorization: Option<Authorization>,
+    web_app: Option<Arc<WebApp>>,
 }
 
 impl Oidc {
@@ -43,6 +50,7 @@ impl Oidc {
             config,
             validator: None,
             authorization: None,
+            web_app: None,
         }
     }
 
@@ -62,8 +70,8 @@ impl Oidc {
 
     /// Loads configuration, discovers the provider, and builds the middleware.
     ///
-    /// This is the config-driven path for bearer-service middleware: local
-    /// `public-key` validation is installed without network access, while
+    /// This is the config-driven path for bearer-service and web-app middleware:
+    /// local `public-key` validation is installed without network access, while
     /// provider-backed configurations fetch discovery metadata and keys.
     pub async fn discover_from_config(config: &Config) -> BuildResult<Oidc> {
         Self::from_config(config)?.discover().await
@@ -128,18 +136,124 @@ impl Oidc {
         Ok(())
     }
 
+    pub(crate) async fn authenticate_web_app(
+        &self,
+        request: &mut Request<Body>,
+    ) -> Result<Option<Response>> {
+        if !self.config.enabled {
+            return Ok(None);
+        }
+
+        if !self.config.tenant_enabled {
+            return Err(Error::TenantDisabled);
+        }
+
+        let Some(web_app) = &self.web_app else {
+            return Err(Error::Session(
+                std::io::Error::other(
+                    "`web-app` requires provider discovery or configured authorization and token endpoints",
+                )
+                .into(),
+            ));
+        };
+
+        if web_app.is_callback(request) {
+            return web_app
+                .callback(request, self.validator.clone())
+                .await
+                .map(Some);
+        }
+
+        if let Some(authorization) = &self.authorization {
+            match authorization.requirement(request.method(), request.uri().path()) {
+                AuthRequirement::Permit => return Ok(None),
+                AuthRequirement::Deny => {
+                    match self.web_app_principal_or_redirect(request, web_app).await? {
+                        WebAppPrincipal::Authenticated(_) => return Err(Error::Forbidden),
+                        WebAppPrincipal::Redirect(response) => return Ok(Some(response)),
+                    }
+                }
+                AuthRequirement::Authenticated(role_mappings) => {
+                    let WebAppPrincipal::Authenticated(mut principal) =
+                        self.web_app_principal_or_redirect(request, web_app).await?
+                    else {
+                        return web_app.authorization_redirect(request).await.map(Some);
+                    };
+                    apply_role_mappings(&mut principal, &role_mappings);
+                    request.extensions_mut().insert(principal);
+                    return Ok(None);
+                }
+                AuthRequirement::Roles {
+                    role_sets,
+                    role_mappings,
+                } => {
+                    let WebAppPrincipal::Authenticated(mut principal) =
+                        self.web_app_principal_or_redirect(request, web_app).await?
+                    else {
+                        return web_app.authorization_redirect(request).await.map(Some);
+                    };
+                    apply_role_mappings(&mut principal, &role_mappings);
+                    if role_sets
+                        .iter()
+                        .all(|roles| principal.has_any_group(roles.iter().map(String::as_str)))
+                    {
+                        request.extensions_mut().insert(principal);
+                        return Ok(None);
+                    }
+                    return Err(Error::Forbidden);
+                }
+            }
+        }
+
+        match self.web_app_principal_or_redirect(request, web_app).await? {
+            WebAppPrincipal::Authenticated(_) => Ok(None),
+            WebAppPrincipal::Redirect(response) => Ok(Some(response)),
+        }
+    }
+
+    async fn web_app_principal_or_redirect(
+        &self,
+        request: &mut Request<Body>,
+        web_app: &WebApp,
+    ) -> Result<WebAppPrincipal> {
+        if let Some(principal) = web_app.session_principal(request).await? {
+            request.extensions_mut().insert(principal.clone());
+            return Ok(WebAppPrincipal::Authenticated(principal));
+        }
+
+        web_app
+            .authorization_redirect(request)
+            .await
+            .map(WebAppPrincipal::Redirect)
+    }
+
     async fn authenticate_principal(&self, request: &mut Request<Body>) -> Result<Principal> {
         let token = bearer_token(request, &self.config.token)?;
         let principal = self.validator.validate(token).await?;
         request.extensions_mut().insert(principal.clone());
         Ok(principal)
     }
+
+    pub(crate) async fn authenticate_or_response(
+        &self,
+        request: &mut Request<Body>,
+    ) -> Result<Option<Response>> {
+        if self.config.application_type != ApplicationType::WebApp {
+            self.authenticate(request).await?;
+            return Ok(None);
+        }
+
+        match self.authenticate_web_app(request).await {
+            Ok(response) => Ok(response),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 pub(crate) fn oidc_builder_from_config(
     config: OidcConfig,
     public_key_property: &str,
-    application_type_property: &str,
+    _application_type_property: &str,
     roles_source_property: &str,
     token_binding_certificate_property: &str,
     token_decrypt_access_token_property: &str,
@@ -150,7 +264,6 @@ pub(crate) fn oidc_builder_from_config(
     if !builder.config.enabled {
         return Ok(builder);
     }
-    validate_service_application_type(&builder.config, application_type_property)?;
     validate_service_roles_source(&builder.config, roles_source_property)?;
     validate_service_token_binding_certificate(
         &builder.config,
@@ -173,29 +286,17 @@ pub(crate) fn oidc_builder_from_config(
     Ok(builder)
 }
 
-fn validate_service_application_type(
-    config: &OidcConfig,
-    property_name: &str,
-) -> mp_config::Result<()> {
-    if config.application_type == ApplicationType::WebApp {
-        return Err(mp_config::ConfigError::Conversion {
-            name: property_name.to_owned(),
-            value: "web-app".to_owned(),
-            message: "`web-app` application type requires authorization-code flow support, which is not implemented for bearer-service middleware".to_owned(),
-        });
-    }
-    Ok(())
-}
-
 fn validate_service_roles_source(
     config: &OidcConfig,
     property_name: &str,
 ) -> mp_config::Result<()> {
-    if config.roles.source == RolesSource::IdToken {
+    if config.roles.source == RolesSource::IdToken
+        && config.application_type != ApplicationType::WebApp
+    {
         return Err(mp_config::ConfigError::Conversion {
             name: property_name.to_owned(),
             value: "idtoken".to_owned(),
-            message: "`idtoken` roles require web-app ID token support, which is not implemented for bearer-service middleware".to_owned(),
+            message: "`idtoken` roles require the `web-app` application type".to_owned(),
         });
     }
     Ok(())
@@ -250,6 +351,7 @@ pub struct OidcBuilder {
     config: OidcConfig,
     validator: Option<Arc<dyn TokenValidator>>,
     authorization: Option<Authorization>,
+    web_app: Option<Arc<WebApp>>,
 }
 
 impl OidcBuilder {
@@ -359,44 +461,57 @@ impl OidcBuilder {
 
     /// Discovers provider metadata using a caller-supplied HTTP client.
     pub async fn discover_with_client(self, client: reqwest::Client) -> BuildResult<Oidc> {
-        if !self.config.enabled || self.config.public_key.is_some() {
+        if !self.config.enabled {
             return Ok(self.build());
+        }
+        if self.config.public_key.is_some()
+            && self.config.application_type != ApplicationType::WebApp
+        {
+            let mut builder = self;
+            builder.install_web_app_from_config(client)?;
+            return Ok(builder.build());
         }
 
         let auth_server_url = auth_server_url_from_config(&self.config)?;
         if !self.config.discovery_enabled {
-            if self.config.token.require_jwt_introspection_only {
-                let introspection_path = self
+            let mut builder = self;
+            builder.install_web_app_from_config(client.clone())?;
+            if builder.config.public_key.is_some() {
+                return Ok(builder.build());
+            }
+            if builder.config.token.require_jwt_introspection_only {
+                let introspection_path = builder
                     .config
                     .introspection_path
                     .clone()
                     .ok_or(BuildError::MissingIntrospectionEndpoint)?;
                 let endpoint = provider_endpoint_url(&auth_server_url, &introspection_path)?;
-                return self
+                return builder
                     .introspection_endpoint_with_client(endpoint.as_str(), client)
                     .map(OidcBuilder::build);
             }
 
-            if self.config.token.verify_access_token_with_user_info {
-                let user_info_path = self
+            if builder.config.token.verify_access_token_with_user_info {
+                let user_info_path = builder
                     .config
                     .user_info_path
                     .clone()
                     .ok_or(BuildError::MissingUserInfoEndpoint)?;
                 let endpoint = provider_endpoint_url(&auth_server_url, &user_info_path)?;
-                return self
+                return builder
                     .user_info_endpoint_with_client(endpoint.as_str(), client)
                     .map(OidcBuilder::build);
             }
 
-            if self.uses_user_info_roles() {
-                self.config
+            if builder.uses_user_info_roles() {
+                builder
+                    .config
                     .user_info_path
                     .as_ref()
                     .ok_or(BuildError::MissingUserInfoEndpoint)?;
             }
 
-            let jwks_path = self
+            let jwks_path = builder
                 .config
                 .jwks_path
                 .clone()
@@ -409,7 +524,6 @@ impl OidcBuilder {
                 .error_for_status()?
                 .json()
                 .await?;
-            let mut builder = self;
             builder.install_jwks_with_optional_introspection(jwks, client);
             return Ok(builder.build());
         }
@@ -423,27 +537,33 @@ impl OidcBuilder {
             .json()
             .await?;
 
-        if self.config.token.require_jwt_introspection_only {
+        let mut builder = self;
+        builder.install_web_app_from_metadata(&metadata, client.clone())?;
+        if builder.config.public_key.is_some() {
+            return Ok(builder.build());
+        }
+
+        if builder.config.token.require_jwt_introspection_only {
             let endpoint = metadata
                 .introspection_endpoint
                 .as_deref()
                 .ok_or(BuildError::MissingIntrospectionEndpoint)?;
-            return self
+            return builder
                 .introspection_endpoint_with_client(endpoint, client)
                 .map(OidcBuilder::build);
         }
 
-        if self.config.token.verify_access_token_with_user_info {
+        if builder.config.token.verify_access_token_with_user_info {
             let endpoint = metadata
                 .userinfo_endpoint
                 .as_deref()
                 .ok_or(BuildError::MissingUserInfoEndpoint)?;
-            return self
+            return builder
                 .user_info_endpoint_with_client(endpoint, client)
                 .map(OidcBuilder::build);
         }
 
-        if self.uses_user_info_roles() {
+        if builder.uses_user_info_roles() {
             metadata
                 .userinfo_endpoint
                 .as_ref()
@@ -458,7 +578,7 @@ impl OidcBuilder {
             .json()
             .await?;
 
-        self.provider_metadata_refreshing(metadata, jwks, client)
+        builder.provider_metadata_refreshing(metadata, jwks, client)
     }
 
     /// Installs provider metadata and a JWKS-backed JWT validator.
@@ -467,6 +587,7 @@ impl OidcBuilder {
         metadata: ProviderMetadata,
         jwks: JwkSet,
     ) -> BuildResult<Oidc> {
+        self.install_web_app_from_metadata(&metadata, reqwest::Client::new())?;
         if self.config.token.require_jwt_introspection_only {
             self.install_metadata_introspection(metadata, reqwest::Client::new())?;
             return Ok(self.build());
@@ -499,6 +620,7 @@ impl OidcBuilder {
         jwks: JwkSet,
         client: reqwest::Client,
     ) -> BuildResult<Oidc> {
+        self.install_web_app_from_metadata(&metadata, client.clone())?;
         if self.config.token.require_jwt_introspection_only {
             self.install_metadata_introspection(metadata, client)?;
             return Ok(self.build());
@@ -626,6 +748,31 @@ impl OidcBuilder {
             && !self.config.token.verify_access_token_with_user_info
     }
 
+    fn install_web_app_from_config(&mut self, client: reqwest::Client) -> BuildResult<()> {
+        if self.config.application_type != ApplicationType::WebApp {
+            return Ok(());
+        }
+        self.web_app = Some(Arc::new(WebApp::from_config(&self.config, client)?));
+        Ok(())
+    }
+
+    fn install_web_app_from_metadata(
+        &mut self,
+        metadata: &ProviderMetadata,
+        client: reqwest::Client,
+    ) -> BuildResult<()> {
+        if self.config.application_type != ApplicationType::WebApp {
+            return Ok(());
+        }
+        self.web_app = Some(Arc::new(WebApp::from_provider_metadata(
+            &self.config,
+            client,
+            metadata.authorization_endpoint.clone(),
+            metadata.token_endpoint.clone(),
+        )?));
+        Ok(())
+    }
+
     fn user_info_endpoint_from_config(&self) -> Option<String> {
         let auth_server_url = self.config.auth_server_url.as_deref()?;
         let user_info_path = self.config.user_info_path.as_deref()?;
@@ -681,6 +828,7 @@ impl OidcBuilder {
             config: self.config,
             validator: self.validator.unwrap_or_else(|| Arc::new(RejectAllTokens)),
             authorization: self.authorization,
+            web_app: self.web_app,
         }
     }
 }
@@ -728,8 +876,9 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            match oidc.authenticate(&mut request).await {
-                Ok(()) => inner.call(request).await,
+            match oidc.authenticate_or_response(&mut request).await {
+                Ok(Some(response)) => Ok(response),
+                Ok(None) => inner.call(request).await,
                 Err(error) => Ok(error.into_response_with_scheme(&authorization_scheme)),
             }
         })

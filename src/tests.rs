@@ -14,7 +14,7 @@ use axum::extract::Extension;
 use axum::response::Response;
 use axum::routing::get;
 use http::Request;
-use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use http::header::{AUTHORIZATION, COOKIE, HOST, LOCATION, SET_COOKIE, WWW_AUTHENTICATE};
 use http::{HeaderValue, StatusCode};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tower::ServiceExt;
+use tower_sessions::{MemoryStore, SessionManagerLayer};
 
 const TEST_IAT: u64 = 1_700_000_000;
 
@@ -122,6 +123,15 @@ fn config_loads_quarkus_oidc_properties() {
                 .with("quarkus.oidc.tenant-id", "orders-tenant")
                 .with("quarkus.oidc.public-key", "configured-public-key")
                 .with("quarkus.oidc.application-type", "hybrid")
+                .with(
+                    "quarkus.oidc.authentication.redirect-path",
+                    "/login/callback",
+                )
+                .with(
+                    "quarkus.oidc.authentication.restore-path-after-redirect",
+                    "false",
+                )
+                .with("quarkus.oidc.authentication.scopes", "openid,email,profile")
                 .with("quarkus.oidc.token.audience", "orders-api")
                 .with("quarkus.oidc.token.token-type", "bearer")
                 .with("quarkus.oidc.token.signature-algorithm", "rs256")
@@ -192,6 +202,15 @@ fn config_loads_quarkus_oidc_properties() {
             tenant_paths: None,
             public_key: Some("configured-public-key".to_owned()),
             application_type: ApplicationType::Hybrid,
+            authentication: OidcAuthenticationConfig {
+                redirect_path: "/login/callback".to_owned(),
+                restore_path_after_redirect: false,
+                scopes: vec![
+                    "openid".to_owned(),
+                    "email".to_owned(),
+                    "profile".to_owned(),
+                ],
+            },
             credentials: OidcCredentialsConfig {
                 secret: Some("orders-secret".to_owned()),
                 client_secret: OidcClientSecretConfig {
@@ -1656,13 +1675,13 @@ fn oidc_from_config_rejects_id_token_roles_source() {
     assert!(
         error
             .to_string()
-            .contains("`idtoken` roles require web-app ID token support"),
+            .contains("`idtoken` roles require the `web-app` application type"),
         "{error}"
     );
 }
 
 #[test]
-fn oidc_from_config_rejects_web_app_application_type() {
+fn oidc_from_config_accepts_web_app_application_type() {
     let config = Config::builder()
         .add_source(
             MapSource::new("web-app", 100)
@@ -1671,20 +1690,189 @@ fn oidc_from_config_rejects_web_app_application_type() {
         )
         .build();
 
-    let Err(error) = Oidc::from_config(&config) else {
-        panic!("web-app should be rejected for bearer-service middleware");
-    };
-    assert!(matches!(
-        error,
-        mp_config::ConfigError::Conversion { ref name, .. }
-            if name == "quarkus.oidc.application-type"
-    ));
-    assert!(
-        error
-            .to_string()
-            .contains("`web-app` application type requires authorization-code flow support"),
-        "{error}"
+    let _builder = Oidc::from_config(&config).expect("web-app should be accepted");
+}
+
+#[tokio::test]
+async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            redirect_path: "/login/callback".to_owned(),
+            restore_path_after_redirect: true,
+            scopes: vec!["openid".to_owned(), "email".to_owned()],
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some("https://issuer.example/realms/app/token".to_owned()),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        JwkSet { keys: vec![] },
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer())
+        .layer(SessionManagerLayer::new(MemoryStore::default()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected?item=1")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    let location = reqwest::Url::parse(location).expect("redirect location should be a URL");
+    assert_eq!(
+        location.as_str().split('?').next().unwrap(),
+        "https://issuer.example/realms/app/auth"
     );
+    let query = location.query_pairs().collect::<HashMap<_, _>>();
+    assert_eq!(
+        query.get("response_type").map(|value| value.as_ref()),
+        Some("code")
+    );
+    assert_eq!(
+        query.get("client_id").map(|value| value.as_ref()),
+        Some("orders-web")
+    );
+    assert_eq!(
+        query.get("redirect_uri").map(|value| value.as_ref()),
+        Some("http://app.example/login/callback")
+    );
+    assert_eq!(
+        query.get("scope").map(|value| value.as_ref()),
+        Some("openid email")
+    );
+    assert!(query.get("state").is_some());
+}
+
+#[tokio::test]
+async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
+    let token = jwt_with_kid(
+        "test-key",
+        TestClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-web",
+            exp: 4_102_444_800,
+            groups: Vec::new(),
+            realm_access: RealmAccessClaims { roles: Vec::new() },
+        },
+    );
+    let token_endpoint = one_shot_token_endpoint("opaque-access-token".to_owned(), Some(token));
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            redirect_path: "/login/callback".to_owned(),
+            restore_path_after_redirect: true,
+            scopes: vec!["openid".to_owned()],
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route(
+            "/protected",
+            get(|Extension(principal): Extension<Principal>| async move {
+                principal.subject().to_owned()
+            }),
+        )
+        .layer(oidc.layer())
+        .layer(SessionManagerLayer::new(MemoryStore::default()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected?item=1")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = cookie_header(&response);
+    let redirect = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    let state = reqwest::Url::parse(redirect)
+        .expect("redirect location should parse")
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .expect("state should be present");
+
+    let callback = format!("/login/callback?code=good-code&state={state}");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(callback)
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response.headers().get(LOCATION).unwrap(),
+        HeaderValue::from_static("/protected?item=1")
+    );
+    let cookie = cookie_header(&response);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected?item=1")
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "alice");
 }
 
 #[test]
@@ -3840,7 +4028,7 @@ fn tenants_from_config_rejects_named_id_token_roles_source() {
     assert!(
         error
             .to_string()
-            .contains("`idtoken` roles require web-app ID token support"),
+            .contains("`idtoken` roles require the `web-app` application type"),
         "{error}"
     );
 }
@@ -3873,7 +4061,7 @@ fn tenants_from_config_rejects_named_empty_role_claim_path() {
 }
 
 #[test]
-fn tenants_from_config_rejects_named_web_app_application_type() {
+fn tenants_from_config_accepts_named_web_app_application_type() {
     let config = Config::builder()
         .add_source(
             MapSource::new("tenant-web-app", 100)
@@ -3882,20 +4070,7 @@ fn tenants_from_config_rejects_named_web_app_application_type() {
         )
         .build();
 
-    let Err(error) = Tenants::from_config(&config) else {
-        panic!("web-app should be rejected for named bearer-service tenants");
-    };
-    assert!(matches!(
-        error,
-        mp_config::ConfigError::Conversion { ref name, .. }
-            if name == "quarkus.oidc.tenant-a.application-type"
-    ));
-    assert!(
-        error
-            .to_string()
-            .contains("`web-app` application type requires authorization-code flow support"),
-        "{error}"
-    );
+    let _builder = Tenants::from_config(&config).expect("named web-app tenants should be accepted");
 }
 
 #[test]
@@ -5638,6 +5813,51 @@ fn request_with_header(uri: &str, header_name: &str, header_value: &str) -> Requ
         .header(header_name, header_value)
         .body(Body::empty())
         .expect("request should be valid")
+}
+
+fn cookie_header(response: &Response) -> String {
+    response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split_once(';').map(|(cookie, _)| cookie.to_owned()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn one_shot_token_endpoint(access_token: String, id_token: Option<String>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("token endpoint should bind");
+    let endpoint = format!(
+        "http://{}/token",
+        listener
+            .local_addr()
+            .expect("token endpoint address should be available")
+    );
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+
+        let (mut stream, _) = listener
+            .accept()
+            .expect("token endpoint should accept one request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        let id_token = id_token
+            .as_deref()
+            .map(|token| format!(r#","id_token":"{token}""#))
+            .unwrap_or_default();
+        let body =
+            format!(r#"{{"access_token":"{access_token}","token_type":"Bearer"{id_token}}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("token endpoint response should write");
+    });
+    endpoint
 }
 
 fn jwt(claims: impl Serialize) -> String {
