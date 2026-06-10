@@ -6965,6 +6965,47 @@ dQIDAQAB
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn jwt_validator_loads_slash_separated_required_claims_from_config() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("slash-required-claims", 100)
+                    .with(
+                        "quarkus.oidc.auth-server-url",
+                        "https://issuer.example/realms/app",
+                    )
+                    .with("quarkus.oidc.token.audience", "orders-api")
+                    .with(
+                        "quarkus.oidc.token.required-claims.\"resource_access/orders/roles\"",
+                        "orders-admin",
+                    ),
+            )
+            .build();
+        let config = OidcConfig::from_config(&config).expect("OIDC config should load");
+        let token = jwt(CustomRoleClaims {
+            sub: "alice",
+            iss: "https://issuer.example/realms/app",
+            aud: "orders-api",
+            exp: 4_102_444_800,
+            resource_access: ResourceAccessClaims {
+                orders: ResourceRolesClaims {
+                    roles: vec!["orders-admin", "orders-user"],
+                },
+            },
+        });
+
+        let response = claims_subject_app(
+            Oidc::builder(config.clone())
+                .validator(JwtValidator::hs256("secret", &config))
+                .build(),
+        )
+        .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
+        .await
+        .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[test]
     fn config_rejects_empty_required_claim_values() {
         let config = Config::builder()
