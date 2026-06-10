@@ -1,4 +1,5 @@
 use crate::provider::provider_endpoint_url;
+use crate::validation_claims::unix_timestamp;
 use crate::{
     BuildError, Error, IdToken, IdTokenClaims, OidcConfig, Principal, Result, TokenValidator,
 };
@@ -17,6 +18,7 @@ use url::form_urlencoded;
 
 const PRINCIPAL_KEY: &str = "oidc.principal";
 const ID_TOKEN_KEY: &str = "oidc.id-token";
+const TOKEN_STATE_KEY: &str = "oidc.token-state";
 const STATE_KEY: &str = "oidc.state";
 const ORIGINAL_URI_KEY: &str = "oidc.original-uri";
 
@@ -29,6 +31,9 @@ pub(crate) struct WebApp {
     token_endpoint: String,
     redirect_path: String,
     restore_path_after_redirect: bool,
+    refresh_expired: bool,
+    refresh_token_time_skew: Option<u64>,
+    lifespan_grace: u64,
     scopes: Vec<String>,
 }
 
@@ -100,6 +105,12 @@ impl WebApp {
             token_endpoint,
             redirect_path: config.authentication.redirect_path.clone(),
             restore_path_after_redirect: config.authentication.restore_path_after_redirect,
+            refresh_expired: config.token.refresh_expired,
+            refresh_token_time_skew: config
+                .token
+                .refresh_token_time_skew
+                .map(|duration| duration.as_secs()),
+            lifespan_grace: config.token.lifespan_grace.unwrap_or_default(),
             scopes: config.authentication.scopes.clone(),
         })
     }
@@ -111,6 +122,7 @@ impl WebApp {
     pub(crate) async fn session_context(
         &self,
         request: &mut Request<Body>,
+        validator: Arc<dyn TokenValidator>,
     ) -> Result<Option<WebAppSession>> {
         let Some(session) = session(request) else {
             trace!(path = %request.uri().path(), "web-app request has no session extension");
@@ -124,16 +136,82 @@ impl WebApp {
             .get::<StoredIdToken>(ID_TOKEN_KEY)
             .await
             .map_err(session_error)?;
+        let stored_token_state = session
+            .get::<StoredTokenState>(TOKEN_STATE_KEY)
+            .await
+            .map_err(session_error)?;
         trace!(
             path = %request.uri().path(),
             has_principal = stored_principal.is_some(),
             has_id_token = stored_id_token.is_some(),
+            has_token_state = stored_token_state.is_some(),
             "checked web-app session for stored principal"
         );
-        Ok(stored_principal.map(|principal| WebAppSession {
-            principal: principal.into_principal(),
-            id_token: stored_id_token.map(StoredIdToken::into_id_token),
-        }))
+        let Some(stored_principal) = stored_principal else {
+            return Ok(None);
+        };
+        let Some(stored_token_state) = stored_token_state else {
+            debug!("web-app session principal did not include token state");
+            clear_authentication(&session).await?;
+            return Ok(None);
+        };
+
+        match stored_token_state.freshness(
+            unix_timestamp()?,
+            self.refresh_token_time_skew,
+            self.lifespan_grace,
+        ) {
+            TokenFreshness::Current => Ok(Some(WebAppSession {
+                principal: stored_principal.into_principal(),
+                id_token: stored_id_token.map(StoredIdToken::into_id_token),
+            })),
+            TokenFreshness::RefreshNeeded | TokenFreshness::Expired if self.refresh_enabled() => {
+                let Some(refresh_token) = stored_token_state.refresh_token.as_deref() else {
+                    if matches!(
+                        stored_token_state.freshness(
+                            unix_timestamp()?,
+                            self.refresh_token_time_skew,
+                            self.lifespan_grace,
+                        ),
+                        TokenFreshness::Expired
+                    ) {
+                        clear_authentication(&session).await?;
+                        return Ok(None);
+                    }
+                    return Ok(Some(WebAppSession {
+                        principal: stored_principal.into_principal(),
+                        id_token: stored_id_token.map(StoredIdToken::into_id_token),
+                    }));
+                };
+                match self.refresh_tokens(refresh_token).await {
+                    Ok(token_response) => {
+                        let refreshed = match self
+                            .validated_tokens(token_response, validator, Some(refresh_token))
+                            .await
+                        {
+                            Ok(refreshed) => refreshed,
+                            Err(error) => {
+                                debug!(%error, "OIDC refreshed tokens were rejected; clearing web-app session");
+                                clear_authentication(&session).await?;
+                                return Ok(None);
+                            }
+                        };
+                        store_authentication(&session, &refreshed).await?;
+                        Ok(Some(refreshed.into_session()))
+                    }
+                    Err(error) => {
+                        debug!(%error, "OIDC token refresh failed; clearing web-app session");
+                        clear_authentication(&session).await?;
+                        Ok(None)
+                    }
+                }
+            }
+            TokenFreshness::RefreshNeeded | TokenFreshness::Expired => {
+                debug!("web-app session tokens are expired and refresh is unavailable");
+                clear_authentication(&session).await?;
+                Ok(None)
+            }
+        }
     }
 
     pub(crate) async fn authorization_redirect(
@@ -217,6 +295,79 @@ impl WebApp {
             has_id_token = token_response.id_token.is_some(),
             "OIDC token endpoint returned callback tokens"
         );
+        let authenticated = self
+            .validated_tokens(token_response, validator, None)
+            .await?;
+        store_authentication(&session, &authenticated).await?;
+
+        trace!(
+            groups = authenticated.principal.groups().count(),
+            "stored web-app principal in session"
+        );
+        let redirect_to = session
+            .remove::<String>(ORIGINAL_URI_KEY)
+            .await
+            .map_err(session_error)?
+            .unwrap_or_else(|| "/".to_owned());
+        debug!(redirect_to = %redirect_to, "OIDC web-app callback completed");
+        redirect_response(&redirect_to)
+    }
+
+    fn refresh_enabled(&self) -> bool {
+        self.refresh_expired || self.refresh_token_time_skew.is_some()
+    }
+
+    async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<TokenResponse> {
+        let mut form = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", self.client_id.as_str()),
+        ];
+        if let Some(secret) = self.client_secret.as_deref() {
+            form.push(("client_secret", secret));
+        }
+        debug!(token_endpoint = %self.token_endpoint, "exchanging OIDC authorization code for tokens");
+        let response = self.token_request(&form).await?;
+        Ok(response)
+    }
+
+    async fn refresh_tokens(&self, refresh_token: &str) -> Result<TokenResponse> {
+        let mut form = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", self.client_id.as_str()),
+        ];
+        if let Some(secret) = self.client_secret.as_deref() {
+            form.push(("client_secret", secret));
+        }
+        debug!(token_endpoint = %self.token_endpoint, "refreshing OIDC web-app tokens");
+        self.token_request(&form).await
+    }
+
+    async fn token_request(&self, form: &[(&str, &str)]) -> Result<TokenResponse> {
+        let response = self
+            .client
+            .post(&self.token_endpoint)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .form(form)
+            .send()
+            .await
+            .map_err(|error| Error::TokenRejected(error.into()))?
+            .error_for_status()
+            .map_err(|error| Error::TokenRejected(error.into()))?
+            .json::<TokenResponse>()
+            .await
+            .map_err(|error| Error::TokenRejected(error.into()))?;
+        Ok(response)
+    }
+
+    async fn validated_tokens(
+        &self,
+        token_response: TokenResponse,
+        validator: Arc<dyn TokenValidator>,
+        previous_refresh_token: Option<&str>,
+    ) -> Result<AuthenticatedTokens> {
         let validated_id_token = match token_response.id_token.as_deref() {
             Some(raw) => Some(validate_id_token(raw, validator.clone()).await?),
             None => None,
@@ -231,55 +382,20 @@ impl WebApp {
                 None => return Err(error),
             },
         };
-        session
-            .insert(PRINCIPAL_KEY, StoredPrincipal::from_principal(&principal))
-            .await
-            .map_err(session_error)?;
-        if let Some((id_token, _)) = &validated_id_token {
-            session
-                .insert(ID_TOKEN_KEY, StoredIdToken::from_id_token(id_token))
-                .await
-                .map_err(session_error)?;
-        }
-
-        trace!(
-            groups = principal.groups().count(),
-            "stored web-app principal in session"
+        let now = unix_timestamp()?;
+        let id_token = validated_id_token.map(|(id_token, _)| id_token);
+        let token_state = StoredTokenState::from_response(
+            &token_response,
+            previous_refresh_token,
+            &id_token,
+            now,
         );
-        let redirect_to = session
-            .remove::<String>(ORIGINAL_URI_KEY)
-            .await
-            .map_err(session_error)?
-            .unwrap_or_else(|| "/".to_owned());
-        debug!(redirect_to = %redirect_to, "OIDC web-app callback completed");
-        redirect_response(&redirect_to)
-    }
 
-    async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<TokenResponse> {
-        let mut form = vec![
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("client_id", self.client_id.as_str()),
-        ];
-        if let Some(secret) = self.client_secret.as_deref() {
-            form.push(("client_secret", secret));
-        }
-        debug!(token_endpoint = %self.token_endpoint, "exchanging OIDC authorization code for tokens");
-        let response = self
-            .client
-            .post(&self.token_endpoint)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .form(&form)
-            .send()
-            .await
-            .map_err(|error| Error::TokenRejected(error.into()))?
-            .error_for_status()
-            .map_err(|error| Error::TokenRejected(error.into()))?
-            .json::<TokenResponse>()
-            .await
-            .map_err(|error| Error::TokenRejected(error.into()))?;
-        Ok(response)
+        Ok(AuthenticatedTokens {
+            principal,
+            id_token,
+            token_state,
+        })
     }
 
     fn redirect_uri(&self, request: &Request<Body>) -> Result<String> {
@@ -312,6 +428,21 @@ impl WebApp {
 pub(crate) struct WebAppSession {
     pub(crate) principal: Principal,
     pub(crate) id_token: Option<IdToken>,
+}
+
+struct AuthenticatedTokens {
+    principal: Principal,
+    id_token: Option<IdToken>,
+    token_state: StoredTokenState,
+}
+
+impl AuthenticatedTokens {
+    fn into_session(self) -> WebAppSession {
+        WebAppSession {
+            principal: self.principal,
+            id_token: self.id_token,
+        }
+    }
 }
 
 async fn validate_id_token(
@@ -348,6 +479,13 @@ fn decode_id_token_claims(token: &str) -> Result<IdTokenClaims> {
         .map_err(|error| Error::TokenRejected(Box::new(error)))
 }
 
+fn unverified_jwt_exp(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims = serde_json::from_slice::<serde_json::Value>(&decoded).ok()?;
+    claims.get("exp").and_then(serde_json::Value::as_u64)
+}
+
 fn endpoint(
     auth_server_url: Option<&str>,
     path: Option<&str>,
@@ -376,6 +514,54 @@ fn path_matches(configured: &str, actual: &str) -> bool {
 
 fn session(request: &Request<Body>) -> Option<Session> {
     request.extensions().get::<Session>().cloned()
+}
+
+async fn store_authentication(
+    session: &Session,
+    authenticated: &AuthenticatedTokens,
+) -> Result<()> {
+    session
+        .insert(
+            PRINCIPAL_KEY,
+            StoredPrincipal::from_principal(&authenticated.principal),
+        )
+        .await
+        .map_err(session_error)?;
+    match &authenticated.id_token {
+        Some(id_token) => {
+            session
+                .insert(ID_TOKEN_KEY, StoredIdToken::from_id_token(id_token))
+                .await
+                .map_err(session_error)?;
+        }
+        None => {
+            session
+                .remove::<StoredIdToken>(ID_TOKEN_KEY)
+                .await
+                .map_err(session_error)?;
+        }
+    }
+    session
+        .insert(TOKEN_STATE_KEY, &authenticated.token_state)
+        .await
+        .map_err(session_error)?;
+    Ok(())
+}
+
+async fn clear_authentication(session: &Session) -> Result<()> {
+    session
+        .remove::<StoredPrincipal>(PRINCIPAL_KEY)
+        .await
+        .map_err(session_error)?;
+    session
+        .remove::<StoredIdToken>(ID_TOKEN_KEY)
+        .await
+        .map_err(session_error)?;
+    session
+        .remove::<StoredTokenState>(TOKEN_STATE_KEY)
+        .await
+        .map_err(session_error)?;
+    Ok(())
 }
 
 fn value(
@@ -423,6 +609,8 @@ where
 struct TokenResponse {
     access_token: String,
     id_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -437,6 +625,66 @@ struct StoredPrincipal {
 struct StoredIdToken {
     claims: IdTokenClaims,
     raw: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct StoredTokenState {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<u64>,
+}
+
+enum TokenFreshness {
+    Current,
+    RefreshNeeded,
+    Expired,
+}
+
+impl StoredTokenState {
+    fn from_response(
+        response: &TokenResponse,
+        previous_refresh_token: Option<&str>,
+        id_token: &Option<IdToken>,
+        now: u64,
+    ) -> Self {
+        let expires_at = [
+            id_token.as_ref().and_then(IdToken::expires_at),
+            unverified_jwt_exp(&response.access_token),
+            response
+                .expires_in
+                .map(|expires_in| now.saturating_add(expires_in)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+
+        Self {
+            access_token: response.access_token.clone(),
+            refresh_token: response
+                .refresh_token
+                .clone()
+                .or_else(|| previous_refresh_token.map(ToOwned::to_owned)),
+            expires_at,
+        }
+    }
+
+    fn freshness(
+        &self,
+        now: u64,
+        refresh_token_time_skew: Option<u64>,
+        lifespan_grace: u64,
+    ) -> TokenFreshness {
+        let Some(expires_at) = self.expires_at else {
+            return TokenFreshness::Current;
+        };
+        if now >= expires_at.saturating_add(lifespan_grace) {
+            return TokenFreshness::Expired;
+        }
+        if refresh_token_time_skew.is_some_and(|skew| now.saturating_add(skew) >= expires_at) {
+            return TokenFreshness::RefreshNeeded;
+        }
+        TokenFreshness::Current
+    }
 }
 
 impl StoredIdToken {

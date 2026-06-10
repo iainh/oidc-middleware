@@ -189,6 +189,13 @@ pub struct OidcAuthenticationConfig {
     pub redirect_path: String,
     /// Return users to their original path after completing the code flow.
     pub restore_path_after_redirect: bool,
+    /// Extra session lifetime available after token expiry for refresh attempts.
+    ///
+    /// This mirrors Quarkus `authentication.session-age-extension`. The actual
+    /// browser cookie lifetime is still owned by the installed `tower-sessions`
+    /// layer; this value is exposed so applications can keep configuration
+    /// vocabulary aligned with Quarkus deployments.
+    pub session_age_extension: Duration,
     /// OIDC scopes requested from the provider.
     ///
     /// The list must include `openid`; without it the provider is not required
@@ -201,6 +208,7 @@ impl Default for OidcAuthenticationConfig {
         Self {
             redirect_path: "/q/oidc/callback".to_owned(),
             restore_path_after_redirect: true,
+            session_age_extension: Duration::from_secs(300),
             scopes: vec!["openid".to_owned()],
         }
     }
@@ -248,6 +256,9 @@ impl ConfigProperties for OidcAuthenticationConfig {
             restore_path_after_redirect: config
                 .get_optional(&key("restore-path-after-redirect"))?
                 .unwrap_or(true),
+            session_age_extension: config
+                .get_optional(&key("session-age-extension"))?
+                .unwrap_or_else(|| Duration::from_secs(300)),
             scopes,
         })
     }
@@ -529,6 +540,10 @@ pub struct OidcTokenConfig {
     pub lifespan_grace: Option<u64>,
     /// Maximum age allowed since the token `iat` claim.
     pub age: Option<Duration>,
+    /// Refresh expired authorization-code flow tokens when a refresh token exists.
+    pub refresh_expired: bool,
+    /// Refresh authorization-code flow tokens before expiry by this skew.
+    pub refresh_token_time_skew: Option<Duration>,
     /// Minimum interval between forced JWKS refreshes after an unknown `kid`.
     pub forced_jwk_refresh_interval: Duration,
     /// Allow remote introspection of JWT tokens when no matching JWK is available.
@@ -561,6 +576,8 @@ impl Default for OidcTokenConfig {
             authorization_scheme: "Bearer".to_owned(),
             lifespan_grace: None,
             age: None,
+            refresh_expired: false,
+            refresh_token_time_skew: None,
             forced_jwk_refresh_interval: Duration::from_secs(600),
             allow_jwt_introspection: true,
             require_jwt_introspection_only: false,
@@ -645,6 +662,8 @@ impl ConfigProperties for OidcTokenConfig {
 
         let token_type = load_optional_non_empty_string(config, &key("token-type"))?;
         let principal_claim = load_optional_non_empty_string(config, &key("principal-claim"))?;
+        let refresh_token_time_skew =
+            config.get_optional::<Duration>(&key("refresh-token-time-skew"))?;
 
         Ok(Self {
             issuer: config.get_optional(&key("issuer"))?,
@@ -671,6 +690,11 @@ impl ConfigProperties for OidcTokenConfig {
             authorization_scheme,
             lifespan_grace: config.get_optional(&key("lifespan-grace"))?,
             age: config.get_optional(&key("age"))?,
+            refresh_expired: config
+                .get_optional::<bool>(&key("refresh-expired"))?
+                .unwrap_or_default()
+                || refresh_token_time_skew.is_some(),
+            refresh_token_time_skew,
             forced_jwk_refresh_interval: config
                 .get_optional(&key("forced-jwk-refresh-interval"))?
                 .unwrap_or_else(|| Duration::from_secs(600)),

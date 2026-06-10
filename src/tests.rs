@@ -105,6 +105,7 @@ fn config_loads_quarkus_oidc_properties() {
                 .with("oidc.application-type", "hybrid")
                 .with("oidc.authentication.redirect-path", "/login/callback")
                 .with("oidc.authentication.restore-path-after-redirect", "false")
+                .with("oidc.authentication.session-age-extension", "120s")
                 .with("oidc.authentication.scopes", "openid,email,profile")
                 .with("oidc.token.audience", "orders-api")
                 .with("oidc.token.token-type", "bearer")
@@ -128,6 +129,8 @@ fn config_loads_quarkus_oidc_properties() {
                 .with("oidc.token.authorization-scheme", "Token")
                 .with("oidc.token.lifespan-grace", "5")
                 .with("oidc.token.age", "60s")
+                .with("oidc.token.refresh-expired", "true")
+                .with("oidc.token.refresh-token-time-skew", "15s")
                 .with("oidc.token.forced-jwk-refresh-interval", "30s")
                 .with("oidc.token.allow-jwt-introspection", "false")
                 .with("oidc.token.require-jwt-introspection-only", "true")
@@ -170,6 +173,7 @@ fn config_loads_quarkus_oidc_properties() {
             authentication: OidcAuthenticationConfig {
                 redirect_path: "/login/callback".to_owned(),
                 restore_path_after_redirect: false,
+                session_age_extension: Duration::from_secs(120),
                 scopes: vec![
                     "openid".to_owned(),
                     "email".to_owned(),
@@ -214,6 +218,8 @@ fn config_loads_quarkus_oidc_properties() {
                 authorization_scheme: "Token".to_owned(),
                 lifespan_grace: Some(5),
                 age: Some(Duration::from_secs(60)),
+                refresh_expired: true,
+                refresh_token_time_skew: Some(Duration::from_secs(15)),
                 forced_jwk_refresh_interval: Duration::from_secs(30),
                 allow_jwt_introspection: false,
                 require_jwt_introspection_only: true,
@@ -1715,6 +1721,7 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
             restore_path_after_redirect: true,
+            session_age_extension: Duration::from_secs(300),
             scopes: vec!["openid".to_owned(), "email".to_owned()],
         },
         ..OidcConfig::default()
@@ -1804,6 +1811,7 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
             restore_path_after_redirect: true,
+            session_age_extension: Duration::from_secs(300),
             scopes: vec!["openid".to_owned()],
         },
         ..OidcConfig::default()
@@ -1894,6 +1902,232 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_body(response).await, "alice:alice@example.com");
+}
+
+#[tokio::test]
+async fn web_app_refreshes_expired_session_tokens() {
+    let initial_token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com"
+        }),
+    );
+    let refreshed_token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "refreshed@example.com"
+        }),
+    );
+    let (token_endpoint, forms) = token_endpoint_sequence(vec![
+        token_response_body(
+            "opaque-access-token",
+            Some(&initial_token),
+            Some("initial-refresh-token"),
+            Some(0),
+        ),
+        token_response_body(
+            "opaque-refreshed-token",
+            Some(&refreshed_token),
+            Some("rotated-refresh-token"),
+            Some(3600),
+        ),
+    ]);
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        token: OidcTokenConfig {
+            refresh_expired: true,
+            ..OidcTokenConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route(
+            "/protected",
+            get(|session: OidcSession| async move {
+                identity_email(&session)
+                    .unwrap_or("missing-email")
+                    .to_owned()
+            }),
+        )
+        .layer(oidc.layer())
+        .layer(SessionManagerLayer::new(MemoryStore::default()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/q/oidc/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = cookie_header(&response);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "refreshed@example.com");
+    let forms = forms
+        .lock()
+        .expect("captured token endpoint forms should not be poisoned");
+    assert_eq!(forms.len(), 2);
+    assert!(forms[0].contains("grant_type=authorization_code"));
+    assert!(forms[1].contains("grant_type=refresh_token"));
+    assert!(forms[1].contains("refresh_token=initial-refresh-token"));
+}
+
+#[tokio::test]
+async fn web_app_redirects_when_expired_session_refresh_is_disabled() {
+    let token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com"
+        }),
+    );
+    let token_endpoint = one_shot_token_endpoint_with_refresh(
+        "opaque-access-token".to_owned(),
+        Some(token),
+        Some("refresh-token".to_owned()),
+        Some(0),
+    );
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer())
+        .layer(SessionManagerLayer::new(MemoryStore::default()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/q/oidc/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = cookie_header(&response);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    assert!(location.starts_with("https://issuer.example/realms/app/auth?"));
 }
 
 fn identity_email(identity: &impl OidcIdentity) -> Option<&str> {
@@ -4943,7 +5177,39 @@ fn cookie_header(response: &Response) -> String {
         .join("; ")
 }
 
+fn redirect_state(response: &Response) -> String {
+    let redirect = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    reqwest::Url::parse(redirect)
+        .expect("redirect location should parse")
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .expect("state should be present")
+}
+
 fn one_shot_token_endpoint(access_token: String, id_token: Option<String>) -> String {
+    one_shot_token_endpoint_with_refresh(access_token, id_token, None, None)
+}
+
+fn one_shot_token_endpoint_with_refresh(
+    access_token: String,
+    id_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+) -> String {
+    let body = token_response_body(
+        &access_token,
+        id_token.as_deref(),
+        refresh_token.as_deref(),
+        expires_in,
+    );
+    token_endpoint_sequence(vec![body]).0
+}
+
+fn token_endpoint_sequence(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("token endpoint should bind");
     let endpoint = format!(
         "http://{}/token",
@@ -4951,30 +5217,91 @@ fn one_shot_token_endpoint(access_token: String, id_token: Option<String>) -> St
             .local_addr()
             .expect("token endpoint address should be available")
     );
+    let forms = Arc::new(Mutex::new(Vec::new()));
+    let captured_forms = forms.clone();
     std::thread::spawn(move || {
-        use std::io::{Read, Write};
+        use std::io::Write;
 
-        let (mut stream, _) = listener
-            .accept()
-            .expect("token endpoint should accept one request");
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request);
-        let id_token = id_token
-            .as_deref()
-            .map(|token| format!(r#","id_token":"{token}""#))
-            .unwrap_or_default();
-        let body =
-            format!(r#"{{"access_token":"{access_token}","token_type":"Bearer"{id_token}}}"#);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("token endpoint response should write");
+        for body in responses {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("token endpoint should accept a request");
+            let request = read_http_request(&mut stream);
+            let form = request
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body.to_owned())
+                .unwrap_or_default();
+            captured_forms
+                .lock()
+                .expect("captured forms should not be poisoned")
+                .push(form);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("token endpoint response should write");
+        }
     });
-    endpoint
+    (endpoint, forms)
+}
+
+fn token_response_body(
+    access_token: &str,
+    id_token: Option<&str>,
+    refresh_token: Option<&str>,
+    expires_in: Option<u64>,
+) -> String {
+    let id_token = id_token
+        .map(|token| format!(r#","id_token":"{token}""#))
+        .unwrap_or_default();
+    let refresh_token = refresh_token
+        .map(|token| format!(r#","refresh_token":"{token}""#))
+        .unwrap_or_default();
+    let expires_in = expires_in
+        .map(|expires_in| format!(r#","expires_in":{expires_in}"#))
+        .unwrap_or_default();
+    format!(
+        r#"{{"access_token":"{access_token}","token_type":"Bearer"{id_token}{refresh_token}{expires_in}}}"#
+    )
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("test token endpoint should set read timeout");
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let count = stream
+            .read(&mut buffer)
+            .expect("token endpoint request should read");
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or_default();
+        if bytes.len() >= header_end + 4 + content_length {
+            break;
+        }
+    }
+    String::from_utf8(bytes).expect("token endpoint request should be UTF-8")
 }
 
 fn jwt(claims: impl Serialize) -> String {

@@ -221,7 +221,10 @@ impl Oidc {
         request: &mut Request<Body>,
         web_app: &WebApp,
     ) -> Result<WebAppPrincipal> {
-        if let Some(session) = web_app.session_context(request).await? {
+        if let Some(session) = web_app
+            .session_context(request, self.validator.clone())
+            .await?
+        {
             trace!(
                 path = %request.uri().path(),
                 groups = session.principal.groups().count(),
