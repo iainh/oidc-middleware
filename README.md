@@ -212,7 +212,7 @@ Default features preserve the full convenience API:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.2" }
+oidc-middleware = { version = "0.3" }
 ```
 
 Applications that provide their own validators can opt into a smaller dependency
@@ -220,7 +220,7 @@ surface:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.2", default-features = false }
+oidc-middleware = { version = "0.3", default-features = false }
 ```
 
 Available features:
