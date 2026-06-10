@@ -1,4 +1,4 @@
-error: authenticated handlers must take an OidcPrincipal argument named `principal`
+error: authenticated handlers must take an OidcAuthorize argument named `principal`
  --> tests/ui/authenticated_no_principal.rs:3:1
   |
 3 | #[authenticated]

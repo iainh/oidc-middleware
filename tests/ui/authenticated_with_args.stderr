@@ -1,4 +1,4 @@
-error: #[authenticated] does not accept arguments
+error: expected `principal = <argument_name>`
  --> tests/ui/authenticated_with_args.rs:3:17
   |
 3 | #[authenticated("admin")]

@@ -126,6 +126,30 @@ impl Principal {
     }
 }
 
+/// Authorization view over an authenticated OIDC principal.
+///
+/// Implement this trait for application-specific Axum extractors when handlers
+/// should receive domain types such as `User` but still use
+/// `#[roles_allowed]` or `#[authenticated]` for OIDC authorization checks.
+pub trait OidcAuthorize {
+    /// Returns the normalized OIDC principal used for authorization decisions.
+    fn principal(&self) -> &Principal;
+
+    /// Returns true when the principal has at least one of `groups`.
+    fn has_any_group<'a, I>(&self, groups: I) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        self.principal().has_any_group(groups)
+    }
+}
+
+impl OidcAuthorize for Principal {
+    fn principal(&self) -> &Principal {
+        self
+    }
+}
+
 /// Axum extractor for the authenticated OIDC principal.
 ///
 /// Use this in handlers that should fail with `403 Forbidden` when called
@@ -142,6 +166,12 @@ impl OidcPrincipal {
     /// a handler needs to pass ownership to another component.
     pub fn into_inner(self) -> Principal {
         self.0
+    }
+}
+
+impl OidcAuthorize for OidcPrincipal {
+    fn principal(&self) -> &Principal {
+        &self.0
     }
 }
 

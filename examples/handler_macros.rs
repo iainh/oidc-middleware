@@ -4,10 +4,12 @@
 //! when a permission belongs directly to a handler and you want Quarkus-style
 //! annotations near the function body.
 
+use axum::extract::FromRequestParts;
 use axum::{Router, routing::get};
+use http::request::Parts;
 use oidc_middleware::{
-    Error, Oidc, OidcConfig, OidcPrincipal, Principal, StaticTokenValidator, authenticated,
-    roles_allowed,
+    Error, Oidc, OidcAuthorize, OidcConfig, OidcPrincipal, Principal, StaticTokenValidator,
+    authenticated, roles_allowed,
 };
 
 fn main() {
@@ -25,6 +27,7 @@ fn app() -> Router {
     Router::new()
         .route("/profile", get(profile))
         .route("/admin", get(admin))
+        .route("/account", get(account))
         .layer(oidc.layer())
 }
 
@@ -36,4 +39,39 @@ async fn profile(principal: OidcPrincipal) -> Result<String, Error> {
 #[roles_allowed("admin")]
 async fn admin(principal: OidcPrincipal) -> Result<String, Error> {
     Ok(format!("admin view for {}", principal.subject()))
+}
+
+#[derive(Clone)]
+struct User {
+    principal: Principal,
+    account_id: String,
+}
+
+impl OidcAuthorize for User {
+    fn principal(&self) -> &Principal {
+        &self.principal
+    }
+}
+
+impl<S> FromRequestParts<S> for User
+where
+    S: Send + Sync,
+{
+    type Rejection = Error;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let principal = OidcPrincipal::from_request_parts(parts, state)
+            .await?
+            .into_inner();
+        let account_id = format!("acct-{}", principal.subject());
+        Ok(Self {
+            principal,
+            account_id,
+        })
+    }
+}
+
+#[roles_allowed("admin", principal = user)]
+async fn account(user: User) -> Result<String, Error> {
+    Ok(format!("account {}", user.account_id))
 }
