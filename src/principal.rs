@@ -150,6 +150,22 @@ impl OidcAuthorize for Principal {
     }
 }
 
+/// Identity/profile view over authenticated OIDC context.
+///
+/// Authorization should continue to use [`OidcAuthorize`] and the access-token
+/// [`Principal`]. This trait exposes optional ID-token context for handlers
+/// that need browser-login profile claims such as email.
+pub trait OidcIdentity: OidcAuthorize {
+    /// Returns the validated ID token when one is available.
+    fn id_token(&self) -> Option<&IdToken>;
+}
+
+impl OidcIdentity for Principal {
+    fn id_token(&self) -> Option<&IdToken> {
+        None
+    }
+}
+
 /// Axum extractor for the authenticated OIDC principal.
 ///
 /// Use this in handlers that should fail with `403 Forbidden` when called
@@ -172,6 +188,12 @@ impl OidcPrincipal {
 impl OidcAuthorize for OidcPrincipal {
     fn principal(&self) -> &Principal {
         &self.0
+    }
+}
+
+impl OidcIdentity for OidcPrincipal {
+    fn id_token(&self) -> Option<&IdToken> {
+        None
     }
 }
 
@@ -237,6 +259,13 @@ impl OidcSession {
 impl OidcAuthorize for OidcSession {
     fn principal(&self) -> &Principal {
         &self.principal
+    }
+}
+
+#[cfg(feature = "web-app")]
+impl OidcIdentity for OidcSession {
+    fn id_token(&self) -> Option<&IdToken> {
+        self.id_token.as_ref()
     }
 }
 

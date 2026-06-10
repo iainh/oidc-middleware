@@ -1830,10 +1830,7 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
                 format!(
                     "{}:{}",
                     session.principal().subject(),
-                    session
-                        .id_token()
-                        .and_then(IdToken::email)
-                        .unwrap_or("missing-email")
+                    identity_email(&session).unwrap_or("missing-email")
                 )
             }),
         )
@@ -1897,6 +1894,10 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_body(response).await, "alice:alice@example.com");
+}
+
+fn identity_email(identity: &impl OidcIdentity) -> Option<&str> {
+    identity.id_token().and_then(IdToken::email)
 }
 
 #[test]

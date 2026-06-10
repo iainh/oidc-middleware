@@ -125,7 +125,7 @@ pub use jwt::JwtValidator;
 pub use oidc::{Oidc, OidcBuilder, OidcLayer, OidcService};
 #[cfg(feature = "web-app")]
 pub use principal::OidcSession;
-pub use principal::{OidcAuthorize, OidcPrincipal, Principal};
+pub use principal::{OidcAuthorize, OidcIdentity, OidcPrincipal, Principal};
 pub use provider::ProviderMetadata;
 pub use tenants::{Tenants, TenantsBuilder, TenantsLayer, TenantsService};
 pub use user_info::{
