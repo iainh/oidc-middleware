@@ -91,12 +91,15 @@ impl Oidc {
     pub fn from_config(config: &Config) -> mp_config::Result<OidcBuilder> {
         oidc_builder_from_config(
             OidcConfig::from_config(config)?,
-            "oidc.public-key",
-            "oidc.application-type",
-            "oidc.roles.source",
-            "oidc.token.binding.certificate",
-            "oidc.token.decrypt-access-token",
-            "oidc.token.decrypt-id-token",
+            OidcConfigPropertyNames {
+                public_key: "oidc.public-key",
+                roles_source: "oidc.roles.source",
+                token_binding_certificate: "oidc.token.binding.certificate",
+                token_decrypt_access_token: "oidc.token.decrypt-access-token",
+                token_decrypt_id_token: "oidc.token.decrypt-id-token",
+                token_refresh_expired: "oidc.token.refresh-expired",
+                token_refresh_token_time_skew: "oidc.token.refresh-token-time-skew",
+            },
         )
     }
 
@@ -289,12 +292,7 @@ impl Oidc {
 
 pub(crate) fn oidc_builder_from_config(
     config: OidcConfig,
-    public_key_property: &str,
-    _application_type_property: &str,
-    roles_source_property: &str,
-    token_binding_certificate_property: &str,
-    token_decrypt_access_token_property: &str,
-    token_decrypt_id_token_property: &str,
+    property_names: OidcConfigPropertyNames<'_>,
 ) -> mp_config::Result<OidcBuilder> {
     let public_key = config.public_key.clone();
     #[cfg(feature = "jwt")]
@@ -305,21 +303,26 @@ pub(crate) fn oidc_builder_from_config(
         debug!("OIDC builder loaded disabled configuration; provider validation setup is skipped");
         return Ok(builder);
     }
-    validate_service_roles_source(&builder.config, roles_source_property)?;
+    validate_service_roles_source(&builder.config, property_names.roles_source)?;
     validate_service_token_binding_certificate(
         &builder.config,
-        token_binding_certificate_property,
+        property_names.token_binding_certificate,
     )?;
     validate_service_token_decryption(
         &builder.config,
-        token_decrypt_access_token_property,
-        token_decrypt_id_token_property,
+        property_names.token_decrypt_access_token,
+        property_names.token_decrypt_id_token,
+    )?;
+    validate_service_token_refresh(
+        &builder.config,
+        property_names.token_refresh_expired,
+        property_names.token_refresh_token_time_skew,
     )?;
     if let Some(public_key) = public_key {
         #[cfg(not(feature = "jwt"))]
         {
             return Err(mp_config::ConfigError::Conversion {
-                name: public_key_property.to_owned(),
+                name: property_names.public_key.to_owned(),
                 value: public_key,
                 message: "configured public-key validation requires the `jwt` crate feature"
                     .to_owned(),
@@ -329,12 +332,12 @@ pub(crate) fn oidc_builder_from_config(
         #[cfg(feature = "jwt")]
         {
             debug!(
-                property = public_key_property,
+                property = property_names.public_key,
                 "installing configured public-key validator"
             );
             builder = builder.public_key(&public_key).map_err(|error| {
                 mp_config::ConfigError::Conversion {
-                    name: public_key_property.to_owned(),
+                    name: property_names.public_key.to_owned(),
                     value: public_key,
                     message: error.to_string(),
                 }
@@ -342,6 +345,16 @@ pub(crate) fn oidc_builder_from_config(
         }
     }
     Ok(builder)
+}
+
+pub(crate) struct OidcConfigPropertyNames<'a> {
+    pub(crate) public_key: &'a str,
+    pub(crate) roles_source: &'a str,
+    pub(crate) token_binding_certificate: &'a str,
+    pub(crate) token_decrypt_access_token: &'a str,
+    pub(crate) token_decrypt_id_token: &'a str,
+    pub(crate) token_refresh_expired: &'a str,
+    pub(crate) token_refresh_token_time_skew: &'a str,
 }
 
 fn validate_service_roles_source(
@@ -392,6 +405,35 @@ fn validate_service_token_decryption(
             name: decrypt_id_token_property.to_owned(),
             value: "true".to_owned(),
             message: "`token.decrypt-id-token` requires web-app ID token decryption, which is not implemented for bearer-service middleware".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_service_token_refresh(
+    config: &OidcConfig,
+    refresh_expired_property: &str,
+    refresh_token_time_skew_property: &str,
+) -> mp_config::Result<()> {
+    if config.application_type == ApplicationType::WebApp {
+        return Ok(());
+    }
+
+    if let Some(refresh_token_time_skew) = config.token.refresh_token_time_skew {
+        return Err(mp_config::ConfigError::Conversion {
+            name: refresh_token_time_skew_property.to_owned(),
+            value: format!("{}s", refresh_token_time_skew.as_secs()),
+            message: "`token.refresh-token-time-skew` requires the `web-app` application type"
+                .to_owned(),
+        });
+    }
+
+    if config.token.refresh_expired {
+        return Err(mp_config::ConfigError::Conversion {
+            name: refresh_expired_property.to_owned(),
+            value: "true".to_owned(),
+            message: "`token.refresh-expired` requires the `web-app` application type".to_owned(),
         });
     }
 

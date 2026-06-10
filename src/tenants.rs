@@ -1,9 +1,10 @@
 use crate::config_helpers::{has_default_tenant_config, named_tenant_configs, split_csv};
+use crate::oidc::{OidcConfigPropertyNames, oidc_builder_from_config};
 use crate::path::path_match_score;
 use crate::token::{unverified_token_from_request, unverified_token_issuer};
 #[cfg(all(feature = "http-client", feature = "jwt"))]
 use crate::{BuildResult, OidcBuilder};
-use crate::{Oidc, OidcConfig, oidc_builder_from_config};
+use crate::{Oidc, OidcConfig};
 use axum::body::Body;
 use axum::response::Response;
 use http::Request;
@@ -77,12 +78,15 @@ impl Tenants {
             let default_config = OidcConfig::from_config(config)?;
             let default_tenant = oidc_builder_from_config(
                 default_config,
-                "oidc.public-key",
-                "oidc.application-type",
-                "oidc.roles.source",
-                "oidc.token.binding.certificate",
-                "oidc.token.decrypt-access-token",
-                "oidc.token.decrypt-id-token",
+                OidcConfigPropertyNames {
+                    public_key: "oidc.public-key",
+                    roles_source: "oidc.roles.source",
+                    token_binding_certificate: "oidc.token.binding.certificate",
+                    token_decrypt_access_token: "oidc.token.decrypt-access-token",
+                    token_decrypt_id_token: "oidc.token.decrypt-id-token",
+                    token_refresh_expired: "oidc.token.refresh-expired",
+                    token_refresh_token_time_skew: "oidc.token.refresh-token-time-skew",
+                },
             )?
             .build();
             builder = builder.default_tenant(default_tenant);
@@ -95,12 +99,17 @@ impl Tenants {
             validate_configured_tenant_paths(&tenant_config, &format!("{prefix}.tenant-paths"))?;
             let oidc = oidc_builder_from_config(
                 tenant_config,
-                &format!("{prefix}.public-key"),
-                &format!("{prefix}.application-type"),
-                &format!("{prefix}.roles.source"),
-                &format!("{prefix}.token.binding.certificate"),
-                &format!("{prefix}.token.decrypt-access-token"),
-                &format!("{prefix}.token.decrypt-id-token"),
+                OidcConfigPropertyNames {
+                    public_key: &format!("{prefix}.public-key"),
+                    roles_source: &format!("{prefix}.roles.source"),
+                    token_binding_certificate: &format!("{prefix}.token.binding.certificate"),
+                    token_decrypt_access_token: &format!("{prefix}.token.decrypt-access-token"),
+                    token_decrypt_id_token: &format!("{prefix}.token.decrypt-id-token"),
+                    token_refresh_expired: &format!("{prefix}.token.refresh-expired"),
+                    token_refresh_token_time_skew: &format!(
+                        "{prefix}.token.refresh-token-time-skew"
+                    ),
+                },
             )?
             .build();
             builder = builder.tenant(tenant.name, oidc);
@@ -352,12 +361,15 @@ async fn discover_tenants_from_config(
         let default_config = OidcConfig::from_config(config)?;
         let default_tenant = oidc_builder_from_config(
             default_config,
-            "oidc.public-key",
-            "oidc.application-type",
-            "oidc.roles.source",
-            "oidc.token.binding.certificate",
-            "oidc.token.decrypt-access-token",
-            "oidc.token.decrypt-id-token",
+            OidcConfigPropertyNames {
+                public_key: "oidc.public-key",
+                roles_source: "oidc.roles.source",
+                token_binding_certificate: "oidc.token.binding.certificate",
+                token_decrypt_access_token: "oidc.token.decrypt-access-token",
+                token_decrypt_id_token: "oidc.token.decrypt-id-token",
+                token_refresh_expired: "oidc.token.refresh-expired",
+                token_refresh_token_time_skew: "oidc.token.refresh-token-time-skew",
+            },
         )?;
         let default_tenant = discover_oidc_builder(default_tenant, client.as_ref()).await?;
         builder = builder.default_tenant(default_tenant);
@@ -369,12 +381,15 @@ async fn discover_tenants_from_config(
         validate_configured_tenant_paths(&tenant_config, &format!("{prefix}.tenant-paths"))?;
         let oidc = oidc_builder_from_config(
             tenant_config,
-            &format!("{prefix}.public-key"),
-            &format!("{prefix}.application-type"),
-            &format!("{prefix}.roles.source"),
-            &format!("{prefix}.token.binding.certificate"),
-            &format!("{prefix}.token.decrypt-access-token"),
-            &format!("{prefix}.token.decrypt-id-token"),
+            OidcConfigPropertyNames {
+                public_key: &format!("{prefix}.public-key"),
+                roles_source: &format!("{prefix}.roles.source"),
+                token_binding_certificate: &format!("{prefix}.token.binding.certificate"),
+                token_decrypt_access_token: &format!("{prefix}.token.decrypt-access-token"),
+                token_decrypt_id_token: &format!("{prefix}.token.decrypt-id-token"),
+                token_refresh_expired: &format!("{prefix}.token.refresh-expired"),
+                token_refresh_token_time_skew: &format!("{prefix}.token.refresh-token-time-skew"),
+            },
         )?;
         let oidc = discover_oidc_builder(oidc, client.as_ref()).await?;
         builder = builder.tenant(tenant.name, oidc);

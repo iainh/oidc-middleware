@@ -136,7 +136,6 @@ pub use user_info::{
 pub use validator::{StaticTokenValidator, TokenValidator};
 
 pub(crate) use config::role_claim_paths_for_source;
-pub(crate) use oidc::oidc_builder_from_config;
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;

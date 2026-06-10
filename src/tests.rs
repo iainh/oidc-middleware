@@ -1701,6 +1701,55 @@ fn oidc_from_config_rejects_id_token_roles_source() {
 }
 
 #[test]
+fn oidc_from_config_rejects_refresh_expired_for_service() {
+    let config = Config::builder()
+        .add_source(
+            MapSource::new("refresh-expired", 100).with("oidc.token.refresh-expired", "true"),
+        )
+        .build();
+
+    let Err(error) = Oidc::from_config(&config) else {
+        panic!("refresh-expired should be rejected for bearer-service middleware");
+    };
+    assert!(matches!(
+        error,
+        mp_config::ConfigError::Conversion { ref name, .. }
+            if name == "oidc.token.refresh-expired"
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("`token.refresh-expired` requires the `web-app` application type"),
+        "{error}"
+    );
+}
+
+#[test]
+fn oidc_from_config_rejects_refresh_token_time_skew_for_service() {
+    let config = Config::builder()
+        .add_source(
+            MapSource::new("refresh-token-time-skew", 100)
+                .with("oidc.token.refresh-token-time-skew", "15s"),
+        )
+        .build();
+
+    let Err(error) = Oidc::from_config(&config) else {
+        panic!("refresh-token-time-skew should be rejected for bearer-service middleware");
+    };
+    assert!(matches!(
+        error,
+        mp_config::ConfigError::Conversion { ref name, .. }
+            if name == "oidc.token.refresh-token-time-skew"
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("`token.refresh-token-time-skew` requires the `web-app` application type"),
+        "{error}"
+    );
+}
+
+#[test]
 fn oidc_from_config_accepts_web_app_application_type() {
     let config = Config::builder()
         .add_source(
@@ -2128,6 +2177,258 @@ async fn web_app_redirects_when_expired_session_refresh_is_disabled() {
         .and_then(|value| value.to_str().ok())
         .expect("redirect location should be present");
     assert!(location.starts_with("https://issuer.example/realms/app/auth?"));
+}
+
+#[tokio::test]
+async fn web_app_refresh_token_time_skew_enables_proactive_refresh() {
+    let initial_token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com"
+        }),
+    );
+    let refreshed_token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "proactive@example.com"
+        }),
+    );
+    let (token_endpoint, forms) = token_endpoint_sequence(vec![
+        token_response_body(
+            "opaque-access-token",
+            Some(&initial_token),
+            Some("initial-refresh-token"),
+            Some(3600),
+        ),
+        token_response_body(
+            "opaque-refreshed-token",
+            Some(&refreshed_token),
+            Some("rotated-refresh-token"),
+            Some(3600),
+        ),
+    ]);
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        token: OidcTokenConfig {
+            refresh_token_time_skew: Some(Duration::from_secs(7200)),
+            ..OidcTokenConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route(
+            "/protected",
+            get(|session: OidcSession| async move {
+                identity_email(&session)
+                    .unwrap_or("missing-email")
+                    .to_owned()
+            }),
+        )
+        .layer(oidc.layer())
+        .layer(SessionManagerLayer::new(MemoryStore::default()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/q/oidc/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = cookie_header(&response);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_body(response).await, "proactive@example.com");
+    let forms = forms
+        .lock()
+        .expect("captured token endpoint forms should not be poisoned");
+    assert_eq!(forms.len(), 2);
+    assert!(forms[1].contains("grant_type=refresh_token"));
+}
+
+#[tokio::test]
+async fn web_app_session_age_extension_bounds_expired_token_refresh() {
+    let token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com"
+        }),
+    );
+    let refreshed_token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "should-not-refresh@example.com"
+        }),
+    );
+    let (token_endpoint, forms) = token_endpoint_sequence(vec![
+        token_response_body(
+            "opaque-access-token",
+            Some(&token),
+            Some("refresh-token"),
+            Some(0),
+        ),
+        token_response_body(
+            "opaque-refreshed-token",
+            Some(&refreshed_token),
+            Some("rotated-refresh-token"),
+            Some(3600),
+        ),
+    ]);
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            session_age_extension: Duration::from_secs(0),
+            ..OidcAuthenticationConfig::default()
+        },
+        token: OidcTokenConfig {
+            refresh_expired: true,
+            ..OidcTokenConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer())
+        .layer(SessionManagerLayer::new(MemoryStore::default()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/q/oidc/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = cookie_header(&response);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let forms = forms
+        .lock()
+        .expect("captured token endpoint forms should not be poisoned");
+    assert_eq!(forms.len(), 1);
+    assert!(forms[0].contains("grant_type=authorization_code"));
 }
 
 fn identity_email(identity: &impl OidcIdentity) -> Option<&str> {
@@ -4300,6 +4601,32 @@ fn tenants_from_config_accepts_named_web_app_application_type() {
         .build();
 
     let _builder = Tenants::from_config(&config).expect("named web-app tenants should be accepted");
+}
+
+#[test]
+fn tenants_from_config_rejects_named_refresh_token_time_skew_for_service() {
+    let config = Config::builder()
+        .add_source(
+            MapSource::new("tenant-refresh-token-time-skew", 100)
+                .with("oidc.tenant-a.tenant-paths", "/api/a/*")
+                .with("oidc.tenant-a.token.refresh-token-time-skew", "15s"),
+        )
+        .build();
+
+    let Err(error) = Tenants::from_config(&config) else {
+        panic!("refresh-token-time-skew should be rejected for named bearer-service tenants");
+    };
+    assert!(matches!(
+        error,
+        mp_config::ConfigError::Conversion { ref name, .. }
+            if name == "oidc.tenant-a.token.refresh-token-time-skew"
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("`token.refresh-token-time-skew` requires the `web-app` application type"),
+        "{error}"
+    );
 }
 
 #[test]

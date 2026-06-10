@@ -34,6 +34,7 @@ pub(crate) struct WebApp {
     refresh_expired: bool,
     refresh_token_time_skew: Option<u64>,
     lifespan_grace: u64,
+    session_age_extension: u64,
     scopes: Vec<String>,
 }
 
@@ -111,6 +112,7 @@ impl WebApp {
                 .refresh_token_time_skew
                 .map(|duration| duration.as_secs()),
             lifespan_grace: config.token.lifespan_grace.unwrap_or_default(),
+            session_age_extension: config.authentication.session_age_extension.as_secs(),
             scopes: config.authentication.scopes.clone(),
         })
     }
@@ -160,21 +162,15 @@ impl WebApp {
             unix_timestamp()?,
             self.refresh_token_time_skew,
             self.lifespan_grace,
+            self.session_age_extension,
         ) {
             TokenFreshness::Current => Ok(Some(WebAppSession {
                 principal: stored_principal.into_principal(),
                 id_token: stored_id_token.map(StoredIdToken::into_id_token),
             })),
-            TokenFreshness::RefreshNeeded | TokenFreshness::Expired if self.refresh_enabled() => {
+            TokenFreshness::RefreshNeeded if self.refresh_enabled() => {
                 let Some(refresh_token) = stored_token_state.refresh_token.as_deref() else {
-                    if matches!(
-                        stored_token_state.freshness(
-                            unix_timestamp()?,
-                            self.refresh_token_time_skew,
-                            self.lifespan_grace,
-                        ),
-                        TokenFreshness::Expired
-                    ) {
+                    if stored_token_state.is_expired(unix_timestamp()?, self.lifespan_grace) {
                         clear_authentication(&session).await?;
                         return Ok(None);
                     }
@@ -673,17 +669,28 @@ impl StoredTokenState {
         now: u64,
         refresh_token_time_skew: Option<u64>,
         lifespan_grace: u64,
+        session_age_extension: u64,
     ) -> TokenFreshness {
         let Some(expires_at) = self.expires_at else {
             return TokenFreshness::Current;
         };
-        if now >= expires_at.saturating_add(lifespan_grace) {
+        let expires_with_grace = expires_at.saturating_add(lifespan_grace);
+        let refreshable_until = expires_with_grace.saturating_add(session_age_extension);
+        if now >= refreshable_until {
             return TokenFreshness::Expired;
         }
-        if refresh_token_time_skew.is_some_and(|skew| now.saturating_add(skew) >= expires_at) {
+        if now >= expires_with_grace {
+            return TokenFreshness::RefreshNeeded;
+        }
+        if refresh_token_time_skew.is_some_and(|skew| now.saturating_add(skew) > expires_at) {
             return TokenFreshness::RefreshNeeded;
         }
         TokenFreshness::Current
+    }
+
+    fn is_expired(&self, now: u64, lifespan_grace: u64) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| now >= expires_at.saturating_add(lifespan_grace))
     }
 }
 
