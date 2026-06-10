@@ -511,19 +511,15 @@ impl mp_config::FromConfigValue for RolesSource {
 }
 
 /// Role extraction configuration loaded from `quarkus.oidc.roles.*`.
-#[derive(Clone, Debug, ConfigProperties, Eq, PartialEq)]
-#[config(rename_all = "kebab-case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcRolesConfig {
     /// Token or response source used to extract roles.
-    #[config(default)]
     pub source: RolesSource,
     /// Token claim paths used to extract role names.
     ///
     /// The default covers standard `groups` claims and Keycloak realm roles.
-    #[config(default = "groups,realm_access.roles")]
     pub role_claim_path: String,
     /// Separator used when a role claim is a string containing multiple roles.
-    #[config(default = " ")]
     pub role_claim_separator: String,
 }
 
@@ -534,6 +530,42 @@ impl Default for OidcRolesConfig {
             role_claim_path: DEFAULT_ROLE_CLAIM_PATH.to_owned(),
             role_claim_separator: " ".to_owned(),
         }
+    }
+}
+
+impl ConfigProperties for OidcRolesConfig {
+    fn from_config(config: &Config) -> mp_config::Result<Self> {
+        Self::from_config_prefix(config, "")
+    }
+
+    fn from_config_prefix(config: &Config, prefix: &str) -> mp_config::Result<Self> {
+        let key = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+
+        let role_claim_path_key = key("role-claim-path");
+        let role_claim_path = config
+            .get_optional::<String>(&role_claim_path_key)?
+            .unwrap_or_else(|| DEFAULT_ROLE_CLAIM_PATH.to_owned());
+        if split_csv(&role_claim_path).is_empty() {
+            return Err(mp_config::ConfigError::Conversion {
+                name: role_claim_path_key,
+                value: role_claim_path,
+                message: "role-claim-path must include at least one claim path".to_owned(),
+            });
+        }
+
+        Ok(Self {
+            source: config.get_optional(&key("source"))?.unwrap_or_default(),
+            role_claim_path,
+            role_claim_separator: config
+                .get_optional(&key("role-claim-separator"))?
+                .unwrap_or_else(|| " ".to_owned()),
+        })
     }
 }
 
@@ -4270,6 +4302,32 @@ dQIDAQAB
     }
 
     #[test]
+    fn config_rejects_empty_role_claim_path() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("empty-role-claim-path", 100)
+                    .with("quarkus.oidc.roles.role-claim-path", " , "),
+            )
+            .build();
+
+        let error =
+            OidcConfig::from_config(&config).expect_err("empty role claim path should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.oidc.roles.role-claim-path"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("role-claim-path must include at least one claim path"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn config_loads_id_token_roles_source() {
         let config = Config::builder()
             .add_source(MapSource::new("test", 100).with("quarkus.oidc.roles.source", "idtoken"))
@@ -7355,6 +7413,33 @@ dQIDAQAB
             error
                 .to_string()
                 .contains("`idtoken` roles require web-app ID token support"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tenants_from_config_rejects_named_empty_role_claim_path() {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("tenant-empty-role-claim-path", 100)
+                    .with("quarkus.oidc.tenant-a.tenant-paths", "/api/a/*")
+                    .with("quarkus.oidc.tenant-a.roles.role-claim-path", " , "),
+            )
+            .build();
+
+        let Err(error) = Tenants::from_config(&config) else {
+            panic!("empty role claim path should be rejected for named tenants");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.oidc.tenant-a.roles.role-claim-path"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("role-claim-path must include at least one claim path"),
             "{error}"
         );
     }
