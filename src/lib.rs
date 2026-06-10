@@ -45,9 +45,11 @@ mod authorization;
 mod claims;
 mod config_helpers;
 mod path;
+mod provider;
 mod token;
 
 pub use authorization::Authorization;
+pub use provider::ProviderMetadata;
 
 use authorization::AuthRequirement;
 use axum::body::Body;
@@ -65,6 +67,9 @@ use jsonwebtoken::jwk::{JwkSet, KeyAlgorithm};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use mp_config::{Config, ConfigProperties};
 use path::path_match_score;
+use provider::{
+    auth_server_url_from_config, discovery_url, provider_endpoint_url, provider_validation_config,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1131,36 +1136,6 @@ impl From<reqwest::Error> for BuildError {
 impl From<mp_config::ConfigError> for BuildError {
     fn from(source: mp_config::ConfigError) -> Self {
         Self::Config(source)
-    }
-}
-
-/// OpenID Provider metadata used by discovery.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct ProviderMetadata {
-    /// Canonical issuer returned by the provider.
-    pub issuer: Option<String>,
-    /// JSON Web Key Set URL returned by the provider.
-    pub jwks_uri: String,
-    /// OAuth2 authorization endpoint returned by the provider.
-    pub authorization_endpoint: Option<String>,
-    /// OAuth2 token endpoint returned by the provider.
-    pub token_endpoint: Option<String>,
-    /// Dynamic client registration endpoint returned by the provider.
-    pub registration_endpoint: Option<String>,
-    /// OAuth2 token revocation endpoint returned by the provider.
-    pub revocation_endpoint: Option<String>,
-    /// OAuth2 token introspection endpoint returned by the provider.
-    pub introspection_endpoint: Option<String>,
-    /// OIDC user info endpoint returned by the provider.
-    pub userinfo_endpoint: Option<String>,
-    /// OIDC end-session endpoint returned by the provider.
-    pub end_session_endpoint: Option<String>,
-}
-
-impl ProviderMetadata {
-    /// Parses provider metadata from JSON.
-    pub fn from_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
     }
 }
 
@@ -3438,49 +3413,6 @@ where
             }
         })
     }
-}
-
-fn discovery_url(auth_server_url: &str, discovery_path: &str) -> BuildResult<reqwest::Url> {
-    provider_endpoint_url(auth_server_url, discovery_path)
-}
-
-fn auth_server_url_from_config(config: &OidcConfig) -> BuildResult<String> {
-    if let Some(auth_server_url) = &config.auth_server_url {
-        return Ok(auth_server_url.clone());
-    }
-
-    if let Some(provider) = config.provider {
-        return provider
-            .auth_server_url()
-            .map(ToOwned::to_owned)
-            .ok_or(BuildError::UnsupportedWellKnownProvider(provider));
-    }
-
-    Err(BuildError::MissingAuthServerUrl)
-}
-
-fn provider_endpoint_url(auth_server_url: &str, path: &str) -> BuildResult<reqwest::Url> {
-    let url = if path.starts_with("http://") || path.starts_with("https://") {
-        path.to_owned()
-    } else {
-        format!(
-            "{}/{}",
-            auth_server_url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
-    };
-    reqwest::Url::parse(&url).map_err(|error| BuildError::InvalidUrl {
-        url,
-        message: error.to_string(),
-    })
-}
-
-fn provider_validation_config(config: &OidcConfig, metadata: &ProviderMetadata) -> OidcConfig {
-    let mut validation_config = config.clone();
-    if validation_config.token.issuer.is_none() {
-        validation_config.token.issuer = metadata.issuer.clone();
-    }
-    validation_config
 }
 
 fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
