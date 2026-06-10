@@ -2824,19 +2824,30 @@ impl OidcBuilder {
             .json()
             .await?;
 
-        Ok(self.provider_metadata_refreshing(metadata, jwks, client))
+        self.provider_metadata_refreshing(metadata, jwks, client)
     }
 
     /// Installs provider metadata and a JWKS-backed JWT validator.
-    pub fn provider_metadata(mut self, metadata: ProviderMetadata, jwks: JwkSet) -> Oidc {
+    pub fn provider_metadata(
+        mut self,
+        metadata: ProviderMetadata,
+        jwks: JwkSet,
+    ) -> BuildResult<Oidc> {
         if self.config.token.require_jwt_introspection_only {
-            self.install_metadata_introspection(metadata, reqwest::Client::new());
-            return self.build();
+            self.install_metadata_introspection(metadata, reqwest::Client::new())?;
+            return Ok(self.build());
         }
 
         if self.config.token.verify_access_token_with_user_info {
-            self.install_metadata_user_info(metadata, reqwest::Client::new());
-            return self.build();
+            self.install_metadata_user_info(metadata, reqwest::Client::new())?;
+            return Ok(self.build());
+        }
+
+        if self.uses_user_info_roles() {
+            metadata
+                .userinfo_endpoint
+                .as_ref()
+                .ok_or(BuildError::MissingUserInfoEndpoint)?;
         }
 
         let validation_config = provider_validation_config(&self.config, &metadata);
@@ -2844,7 +2855,7 @@ impl OidcBuilder {
         let client = reqwest::Client::new();
         let validator = self.jwt_with_metadata_introspection(jwt, metadata.clone(), client.clone());
         self.validator = Some(self.with_metadata_user_info_roles(validator, metadata, client));
-        self.build()
+        Ok(self.build())
     }
 
     /// Installs provider metadata and a refreshable JWKS-backed JWT validator.
@@ -2853,15 +2864,22 @@ impl OidcBuilder {
         metadata: ProviderMetadata,
         jwks: JwkSet,
         client: reqwest::Client,
-    ) -> Oidc {
+    ) -> BuildResult<Oidc> {
         if self.config.token.require_jwt_introspection_only {
-            self.install_metadata_introspection(metadata, client);
-            return self.build();
+            self.install_metadata_introspection(metadata, client)?;
+            return Ok(self.build());
         }
 
         if self.config.token.verify_access_token_with_user_info {
-            self.install_metadata_user_info(metadata, client);
-            return self.build();
+            self.install_metadata_user_info(metadata, client)?;
+            return Ok(self.build());
+        }
+
+        if self.uses_user_info_roles() {
+            metadata
+                .userinfo_endpoint
+                .as_ref()
+                .ok_or(BuildError::MissingUserInfoEndpoint)?;
         }
 
         let validation_config = provider_validation_config(&self.config, &metadata);
@@ -2875,7 +2893,7 @@ impl OidcBuilder {
         );
         let validator = self.jwt_with_metadata_introspection(jwt, metadata.clone(), client.clone());
         self.validator = Some(self.with_metadata_user_info_roles(validator, metadata, client));
-        self.build()
+        Ok(self.build())
     }
 
     fn install_jwks_with_optional_introspection(&mut self, jwks: JwkSet, client: reqwest::Client) {
@@ -2942,26 +2960,34 @@ impl OidcBuilder {
         &mut self,
         metadata: ProviderMetadata,
         client: reqwest::Client,
-    ) {
-        let Some(endpoint) = metadata.introspection_endpoint.clone() else {
-            return;
-        };
+    ) -> BuildResult<()> {
+        let endpoint = metadata
+            .introspection_endpoint
+            .clone()
+            .ok_or(BuildError::MissingIntrospectionEndpoint)?;
         let validation_config = provider_validation_config(&self.config, &metadata);
         self.validator = Some(Arc::new(IntrospectionValidator::new(
             http_token_introspector(&validation_config, client, endpoint),
             &validation_config,
         )));
+        Ok(())
     }
 
-    fn install_metadata_user_info(&mut self, metadata: ProviderMetadata, client: reqwest::Client) {
-        let Some(endpoint) = metadata.userinfo_endpoint.clone() else {
-            return;
-        };
+    fn install_metadata_user_info(
+        &mut self,
+        metadata: ProviderMetadata,
+        client: reqwest::Client,
+    ) -> BuildResult<()> {
+        let endpoint = metadata
+            .userinfo_endpoint
+            .clone()
+            .ok_or(BuildError::MissingUserInfoEndpoint)?;
         let validation_config = provider_validation_config(&self.config, &metadata);
         self.validator = Some(Arc::new(UserInfoValidator::new(
             HttpUserInfoProvider { client, endpoint },
             &validation_config,
         )));
+        Ok(())
     }
 
     fn uses_user_info_roles(&self) -> bool {
@@ -7340,7 +7366,8 @@ dQIDAQAB
                 },
                 ..OidcConfig::default()
             })
-            .provider_metadata(test_metadata(), test_jwks()),
+            .provider_metadata(test_metadata(), test_jwks())
+            .expect("provider metadata should install validator"),
         )
         .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
         .await
@@ -7376,7 +7403,8 @@ dQIDAQAB
                 },
                 ..OidcConfig::default()
             })
-            .provider_metadata(test_introspection_metadata(), test_jwks()),
+            .provider_metadata(test_introspection_metadata(), test_jwks())
+            .expect("provider metadata should install introspection validator"),
         )
         .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
         .await
@@ -7412,13 +7440,59 @@ dQIDAQAB
                 },
                 ..OidcConfig::default()
             })
-            .provider_metadata(test_user_info_metadata(), test_jwks()),
+            .provider_metadata(test_user_info_metadata(), test_jwks())
+            .expect("provider metadata should install UserInfo validator"),
         )
         .oneshot(request("/protected", Some(&format!("Bearer {token}"))))
         .await
         .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn provider_metadata_requires_introspection_endpoint() {
+        let result = Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                require_jwt_introspection_only: true,
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .provider_metadata(test_metadata(), test_jwks());
+
+        assert!(matches!(
+            result,
+            Err(BuildError::MissingIntrospectionEndpoint)
+        ));
+    }
+
+    #[test]
+    fn provider_metadata_requires_user_info_endpoint_for_validation() {
+        let result = Oidc::builder(OidcConfig {
+            token: OidcTokenConfig {
+                verify_access_token_with_user_info: true,
+                ..OidcTokenConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .provider_metadata(test_metadata(), test_jwks());
+
+        assert!(matches!(result, Err(BuildError::MissingUserInfoEndpoint)));
+    }
+
+    #[test]
+    fn provider_metadata_requires_user_info_endpoint_for_roles() {
+        let result = Oidc::builder(OidcConfig {
+            roles: OidcRolesConfig {
+                source: RolesSource::UserInfo,
+                ..OidcRolesConfig::default()
+            },
+            ..OidcConfig::default()
+        })
+        .provider_metadata(test_metadata(), test_jwks());
+
+        assert!(matches!(result, Err(BuildError::MissingUserInfoEndpoint)));
     }
 
     #[test]
