@@ -3396,7 +3396,7 @@ fn load_role_policies(config: &Config) -> mp_config::Result<HashMap<String, Role
             .entry(name.to_owned())
             .or_insert_with(RolePolicy::default)
             .role_mappings
-            .insert(role, split_csv(&config.get::<String>(&key)?));
+            .insert(role, load_role_mapping(config, &key)?);
     }
 
     Ok(policies)
@@ -3417,10 +3417,23 @@ fn load_role_mappings(
             continue;
         };
 
-        mappings.insert(role, split_csv(&config.get::<String>(&key)?));
+        mappings.insert(role, load_role_mapping(config, &key)?);
     }
 
     Ok(mappings)
+}
+
+fn load_role_mapping(config: &Config, key: &str) -> mp_config::Result<Vec<String>> {
+    let value = config.get::<String>(key)?;
+    let mapped_roles = split_csv(&value);
+    if mapped_roles.is_empty() {
+        return Err(mp_config::ConfigError::Conversion {
+            name: key.to_owned(),
+            value,
+            message: "role mappings must include at least one mapped role".to_owned(),
+        });
+    }
+    Ok(mapped_roles)
 }
 
 fn load_required_claims(
@@ -8740,6 +8753,32 @@ dQIDAQAB
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn authorization_rejects_empty_global_role_mapping() {
+        let error = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-empty-global-role-mapping", 100)
+                        .with("quarkus.http.auth.roles-mapping.admin", " , "),
+                )
+                .build(),
+        )
+        .expect_err("empty global role mapping should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.http.auth.roles-mapping.admin"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("role mappings must include at least one mapped role"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn authorization_applies_policy_role_mappings() {
         let authorization = Authorization::from_config(
@@ -8769,6 +8808,35 @@ dQIDAQAB
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn authorization_rejects_empty_policy_role_mapping() {
+        let error = Authorization::from_config(
+            &Config::builder()
+                .add_source(
+                    MapSource::new("quarkus-empty-policy-role-mapping", 100)
+                        .with("quarkus.http.auth.policy.mapped.roles-allowed", "Admin1")
+                        .with("quarkus.http.auth.policy.mapped.roles.admin", " , ")
+                        .with("quarkus.http.auth.permission.mapped.paths", "/mapped")
+                        .with("quarkus.http.auth.permission.mapped.policy", "mapped"),
+                )
+                .build(),
+        )
+        .expect_err("empty policy role mapping should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("quarkus.http.auth.policy.mapped.roles.admin"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("role mappings must include at least one mapped role"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
