@@ -358,6 +358,25 @@ impl WellKnownProvider {
             _ => None,
         }
     }
+
+    fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Apple => "apple",
+            Self::Discord => "discord",
+            Self::Facebook => "facebook",
+            Self::Github => "github",
+            Self::Google => "google",
+            Self::Linkedin => "linkedin",
+            Self::Mastodon => "mastodon",
+            Self::Microsoft => "microsoft",
+            Self::Slack => "slack",
+            Self::Spotify => "spotify",
+            Self::Strava => "strava",
+            Self::Twitch => "twitch",
+            Self::Twitter => "twitter",
+            Self::X => "x",
+        }
+    }
 }
 
 /// Introspection endpoint-specific credentials.
@@ -973,6 +992,8 @@ impl IntoResponse for Error {
 pub enum BuildError {
     /// Provider discovery requires `quarkus.oidc.auth-server-url`.
     MissingAuthServerUrl,
+    /// The configured well-known provider has no built-in issuer URL yet.
+    UnsupportedWellKnownProvider(WellKnownProvider),
     /// Direct JWKS loading requires `quarkus.oidc.jwks-path`.
     MissingJwksPath,
     /// Remote token introspection requires a configured or discovered endpoint.
@@ -993,6 +1014,11 @@ impl fmt::Display for BuildError {
             Self::MissingAuthServerUrl => write!(
                 f,
                 "OIDC provider discovery requires `quarkus.oidc.auth-server-url`"
+            ),
+            Self::UnsupportedWellKnownProvider(provider) => write!(
+                f,
+                "well-known OIDC provider `{}` requires `quarkus.oidc.auth-server-url` until its issuer URL is built in",
+                provider.as_config_value()
             ),
             Self::MissingJwksPath => write!(
                 f,
@@ -2797,8 +2823,7 @@ impl OidcBuilder {
             return Ok(self.build());
         }
 
-        let auth_server_url =
-            auth_server_url_from_config(&self.config).ok_or(BuildError::MissingAuthServerUrl)?;
+        let auth_server_url = auth_server_url_from_config(&self.config)?;
         if !self.config.discovery_enabled {
             if self.config.token.require_jwt_introspection_only {
                 let introspection_path = self
@@ -3998,13 +4023,19 @@ fn discovery_url(auth_server_url: &str, discovery_path: &str) -> BuildResult<req
     provider_endpoint_url(auth_server_url, discovery_path)
 }
 
-fn auth_server_url_from_config(config: &OidcConfig) -> Option<String> {
-    config.auth_server_url.clone().or_else(|| {
-        config
-            .provider
-            .and_then(WellKnownProvider::auth_server_url)
+fn auth_server_url_from_config(config: &OidcConfig) -> BuildResult<String> {
+    if let Some(auth_server_url) = &config.auth_server_url {
+        return Ok(auth_server_url.clone());
+    }
+
+    if let Some(provider) = config.provider {
+        return provider
+            .auth_server_url()
             .map(ToOwned::to_owned)
-    })
+            .ok_or(BuildError::UnsupportedWellKnownProvider(provider));
+    }
+
+    Err(BuildError::MissingAuthServerUrl)
 }
 
 fn provider_endpoint_url(auth_server_url: &str, path: &str) -> BuildResult<reqwest::Url> {
@@ -7403,8 +7434,10 @@ dQIDAQAB
         };
 
         assert_eq!(
-            auth_server_url_from_config(&config).as_deref(),
-            Some("https://accounts.google.com")
+            auth_server_url_from_config(&config)
+                .expect("google provider should supply auth-server-url")
+                .as_str(),
+            "https://accounts.google.com"
         );
         assert_eq!(
             discovery_url(
@@ -7428,8 +7461,31 @@ dQIDAQAB
         };
 
         assert_eq!(
-            auth_server_url_from_config(&config).as_deref(),
-            Some("https://issuer.example/realms/app")
+            auth_server_url_from_config(&config)
+                .expect("explicit auth-server-url should be used")
+                .as_str(),
+            "https://issuer.example/realms/app"
+        );
+    }
+
+    #[test]
+    fn unsupported_provider_requires_auth_server_url() {
+        let config = OidcConfig {
+            provider: Some(WellKnownProvider::Github),
+            ..OidcConfig::default()
+        };
+
+        assert!(matches!(
+            auth_server_url_from_config(&config),
+            Err(BuildError::UnsupportedWellKnownProvider(
+                WellKnownProvider::Github
+            ))
+        ));
+        assert!(
+            auth_server_url_from_config(&config)
+                .expect_err("github provider should require explicit auth-server-url")
+                .to_string()
+                .contains("well-known OIDC provider `github` requires"),
         );
     }
 

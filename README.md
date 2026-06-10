@@ -9,8 +9,9 @@ This crate is in early development. The current implementation includes:
 
 - `OidcConfig` loaded from `quarkus.oidc.*` properties, including
   `client-id`, `client-name`, and well-known `provider` values. `provider=google`
-  supplies the Google issuer URL when `auth-server-url` is not configured, and
-  `Oidc::from_config` also applies configured
+  supplies the Google issuer URL when `auth-server-url` is not configured.
+  Other provider identifiers require an explicit `auth-server-url` until their
+  issuer URLs are built in. `Oidc::from_config` also applies configured
   `quarkus.http.auth.permission.*` policies.
 - Service and hybrid `quarkus.oidc.application-type` bearer-token middleware;
   pure `web-app` authorization-code flow is rejected until implemented.
