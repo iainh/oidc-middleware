@@ -662,6 +662,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tower-sessions",
+ "tracing",
  "trybuild",
  "url",
 ]

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
+use tracing::{debug, trace};
 
 /// Multi-tenant OIDC middleware.
 ///
@@ -70,6 +71,7 @@ impl Tenants {
             builder = builder.tenant_header(parsed);
         }
         if has_default_tenant_config(config) {
+            debug!("loading default OIDC tenant from configuration");
             let default_config = OidcConfig::from_config(config)?;
             let default_tenant = oidc_builder_from_config(
                 default_config,
@@ -85,6 +87,7 @@ impl Tenants {
         }
 
         for tenant in named_tenant_configs(config) {
+            debug!(tenant = %tenant.name, "loading named OIDC tenant from configuration");
             let prefix = format!("oidc.{}", tenant.prefix_segment);
             let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
             validate_configured_tenant_paths(&tenant_config, &format!("{prefix}.tenant-paths"))?;
@@ -137,6 +140,8 @@ impl Tenants {
     }
 
     fn select(&self, request: &Request<Body>) -> Option<&Oidc> {
+        let path = request.uri().path();
+        trace!(path = %path, "selecting OIDC tenant for request");
         if let Some(header_name) = &self.header_name {
             if let Some(value) = request
                 .headers()
@@ -144,8 +149,22 @@ impl Tenants {
                 .and_then(|value| value.to_str().ok())
             {
                 if let Some(tenant) = self.tenants.iter().find(|tenant| tenant.matches_id(value)) {
+                    debug!(
+                        path = %path,
+                        source = "header",
+                        header = %header_name,
+                        tenant = %tenant.name,
+                        tenant_id = %tenant.id,
+                        "selected OIDC tenant"
+                    );
                     return Some(&tenant.oidc);
                 }
+                trace!(
+                    path = %path,
+                    header = %header_name,
+                    tenant_header_value = %value,
+                    "tenant header did not match a configured tenant"
+                );
             }
         }
 
@@ -155,17 +174,40 @@ impl Tenants {
                     .unverified_request_issuer(request)
                     .is_some_and(|issuer| tenant.issuer_matches(&issuer))
             }) {
+                debug!(
+                    path = %path,
+                    source = "issuer",
+                    tenant = %tenant.name,
+                    tenant_id = %tenant.id,
+                    "selected OIDC tenant"
+                );
                 return Some(&tenant.oidc);
             }
+            trace!(path = %path, "issuer-based tenant selection did not match");
         }
 
-        let path = request.uri().path();
         self.tenants
             .iter()
             .filter_map(|tenant| tenant.match_score(path).map(|score| (score, tenant)))
             .max_by_key(|(score, _)| *score)
-            .map(|(_, tenant)| &tenant.oidc)
-            .or(self.default_tenant.as_ref())
+            .map(|(_, tenant)| {
+                debug!(
+                    path = %path,
+                    source = "path",
+                    tenant = %tenant.name,
+                    tenant_id = %tenant.id,
+                    "selected OIDC tenant"
+                );
+                &tenant.oidc
+            })
+            .or_else(|| {
+                if self.default_tenant.is_some() {
+                    debug!(path = %path, source = "default", "selected default OIDC tenant");
+                } else {
+                    trace!(path = %path, "no OIDC tenant matched request");
+                }
+                self.default_tenant.as_ref()
+            })
     }
 }
 
@@ -233,6 +275,12 @@ impl TenantsBuilder {
         if tenant_paths.is_empty() {
             tenant_paths.push(default_tenant_path(name.as_ref()));
         }
+        debug!(
+            tenant = %name,
+            tenant_id = %id,
+            tenant_paths = ?tenant_paths,
+            "registering OIDC tenant"
+        );
         self.tenants.push(RegisteredTenant {
             name,
             id,

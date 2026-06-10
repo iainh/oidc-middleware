@@ -12,6 +12,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, trace};
 
 /// JWT bearer token validator.
 #[derive(Clone)]
@@ -35,6 +36,7 @@ impl JwtValidator {
     /// deployments should normally use asymmetric keys from provider metadata,
     /// which will be added as the discovery/JWKS support grows.
     pub fn hs256(secret: impl AsRef<[u8]>, config: &OidcConfig) -> Self {
+        debug!("building HS256 JWT validator");
         let mut validation = Validation::new(Algorithm::HS256);
         apply_validation_config(&mut validation, config);
         apply_signature_algorithm_config(&mut validation, config);
@@ -63,6 +65,10 @@ impl JwtValidator {
     /// used. Supported key algorithms are inferred from JWK `alg` fields when
     /// present.
     pub fn jwks(jwks: JwkSet, config: &OidcConfig) -> Self {
+        debug!(
+            keys = jwks.keys.len(),
+            "building refreshable JWKS JWT validator"
+        );
         let mut validation = Validation::new(Algorithm::RS256);
         apply_validation_config(&mut validation, config);
         apply_jwks_algorithm_config(&mut validation, &jwks, config);
@@ -86,6 +92,7 @@ impl JwtValidator {
 
     /// Builds a JWT validator backed by `oidc.public-key`.
     pub fn public_key(public_key: &str, config: &OidcConfig) -> BuildResult<Self> {
+        debug!("building public-key JWT validator");
         let mut validation = Validation::new(public_key_algorithm(config));
         apply_validation_config(&mut validation, config);
         apply_signature_algorithm_config(&mut validation, config);
@@ -154,26 +161,50 @@ impl TokenValidator for JwtValidator {
         let leeway = validation.leeway;
 
         Box::pin(async move {
+            trace!(
+                algorithms = ?validation.algorithms,
+                validate_audience = validation.validate_aud,
+                required_claims = required_claims.len(),
+                "starting JWT validation"
+            );
             let key = keys.decoding_key(&token).await?;
-            decode::<TokenClaims>(&token, &key, &validation)
-                .map_err(|error| Error::TokenRejected(Box::new(error)))
-                .and_then(|data| {
-                    validate_token_type(
-                        data.header.typ.as_deref(),
-                        &data.claims,
-                        token_type.as_deref(),
-                    )?;
-                    validate_subject(&data.claims, subject_required)?;
-                    validate_issued_at(&data.claims, issued_at_required, leeway)?;
-                    validate_required_claims(&data.claims, &required_claims)?;
-                    validate_token_age(&data.claims, token_age, leeway)?;
-                    Principal::from_claims(
-                        data.claims,
-                        &role_claim_paths,
-                        &role_claim_separator,
-                        principal_claim.as_deref(),
-                    )
-                })
+            let data = match decode::<TokenClaims>(&token, &key, &validation) {
+                Ok(data) => data,
+                Err(error) => {
+                    debug!(error = %error, "JWT decode or standard claim validation failed");
+                    return Err(Error::TokenRejected(Box::new(error)));
+                }
+            };
+            let result = (|| {
+                validate_token_type(
+                    data.header.typ.as_deref(),
+                    &data.claims,
+                    token_type.as_deref(),
+                )?;
+                validate_subject(&data.claims, subject_required)?;
+                validate_issued_at(&data.claims, issued_at_required, leeway)?;
+                validate_required_claims(&data.claims, &required_claims)?;
+                validate_token_age(&data.claims, token_age, leeway)?;
+                Principal::from_claims(
+                    data.claims,
+                    &role_claim_paths,
+                    &role_claim_separator,
+                    principal_claim.as_deref(),
+                )
+            })();
+            match result {
+                Ok(principal) => {
+                    trace!(
+                        groups = principal.groups().count(),
+                        "JWT validation succeeded"
+                    );
+                    Ok(principal)
+                }
+                Err(error) => {
+                    debug!(error = %error, "JWT application claim validation failed");
+                    Err(error)
+                }
+            }
         })
     }
 }
@@ -187,24 +218,29 @@ fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
         .as_deref()
         .or(config.auth_server_url.as_deref());
     if let Some(issuer) = issuer.filter(|issuer| *issuer != "any") {
+        trace!(issuer = %issuer, "configuring JWT issuer validation");
         validation.set_issuer(&[issuer]);
     }
 
     if config.token.accepts_any_audience() {
+        debug!("JWT audience validation disabled because audience is configured as any");
         validation.validate_aud = false;
         return;
     }
 
     let audiences = config.token.audiences();
     if audiences.is_empty() {
+        trace!("JWT audience validation disabled because no audience is configured");
         validation.validate_aud = false;
     } else {
+        trace!(audiences = ?audiences, "configuring JWT audience validation");
         validation.set_audience(&audiences);
     }
 }
 
 fn apply_signature_algorithm_config(validation: &mut Validation, config: &OidcConfig) {
     if let Some(algorithm) = config.token.signature_algorithm {
+        debug!(algorithm = ?algorithm, "configuring explicit JWT signature algorithm");
         validation.algorithms = vec![algorithm.algorithm()];
     }
 }
@@ -217,6 +253,7 @@ fn apply_jwks_algorithm_config(validation: &mut Validation, jwks: &JwkSet, confi
 
     let algorithms = supported_algorithms(jwks);
     if !algorithms.is_empty() {
+        trace!(algorithms = ?algorithms, "configuring JWT algorithms from JWKS metadata");
         validation.algorithms = algorithms;
     }
 }

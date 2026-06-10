@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::sync::Arc;
 use tower_sessions::Session;
+use tracing::{debug, trace};
 use url::form_urlencoded;
 
 const PRINCIPAL_KEY: &str = "oidc.principal";
@@ -44,6 +45,11 @@ impl WebApp {
             config.token_path.as_deref(),
             BuildError::MissingTokenEndpoint,
         )?;
+        debug!(
+            authorization_endpoint = %authorization_endpoint,
+            token_endpoint = %token_endpoint,
+            "building web-app support from configured endpoints"
+        );
         Self::new(config, client, authorization_endpoint, token_endpoint)
     }
 
@@ -53,12 +59,15 @@ impl WebApp {
         authorization_endpoint: Option<String>,
         token_endpoint: Option<String>,
     ) -> crate::BuildResult<Self> {
-        Self::new(
-            config,
-            client,
-            authorization_endpoint.ok_or(BuildError::MissingAuthorizationEndpoint)?,
-            token_endpoint.ok_or(BuildError::MissingTokenEndpoint)?,
-        )
+        let authorization_endpoint =
+            authorization_endpoint.ok_or(BuildError::MissingAuthorizationEndpoint)?;
+        let token_endpoint = token_endpoint.ok_or(BuildError::MissingTokenEndpoint)?;
+        debug!(
+            authorization_endpoint = %authorization_endpoint,
+            token_endpoint = %token_endpoint,
+            "building web-app support from provider metadata"
+        );
+        Self::new(config, client, authorization_endpoint, token_endpoint)
     }
 
     fn new(
@@ -67,6 +76,13 @@ impl WebApp {
         authorization_endpoint: String,
         token_endpoint: String,
     ) -> crate::BuildResult<Self> {
+        debug!(
+            redirect_path = %config.authentication.redirect_path,
+            restore_path_after_redirect = config.authentication.restore_path_after_redirect,
+            scopes = ?config.authentication.scopes,
+            has_client_secret = config.credentials.effective_client_secret().is_some(),
+            "configured OIDC web-app flow"
+        );
         Ok(Self {
             client,
             client_id: config
@@ -94,12 +110,18 @@ impl WebApp {
         request: &mut Request<Body>,
     ) -> Result<Option<Principal>> {
         let Some(session) = session(request) else {
+            trace!(path = %request.uri().path(), "web-app request has no session extension");
             return Ok(None);
         };
         let stored = session
             .get::<StoredPrincipal>(PRINCIPAL_KEY)
             .await
             .map_err(session_error)?;
+        trace!(
+            path = %request.uri().path(),
+            has_principal = stored.is_some(),
+            "checked web-app session for stored principal"
+        );
         Ok(stored.map(StoredPrincipal::into_principal))
     }
 
@@ -113,11 +135,18 @@ impl WebApp {
         let original_uri = request.uri().to_string();
         let redirect_uri = self.redirect_uri(request)?;
         let state = random_state()?;
+        debug!(
+            original_uri = %original_uri,
+            redirect_uri = %redirect_uri,
+            authorization_endpoint = %self.authorization_endpoint,
+            "creating OIDC authorization redirect"
+        );
         session
             .insert(STATE_KEY, state.clone())
             .await
             .map_err(session_error)?;
         if self.restore_path_after_redirect {
+            trace!(original_uri = %original_uri, "storing original URI before OIDC redirect");
             session
                 .insert(ORIGINAL_URI_KEY, original_uri)
                 .await
@@ -149,7 +178,9 @@ impl WebApp {
         let query = request.uri().query().unwrap_or_default().to_owned();
         let redirect_uri = self.redirect_uri(request)?;
         let params = form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>();
+        debug!(redirect_uri = %redirect_uri, "processing OIDC authorization callback");
         if let Some(error) = value(&params, "error") {
+            debug!(provider_error = %error, "OIDC authorization endpoint returned an error");
             return Err(Error::TokenRejected(
                 std::io::Error::other(format!("authorization endpoint returned `{error}`")).into(),
             ));
@@ -162,6 +193,7 @@ impl WebApp {
             .map_err(session_error)?
             .ok_or(Error::InvalidAuthorizationHeader)?;
         if expected_state != state {
+            debug!("OIDC callback state did not match session state");
             return Err(Error::InvalidAuthorizationHeader);
         }
         session
@@ -170,6 +202,10 @@ impl WebApp {
             .map_err(session_error)?;
 
         let token_response = self.exchange_code(&code, &redirect_uri).await?;
+        trace!(
+            has_id_token = token_response.id_token.is_some(),
+            "OIDC token endpoint returned callback tokens"
+        );
         let token = token_response
             .id_token
             .as_deref()
@@ -180,11 +216,16 @@ impl WebApp {
             .await
             .map_err(session_error)?;
 
+        trace!(
+            groups = principal.groups().count(),
+            "stored web-app principal in session"
+        );
         let redirect_to = session
             .remove::<String>(ORIGINAL_URI_KEY)
             .await
             .map_err(session_error)?
             .unwrap_or_else(|| "/".to_owned());
+        debug!(redirect_to = %redirect_to, "OIDC web-app callback completed");
         redirect_response(&redirect_to)
     }
 
@@ -198,6 +239,7 @@ impl WebApp {
         if let Some(secret) = self.client_secret.as_deref() {
             form.push(("client_secret", secret));
         }
+        debug!(token_endpoint = %self.token_endpoint, "exchanging OIDC authorization code for tokens");
         let response = self
             .client
             .post(&self.token_endpoint)
@@ -216,6 +258,7 @@ impl WebApp {
 
     fn redirect_uri(&self, request: &Request<Body>) -> Result<String> {
         if self.redirect_path.starts_with("http://") || self.redirect_path.starts_with("https://") {
+            trace!(redirect_uri = %self.redirect_path, "using absolute OIDC redirect URI");
             return Ok(self.redirect_path.clone());
         }
         let host = request
@@ -234,7 +277,9 @@ impl WebApp {
             .and_then(|value| value.to_str().ok())
             .or_else(|| request.uri().scheme_str())
             .unwrap_or("http");
-        Ok(format!("{scheme}://{host}{}", self.redirect_path))
+        let redirect_uri = format!("{scheme}://{host}{}", self.redirect_path);
+        trace!(redirect_uri = %redirect_uri, "built OIDC redirect URI from request headers");
+        Ok(redirect_uri)
     }
 }
 

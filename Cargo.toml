@@ -27,6 +27,7 @@ serde_json = "1"
 tower-layer = "0.3"
 tower-service = "0.3"
 tower-sessions = "0.14"
+tracing = "0.1"
 url = "2"
 
 [dev-dependencies]

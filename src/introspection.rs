@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, trace};
 
 /// Token validator that falls back to introspection after local JWT rejection.
 ///
@@ -53,13 +54,28 @@ impl TokenValidator for IntrospectionFallbackValidator {
         let allow_opaque_token_introspection = self.allow_opaque_token_introspection;
 
         Box::pin(async move {
+            trace!("starting JWT validation before optional introspection fallback");
             match jwt.validate(token.clone()).await {
-                Ok(principal) => Ok(principal),
+                Ok(principal) => {
+                    trace!("primary JWT validation succeeded; introspection fallback not used");
+                    Ok(principal)
+                }
                 Err(error) => {
                     let token_is_jwt = token_looks_like_jwt(&token);
+                    debug!(
+                        token_is_jwt,
+                        allow_jwt_introspection,
+                        allow_opaque_token_introspection,
+                        error = %error,
+                        "primary JWT validation failed; evaluating introspection fallback"
+                    );
                     if (token_is_jwt && !allow_jwt_introspection)
                         || (!token_is_jwt && !allow_opaque_token_introspection)
                     {
+                        trace!(
+                            token_is_jwt,
+                            "introspection fallback is disabled for token shape"
+                        );
                         return Err(error);
                     }
                     introspection.validate(token).await
@@ -185,6 +201,13 @@ impl IntrospectionValidator {
             .map(|issuer| Arc::from(issuer.to_owned()));
         let audiences = config.token.audiences();
 
+        debug!(
+            has_expected_issuer = expected_issuer.is_some(),
+            audiences = ?audiences,
+            accepts_any_audience = config.token.accepts_any_audience(),
+            required_claims = config.token.required_claims.len(),
+            "building introspection validator"
+        );
         Self {
             introspector: Arc::new(introspector),
             expected_issuer,
@@ -223,16 +246,25 @@ impl TokenValidator for IntrospectionValidator {
         let leeway = self.leeway;
 
         Box::pin(async move {
+            trace!("calling token introspector");
             let response = introspector
                 .introspect(token)
                 .await
                 .map_err(Error::TokenRejected)?;
             if !response.active {
+                debug!("token introspection response was inactive");
                 return Err(Error::TokenRejected(
                     "token introspection is not active".into(),
                 ));
             }
 
+            trace!(
+                has_subject = response.sub.is_some(),
+                has_issuer = response.iss.is_some(),
+                audiences = response.aud.len(),
+                extra_claims = response.extra.len(),
+                "token introspection response is active"
+            );
             let claims = response.into_claims();
             validate_introspection_issuer(&claims, expected_issuer.as_deref())?;
             validate_introspection_audience(&claims, &audiences, accepts_any_audience)?;
@@ -241,12 +273,17 @@ impl TokenValidator for IntrospectionValidator {
             validate_issued_at(&claims, issued_at_required, leeway)?;
             validate_required_claims(&claims, &required_claims)?;
             validate_token_age(&claims, token_age, leeway)?;
-            Principal::from_claims(
+            let principal = Principal::from_claims(
                 claims,
                 &role_claim_paths,
                 &role_claim_separator,
                 principal_claim.as_deref(),
-            )
+            )?;
+            trace!(
+                groups = principal.groups().count(),
+                "introspection validation succeeded"
+            );
+            Ok(principal)
         })
     }
 }
@@ -272,6 +309,14 @@ impl TokenIntrospector for HttpTokenIntrospector {
         let client_secret_method = self.client_secret_method;
         let include_client_id = self.include_client_id;
         Box::pin(async move {
+            debug!(
+                endpoint = %endpoint,
+                client_secret_method = ?client_secret_method,
+                include_client_id,
+                has_client_id = client_id.is_some(),
+                has_client_secret = client_secret.is_some(),
+                "sending token introspection request"
+            );
             introspection_request(
                 &client,
                 &endpoint,

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
+use tracing::{debug, trace};
 
 enum WebAppPrincipal {
     Authenticated,
@@ -115,31 +116,55 @@ impl Oidc {
     }
 
     pub(crate) async fn authenticate(&self, request: &mut Request<Body>) -> Result<()> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        trace!(%method, path = %path, "starting bearer-service authentication");
         if !self.config.enabled {
+            debug!(%method, path = %path, "OIDC middleware is disabled; request is passed through");
             return Ok(());
         }
 
         if !self.config.tenant_enabled {
+            debug!(%method, path = %path, "OIDC tenant is disabled; request will be hidden");
             return Err(Error::TenantDisabled);
         }
 
-        self.authenticate_principal(request).await?;
-        Ok(())
+        match self.authenticate_principal(request).await {
+            Ok(principal) => {
+                trace!(
+                    %method,
+                    path = %path,
+                    groups = principal.groups().count(),
+                    "bearer-service authentication succeeded"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                debug!(%method, path = %path, error = %error, "bearer-service authentication failed");
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn authenticate_web_app(
         &self,
         request: &mut Request<Body>,
     ) -> Result<Option<Response>> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        trace!(%method, path = %path, "starting web-app authentication");
         if !self.config.enabled {
+            debug!(%method, path = %path, "OIDC web-app middleware is disabled; request is passed through");
             return Ok(None);
         }
 
         if !self.config.tenant_enabled {
+            debug!(%method, path = %path, "OIDC web-app tenant is disabled; request will be hidden");
             return Err(Error::TenantDisabled);
         }
 
         let Some(web_app) = &self.web_app else {
+            debug!(%method, path = %path, "web-app middleware has no authorization-code endpoints configured");
             return Err(Error::Session(
                 std::io::Error::other(
                     "`web-app` requires provider discovery or configured authorization and token endpoints",
@@ -149,6 +174,7 @@ impl Oidc {
         };
 
         if web_app.is_callback(request) {
+            debug!(%method, path = %path, "handling OIDC web-app callback");
             return web_app
                 .callback(request, self.validator.clone())
                 .await
@@ -156,8 +182,14 @@ impl Oidc {
         }
 
         match self.web_app_principal_or_redirect(request, web_app).await? {
-            WebAppPrincipal::Authenticated => Ok(None),
-            WebAppPrincipal::Redirect(response) => Ok(Some(response)),
+            WebAppPrincipal::Authenticated => {
+                trace!(%method, path = %path, "web-app session authentication succeeded");
+                Ok(None)
+            }
+            WebAppPrincipal::Redirect(response) => {
+                debug!(%method, path = %path, "web-app request requires authorization redirect");
+                Ok(Some(response))
+            }
         }
     }
 
@@ -167,10 +199,16 @@ impl Oidc {
         web_app: &WebApp,
     ) -> Result<WebAppPrincipal> {
         if let Some(principal) = web_app.session_principal(request).await? {
+            trace!(
+                path = %request.uri().path(),
+                groups = principal.groups().count(),
+                "restored principal from web-app session"
+            );
             request.extensions_mut().insert(principal.clone());
             return Ok(WebAppPrincipal::Authenticated);
         }
 
+        trace!(path = %request.uri().path(), "web-app session did not contain a principal");
         web_app
             .authorization_redirect(request)
             .await
@@ -179,8 +217,14 @@ impl Oidc {
 
     async fn authenticate_principal(&self, request: &mut Request<Body>) -> Result<Principal> {
         let token = bearer_token(request, &self.config.token)?;
+        trace!(path = %request.uri().path(), "validating extracted OIDC token");
         let principal = self.validator.validate(token).await?;
         request.extensions_mut().insert(principal.clone());
+        trace!(
+            path = %request.uri().path(),
+            groups = principal.groups().count(),
+            "inserted authenticated principal into request extensions"
+        );
         Ok(principal)
     }
 
@@ -212,6 +256,7 @@ pub(crate) fn oidc_builder_from_config(
     let public_key = config.public_key.clone();
     let mut builder = Oidc::builder(config);
     if !builder.config.enabled {
+        debug!("OIDC builder loaded disabled configuration; provider validation setup is skipped");
         return Ok(builder);
     }
     validate_service_roles_source(&builder.config, roles_source_property)?;
@@ -225,6 +270,10 @@ pub(crate) fn oidc_builder_from_config(
         token_decrypt_id_token_property,
     )?;
     if let Some(public_key) = public_key {
+        debug!(
+            property = public_key_property,
+            "installing configured public-key validator"
+        );
         builder = builder.public_key(&public_key).map_err(|error| {
             mp_config::ConfigError::Conversion {
                 name: public_key_property.to_owned(),
@@ -291,6 +340,10 @@ fn validate_service_token_decryption(
 }
 
 fn oidc_http_client(config: &OidcConfig) -> BuildResult<reqwest::Client> {
+    trace!(
+        timeout_ms = config.connection_timeout.as_millis(),
+        "building OIDC HTTP client"
+    );
     Ok(reqwest::Client::builder()
         .connect_timeout(config.connection_timeout)
         .build()?)
@@ -318,6 +371,7 @@ impl OidcBuilder {
     where
         V: TokenValidator,
     {
+        debug!("installing custom OIDC token validator");
         self.validator = Some(Arc::new(validator));
         self
     }
@@ -328,6 +382,7 @@ impl OidcBuilder {
     /// rotate automatically. Prefer discovery or refreshable JWKS when the
     /// provider rotates signing keys.
     pub fn public_key(mut self, public_key: &str) -> BuildResult<Self> {
+        debug!("installing static public-key JWT validator");
         self.validator = Some(Arc::new(JwtValidator::public_key(
             public_key,
             &self.config,
@@ -344,6 +399,7 @@ impl OidcBuilder {
     where
         I: TokenIntrospector,
     {
+        debug!("installing custom token introspection validator");
         self.validator = Some(Arc::new(IntrospectionValidator::new(
             introspector,
             &self.config,
@@ -371,6 +427,7 @@ impl OidcBuilder {
             url: endpoint.to_owned(),
             message: error.to_string(),
         })?;
+        debug!(endpoint = %endpoint, "installing HTTP token introspection validator");
         self.validator = Some(Arc::new(IntrospectionValidator::new(
             http_token_introspector(&self.config, client, endpoint.to_owned()),
             &self.config,
@@ -387,6 +444,7 @@ impl OidcBuilder {
     where
         P: UserInfoProvider,
     {
+        debug!("installing custom UserInfo token validator");
         self.validator = Some(Arc::new(UserInfoValidator::new(provider, &self.config)));
         self
     }
@@ -407,6 +465,7 @@ impl OidcBuilder {
             url: endpoint.to_owned(),
             message: error.to_string(),
         })?;
+        debug!(endpoint = %endpoint, "installing HTTP UserInfo token validator");
         self.validator = Some(Arc::new(UserInfoValidator::new(
             HttpUserInfoProvider::new(client, endpoint.to_owned()),
             &self.config,
@@ -427,17 +486,20 @@ impl OidcBuilder {
     /// Discovers provider metadata using a caller-supplied HTTP client.
     pub async fn discover_with_client(self, client: reqwest::Client) -> BuildResult<Oidc> {
         if !self.config.enabled {
+            debug!("OIDC discovery skipped because middleware is disabled");
             return Ok(self.build());
         }
         if self.config.public_key.is_some()
             && self.config.application_type != ApplicationType::WebApp
         {
+            debug!("OIDC discovery skipped because a static public key is configured");
             let mut builder = self;
             builder.install_web_app_from_config(client)?;
             return Ok(builder.build());
         }
 
         let auth_server_url = auth_server_url_from_config(&self.config)?;
+        debug!(auth_server_url = %auth_server_url, discovery_enabled = self.config.discovery_enabled, "starting OIDC provider setup");
         if !self.config.discovery_enabled {
             let mut builder = self;
             builder.install_web_app_from_config(client.clone())?;
@@ -445,6 +507,7 @@ impl OidcBuilder {
                 return Ok(builder.build());
             }
             if builder.config.token.require_jwt_introspection_only {
+                debug!("discovery disabled; installing configured introspection-only validator");
                 let introspection_path = builder
                     .config
                     .introspection_path
@@ -457,6 +520,7 @@ impl OidcBuilder {
             }
 
             if builder.config.token.verify_access_token_with_user_info {
+                debug!("discovery disabled; installing configured UserInfo token validator");
                 let user_info_path = builder
                     .config
                     .user_info_path
@@ -482,6 +546,7 @@ impl OidcBuilder {
                 .clone()
                 .ok_or(BuildError::MissingJwksPath)?;
             let jwks_url = provider_endpoint_url(&auth_server_url, &jwks_path)?;
+            debug!(jwks_url = %jwks_url, "discovery disabled; loading configured JWKS");
             let jwks: JwkSet = client
                 .get(jwks_url)
                 .send()
@@ -494,6 +559,7 @@ impl OidcBuilder {
         }
 
         let metadata_url = discovery_url(&auth_server_url, &self.config.discovery_path)?;
+        debug!(metadata_url = %metadata_url, "fetching OIDC provider metadata");
         let metadata: ProviderMetadata = client
             .get(metadata_url)
             .send()
@@ -502,6 +568,13 @@ impl OidcBuilder {
             .json()
             .await?;
 
+        debug!(
+            issuer = ?metadata.issuer,
+            jwks_uri = %metadata.jwks_uri,
+            has_introspection_endpoint = metadata.introspection_endpoint.is_some(),
+            has_userinfo_endpoint = metadata.userinfo_endpoint.is_some(),
+            "OIDC provider metadata loaded"
+        );
         let mut builder = self;
         builder.install_web_app_from_metadata(&metadata, client.clone())?;
         if builder.config.public_key.is_some() {
@@ -509,6 +582,7 @@ impl OidcBuilder {
         }
 
         if builder.config.token.require_jwt_introspection_only {
+            debug!("provider metadata requires introspection-only validation");
             let endpoint = metadata
                 .introspection_endpoint
                 .as_deref()
@@ -519,6 +593,7 @@ impl OidcBuilder {
         }
 
         if builder.config.token.verify_access_token_with_user_info {
+            debug!("provider metadata requires UserInfo token validation");
             let endpoint = metadata
                 .userinfo_endpoint
                 .as_deref()
@@ -535,6 +610,7 @@ impl OidcBuilder {
                 .ok_or(BuildError::MissingUserInfoEndpoint)?;
         }
 
+        debug!(jwks_uri = %metadata.jwks_uri, "fetching provider JWKS");
         let jwks: JwkSet = client
             .get(&metadata.jwks_uri)
             .send()
@@ -555,6 +631,7 @@ impl OidcBuilder {
         metadata: ProviderMetadata,
         jwks: JwkSet,
     ) -> BuildResult<Oidc> {
+        debug!("installing validator from supplied provider metadata");
         self.install_web_app_from_metadata(&metadata, reqwest::Client::new())?;
         if self.config.token.require_jwt_introspection_only {
             self.install_metadata_introspection(metadata, reqwest::Client::new())?;
@@ -592,6 +669,7 @@ impl OidcBuilder {
         jwks: JwkSet,
         client: reqwest::Client,
     ) -> BuildResult<Oidc> {
+        debug!("installing refreshable validator from supplied provider metadata");
         self.install_web_app_from_metadata(&metadata, client.clone())?;
         if self.config.token.require_jwt_introspection_only {
             self.install_metadata_introspection(metadata, client)?;
@@ -622,6 +700,7 @@ impl OidcBuilder {
     }
 
     fn install_jwks_with_optional_introspection(&mut self, jwks: JwkSet, client: reqwest::Client) {
+        debug!("installing JWKS validator with optional introspection fallback");
         let jwt = JwtValidator::jwks(jwks, &self.config);
         let user_info_endpoint = self.user_info_endpoint_from_config();
         let Some(introspection_path) = self.config.introspection_path.as_deref() else {
@@ -667,8 +746,12 @@ impl OidcBuilder {
         J: TokenValidator,
     {
         let Some(endpoint) = metadata.introspection_endpoint.clone() else {
+            trace!(
+                "provider metadata did not include an introspection endpoint; JWT fallback is disabled"
+            );
             return Arc::new(jwt);
         };
+        debug!(endpoint = %endpoint, "installing metadata introspection fallback");
         let validation_config = provider_validation_config(&self.config, &metadata);
         let introspection = IntrospectionValidator::new(
             http_token_introspector(&validation_config, client, endpoint),
@@ -690,6 +773,7 @@ impl OidcBuilder {
             .introspection_endpoint
             .clone()
             .ok_or(BuildError::MissingIntrospectionEndpoint)?;
+        debug!(endpoint = %endpoint, "installing metadata introspection validator");
         let validation_config = provider_validation_config(&self.config, &metadata);
         self.validator = Some(Arc::new(IntrospectionValidator::new(
             http_token_introspector(&validation_config, client, endpoint),
@@ -707,6 +791,7 @@ impl OidcBuilder {
             .userinfo_endpoint
             .clone()
             .ok_or(BuildError::MissingUserInfoEndpoint)?;
+        debug!(endpoint = %endpoint, "installing metadata UserInfo validator");
         let validation_config = provider_validation_config(&self.config, &metadata);
         self.validator = Some(Arc::new(UserInfoValidator::new(
             HttpUserInfoProvider::new(client, endpoint),
@@ -724,6 +809,7 @@ impl OidcBuilder {
         if self.config.application_type != ApplicationType::WebApp {
             return Ok(());
         }
+        debug!("installing web-app support from configured endpoints");
         self.web_app = Some(Arc::new(WebApp::from_config(&self.config, client)?));
         Ok(())
     }
@@ -736,6 +822,7 @@ impl OidcBuilder {
         if self.config.application_type != ApplicationType::WebApp {
             return Ok(());
         }
+        debug!("installing web-app support from provider metadata");
         self.web_app = Some(Arc::new(WebApp::from_provider_metadata(
             &self.config,
             client,
@@ -800,6 +887,9 @@ impl OidcBuilder {
     /// protected routes closed while allowing configuration and routing to be
     /// wired before a JWT/JWKS backend is added.
     pub fn build(self) -> Oidc {
+        let has_validator = self.validator.is_some();
+        let has_web_app = self.web_app.is_some();
+        debug!(has_validator, has_web_app, "building OIDC middleware");
         Oidc {
             config: self.config,
             validator: self.validator.unwrap_or_else(|| Arc::new(RejectAllTokens)),

@@ -7,6 +7,7 @@ use http::{HeaderValue, Request};
 use serde_json::Value;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::trace;
 
 pub(crate) fn validate_authorization_scheme(
     property_name: &str,
@@ -34,9 +35,17 @@ pub(crate) fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) ->
     let header_name = http::HeaderName::from_str(&config.header)
         .map_err(|_| Error::InvalidAuthorizationHeader)?;
     let Some(header) = request.headers().get(&header_name) else {
+        trace!(
+            configured_header = %config.header,
+            "authorization token header was not present"
+        );
         return Err(Error::MissingBearerToken);
     };
     if header_name == AUTHORIZATION {
+        trace!(
+            authorization_scheme = %config.authorization_scheme,
+            "extracting bearer token from Authorization header"
+        );
         return bearer_token_from_authorization_header(header, &config.authorization_scheme);
     }
     let token = header
@@ -44,8 +53,10 @@ pub(crate) fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) ->
         .map_err(|_| Error::InvalidAuthorizationHeader)?
         .trim();
     if token.is_empty() {
+        trace!(configured_header = %config.header, "configured token header was empty");
         return Err(Error::InvalidAuthorizationHeader);
     }
+    trace!(configured_header = %config.header, "extracted token from configured header");
     Ok(Arc::from(token))
 }
 

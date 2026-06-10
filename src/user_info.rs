@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, trace};
 
 /// OIDC UserInfo response.
 ///
@@ -107,6 +108,11 @@ impl UserInfoValidator {
     where
         P: UserInfoProvider,
     {
+        debug!(
+            subject_required = config.token.subject_required,
+            required_claims = config.token.required_claims.len(),
+            "building UserInfo token validator"
+        );
         Self {
             provider: Arc::new(provider),
             role_claim_paths: Arc::from(role_claim_paths_for_source(config, RolesSource::UserInfo)),
@@ -132,22 +138,33 @@ impl TokenValidator for UserInfoValidator {
         let leeway = self.leeway;
 
         Box::pin(async move {
+            trace!("fetching UserInfo for token validation");
             let claims = provider
                 .user_info(token)
                 .await
                 .map_err(Error::TokenRejected)?
                 .into_claims();
+            trace!(
+                has_subject = claims.sub.is_some(),
+                extra_claims = claims.extra.as_object().map_or(0, serde_json::Map::len),
+                "UserInfo response received for token validation"
+            );
             validate_subject(&claims, subject_required)?;
             validate_required_claims(&claims, &required_claims)?;
             if claims.iat.is_some() {
                 validate_token_age(&claims, token_age, leeway)?;
             }
-            Principal::from_claims(
+            let principal = Principal::from_claims(
                 claims,
                 &role_claim_paths,
                 &role_claim_separator,
                 principal_claim.as_deref(),
-            )
+            )?;
+            trace!(
+                groups = principal.groups().count(),
+                "UserInfo token validation succeeded"
+            );
+            Ok(principal)
         })
     }
 }
@@ -183,6 +200,7 @@ impl UserInfoRolesValidator {
         provider: Arc<dyn UserInfoProvider>,
         config: &OidcConfig,
     ) -> Self {
+        debug!("building validator that loads roles from UserInfo after token validation");
         Self {
             token_validator,
             provider,
@@ -200,27 +218,34 @@ impl TokenValidator for UserInfoRolesValidator {
         let role_claim_separator = self.role_claim_separator.clone();
 
         Box::pin(async move {
+            trace!("validating token before loading UserInfo roles");
             let principal = token_validator.validate(token.clone()).await?;
             let claims = provider
                 .user_info(token)
                 .await
                 .map_err(Error::TokenRejected)?
                 .into_claims();
+            trace!(
+                has_subject = claims.sub.is_some(),
+                extra_claims = claims.extra.as_object().map_or(0, serde_json::Map::len),
+                "UserInfo response received for role extraction"
+            );
 
             if let Some(user_info_subject) = claims.sub.as_deref() {
                 if user_info_subject != principal.subject() {
+                    debug!("UserInfo subject did not match access-token subject");
                     return Err(Error::TokenRejected(
                         "UserInfo subject did not match access token subject".into(),
                     ));
                 }
             }
 
-            Ok(principal.with_claim_groups(
-                extract_roles(&claims.extra, &role_claim_paths, &role_claim_separator)
-                    .into_iter()
-                    .map(Arc::from)
-                    .collect(),
-            ))
+            let groups = extract_roles(&claims.extra, &role_claim_paths, &role_claim_separator)
+                .into_iter()
+                .map(Arc::from)
+                .collect::<Vec<_>>();
+            trace!(groups = groups.len(), "loaded roles from UserInfo response");
+            Ok(principal.with_claim_groups(groups))
         })
     }
 }
@@ -242,6 +267,7 @@ impl UserInfoProvider for HttpUserInfoProvider {
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         Box::pin(async move {
+            debug!(endpoint = %endpoint, "sending UserInfo request");
             let authorization = HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|error| Box::new(error) as BoxError)?;
             client

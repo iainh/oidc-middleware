@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use tracing::{debug, trace};
 
 /// Future returned by [`JwksProvider`].
 ///
@@ -56,6 +57,7 @@ impl JwksProvider for HttpJwksProvider {
         let client = self.client.clone();
         let jwks_uri = self.jwks_uri.clone();
         Box::pin(async move {
+            debug!(jwks_uri = %jwks_uri, "fetching JWKS from provider");
             client
                 .get(&jwks_uri)
                 .send()
@@ -102,8 +104,17 @@ impl JwtKeys {
 
     pub(crate) async fn decoding_key(&self, token: &str) -> Result<DecodingKey> {
         match self {
-            Self::Single(key) => Ok((**key).clone()),
-            Self::Set(jwks) => decoding_key_from_jwks(jwks, token),
+            Self::Single(key) => {
+                trace!("using single configured JWT decoding key");
+                Ok((**key).clone())
+            }
+            Self::Set(jwks) => {
+                trace!(
+                    keys = jwks.keys.len(),
+                    "selecting JWT decoding key from JWKS"
+                );
+                decoding_key_from_jwks(jwks, token)
+            }
             Self::Refreshing(jwks) => {
                 let key_result = {
                     let current = jwks
@@ -116,11 +127,15 @@ impl JwtKeys {
                 match key_result {
                     Ok(key) => Ok(key),
                     Err(error) if should_refresh_jwks(&error) => {
+                        debug!(error = %error, "JWT key id was not found in cached JWKS");
                         if !jwks.should_force_refresh()? {
+                            trace!("JWKS refresh suppressed by forced refresh interval");
                             return Err(error);
                         }
+                        debug!("refreshing JWKS after unknown JWT key id");
                         let refreshed =
                             jwks.provider.fetch().await.map_err(Error::TokenRejected)?;
+                        debug!(keys = refreshed.keys.len(), "JWKS refresh succeeded");
                         let key = decoding_key_from_jwks(&refreshed, token)?;
                         let mut current = jwks.current.lock().map_err(|_| {
                             Error::TokenRejected("JWKS cache lock was poisoned".into())
@@ -164,12 +179,20 @@ impl RefreshingJwks {
 
 fn decoding_key_from_jwks(jwks: &JwkSet, token: &str) -> Result<DecodingKey> {
     let header = decode_header(token).map_err(|error| Error::TokenRejected(Box::new(error)))?;
+    trace!(kid = ?header.kid, algorithm = ?header.alg, "decoded JWT header for key selection");
     let jwk = match header.kid.as_deref() {
         Some(kid) => jwks
             .find(kid)
             .ok_or_else(|| Error::TokenRejected(UnknownKid(kid.to_owned()).into()))?,
-        None if jwks.keys.len() == 1 => &jwks.keys[0],
+        None if jwks.keys.len() == 1 => {
+            trace!("JWT header had no kid; using only key in JWKS");
+            &jwks.keys[0]
+        }
         None => {
+            debug!(
+                keys = jwks.keys.len(),
+                "JWT header did not include a key id and JWKS has multiple keys"
+            );
             return Err(Error::TokenRejected(
                 "JWT header did not include a key id".into(),
             ));

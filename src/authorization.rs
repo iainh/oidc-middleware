@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
+use tracing::{debug, trace};
 
 /// Requires a route to run only after OIDC authentication has succeeded.
 ///
@@ -80,9 +81,19 @@ where
 
         Box::pin(async move {
             if request.extensions().get::<Principal>().is_none() {
+                debug!(
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    "authenticated route reached without a principal extension"
+                );
                 return Ok(Error::MissingBearerToken.into_response());
             }
 
+            trace!(
+                method = %request.method(),
+                path = %request.uri().path(),
+                "authenticated route authorization passed"
+            );
             inner.call(request).await
         })
     }
@@ -188,6 +199,12 @@ where
 
         Box::pin(async move {
             let Some(principal) = request.extensions().get::<Principal>() else {
+                debug!(
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    required_roles = ?roles,
+                    "role-protected route reached without a principal extension"
+                );
                 return Ok(Error::MissingBearerToken.into_response());
             };
 
@@ -197,9 +214,23 @@ where
             };
 
             if !allowed {
+                debug!(
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    required_roles = ?roles,
+                    mode = ?mode,
+                    "principal did not satisfy route role requirement"
+                );
                 return Ok(Error::Forbidden.into_response());
             }
 
+            trace!(
+                method = %request.method(),
+                path = %request.uri().path(),
+                required_roles = ?roles,
+                mode = ?mode,
+                "route role authorization passed"
+            );
             inner.call(request).await
         })
     }

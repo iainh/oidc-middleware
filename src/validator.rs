@@ -2,6 +2,7 @@ use crate::{Error, Principal, Result};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::trace;
 
 pub(crate) type ValidationFuture = Pin<Box<dyn Future<Output = Result<Principal>> + Send>>;
 
@@ -65,8 +66,13 @@ impl TokenValidator for StaticTokenValidator {
         let expected = self.token.clone();
         Box::pin(async move {
             if token == expected {
+                trace!(
+                    groups = principal.groups().count(),
+                    "static token validator accepted token"
+                );
                 Ok(principal)
             } else {
+                trace!("static token validator rejected token");
                 Err(Error::TokenRejected("bearer token did not match".into()))
             }
         })
