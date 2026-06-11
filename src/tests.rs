@@ -1900,7 +1900,7 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
         query.get("scope").map(|value| value.as_ref()),
         Some("openid email")
     );
-    assert!(query.get("state").is_some());
+    assert!(query.contains_key("state"));
 }
 
 #[tokio::test]
@@ -6660,8 +6660,10 @@ fn jwt_without_iat(claims: impl Serialize) -> String {
 }
 
 fn jwt_with_header_type(token_type: &str, claims: impl Serialize) -> String {
-    let mut header = Header::default();
-    header.typ = Some(token_type.to_owned());
+    let header = Header {
+        typ: Some(token_type.to_owned()),
+        ..Default::default()
+    };
     jwt_value_with_header(header, claims, true)
 }
 
@@ -6675,10 +6677,10 @@ fn jwt_value_with_header(
     include_default_iat: bool,
 ) -> String {
     let mut claims = serde_json::to_value(claims).expect("test claims should serialize");
-    if include_default_iat {
-        if let Value::Object(claims) = &mut claims {
-            claims.entry("iat").or_insert_with(|| Value::from(TEST_IAT));
-        }
+    if include_default_iat
+        && let Value::Object(claims) = &mut claims
+    {
+        claims.entry("iat").or_insert_with(|| Value::from(TEST_IAT));
     }
     encode(&header, &claims, &EncodingKey::from_secret(b"secret"))
         .expect("test token should encode")
@@ -6703,8 +6705,10 @@ fn jwt_with_kid(kid: &str, claims: TestClaims<'_>) -> String {
 }
 
 fn jwt_with_kid_and_secret(kid: &str, secret: &[u8], claims: impl Serialize) -> String {
-    let mut header = Header::default();
-    header.kid = Some(kid.to_owned());
+    let header = Header {
+        kid: Some(kid.to_owned()),
+        ..Default::default()
+    };
     let mut claims = serde_json::to_value(claims).expect("test claims should serialize");
     if let Value::Object(claims) = &mut claims {
         claims.entry("iat").or_insert_with(|| Value::from(TEST_IAT));
