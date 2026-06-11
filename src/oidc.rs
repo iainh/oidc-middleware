@@ -23,6 +23,8 @@ use crate::token::bearer_token;
 use crate::user_info::HttpUserInfoProvider;
 use crate::validator::RejectAllTokens;
 #[cfg(feature = "web-app")]
+use crate::web_app::PendingWebAppCookies;
+#[cfg(feature = "web-app")]
 use crate::web_app::WebApp;
 use crate::{
     ApplicationType, Error, IntrospectionValidator, OidcConfig, Principal, Result, RolesSource,
@@ -1094,7 +1096,14 @@ where
         Box::pin(async move {
             match oidc.authenticate_or_response(&mut request).await {
                 Ok(Some(response)) => Ok(response),
-                Ok(None) => inner.call(request).await,
+                Ok(None) => {
+                    let pending_cookies = request.extensions_mut().remove::<PendingWebAppCookies>();
+                    let mut response = inner.call(request).await?;
+                    if let Some(pending_cookies) = pending_cookies {
+                        pending_cookies.append_to(&mut response);
+                    }
+                    Ok(response)
+                }
                 Err(error) => Ok(error.into_response_with_scheme(&authorization_scheme)),
             }
         })

@@ -21,11 +21,12 @@ macros = ["dep:oidc-middleware-macros"]
 native-tls = ["http-client", "reqwest/native-tls"]
 rustls = ["http-client", "reqwest/rustls-tls"]
 rustls-native-certs = ["http-client", "reqwest/rustls-tls-native-roots"]
-web-app = ["http-client", "jwt", "dep:getrandom", "dep:tower-sessions"]
+web-app = ["http-client", "jwt", "dep:cookie", "dep:getrandom", "dep:tower-sessions"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["json"] }
 base64 = "0.22"
+cookie = { version = "0.18", features = ["private"], optional = true }
 getrandom = { version = "0.2", optional = true }
 http = "1"
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"], optional = true }

@@ -106,6 +106,10 @@ fn config_loads_quarkus_oidc_properties() {
                 .with("oidc.authentication.redirect-path", "/login/callback")
                 .with("oidc.authentication.restore-path-after-redirect", "false")
                 .with("oidc.authentication.session-age-extension", "120s")
+                .with(
+                    "oidc.authentication.token-state-cookie-key",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                )
                 .with("oidc.authentication.scopes", "openid,email,profile")
                 .with("oidc.token.audience", "orders-api")
                 .with("oidc.token.token-type", "bearer")
@@ -174,6 +178,10 @@ fn config_loads_quarkus_oidc_properties() {
                 redirect_path: "/login/callback".to_owned(),
                 restore_path_after_redirect: false,
                 session_age_extension: Duration::from_secs(120),
+                token_state_cookie_key: Some(
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                        .to_owned(),
+                ),
                 scopes: vec![
                     "openid".to_owned(),
                     "email".to_owned(),
@@ -1771,6 +1779,7 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
             redirect_path: "/login/callback".to_owned(),
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
+            token_state_cookie_key: None,
             scopes: vec!["openid".to_owned(), "email".to_owned()],
         },
         ..OidcConfig::default()
@@ -1837,6 +1846,42 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
     assert!(query.get("state").is_some());
 }
 
+#[test]
+fn web_app_rejects_invalid_token_state_cookie_key() {
+    let Err(error) = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            token_state_cookie_key: Some("too-short".to_owned()),
+            ..OidcAuthenticationConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some("https://issuer.example/realms/app/token".to_owned()),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        JwkSet { keys: vec![] },
+    ) else {
+        panic!("invalid token-state cookie key should be rejected");
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("token-state-cookie-key must be base64-encoded"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
     let token = jwt_with_kid_and_secret(
@@ -1861,6 +1906,7 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
             redirect_path: "/login/callback".to_owned(),
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
+            token_state_cookie_key: None,
             scopes: vec!["openid".to_owned()],
         },
         ..OidcConfig::default()
@@ -1936,6 +1982,10 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
         response.headers().get(LOCATION).unwrap(),
         HeaderValue::from_static("/protected?item=1")
     );
+    let token_state_cookie = set_cookie_header(&response, "q_oidc")
+        .expect("token-state cookie should be set after callback");
+    assert!(!token_state_cookie.contains("opaque-access-token"));
+    assert!(!token_state_cookie.contains("alice@example.com"));
     let cookie = cookie_header(&response);
 
     let response = app
@@ -1951,6 +2001,193 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_body(response).await, "alice:alice@example.com");
+}
+
+#[tokio::test]
+async fn web_app_clears_tampered_token_state_cookie() {
+    let token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com"
+        }),
+    );
+    let token_endpoint = one_shot_token_endpoint("opaque-access-token".to_owned(), Some(token));
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer())
+        .layer(SessionManagerLayer::new(MemoryStore::default()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/q/oidc/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = tamper_cookie_value(&cookie_header(&response), "q_oidc");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    assert!(location.starts_with("https://issuer.example/realms/app/auth?"));
+    let cleared = set_cookie_header(&response, "q_oidc")
+        .expect("tampered token-state cookie should be cleared");
+    assert!(cleared.contains("Max-Age=0"));
+}
+
+#[tokio::test]
+async fn web_app_token_state_cookie_lifetime_tracks_tokens() {
+    let token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com"
+        }),
+    );
+    let token_endpoint = one_shot_token_endpoint_with_refresh(
+        "opaque-access-token".to_owned(),
+        Some(token),
+        Some("refresh-token".to_owned()),
+        Some(30),
+    );
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            session_age_extension: Duration::from_secs(20),
+            ..OidcAuthenticationConfig::default()
+        },
+        token: OidcTokenConfig {
+            lifespan_grace: Some(10),
+            refresh_expired: true,
+            ..OidcTokenConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer())
+        .layer(SessionManagerLayer::new(MemoryStore::default()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/q/oidc/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let token_state_cookie = set_cookie_header(&response, "q_oidc")
+        .expect("token-state cookie should be set after callback");
+    let max_age = cookie_attribute(&token_state_cookie, "Max-Age")
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("token-state cookie should have Max-Age");
+    assert!(
+        (55..=60).contains(&max_age),
+        "expected Max-Age near 60 seconds, got {max_age}: {token_state_cookie}"
+    );
 }
 
 #[tokio::test]
@@ -5500,6 +5737,43 @@ fn cookie_header(response: &Response) -> String {
         .iter()
         .filter_map(|value| value.to_str().ok())
         .filter_map(|value| value.split_once(';').map(|(cookie, _)| cookie.to_owned()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn set_cookie_header(response: &Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with(&format!("{name}=")))
+        .map(ToOwned::to_owned)
+}
+
+fn cookie_attribute(cookie: &str, name: &str) -> Option<String> {
+    cookie.split(';').skip(1).find_map(|attribute| {
+        let attribute = attribute.trim();
+        let (attribute_name, attribute_value) = attribute.split_once('=')?;
+        attribute_name
+            .eq_ignore_ascii_case(name)
+            .then(|| attribute_value.to_owned())
+    })
+}
+
+fn tamper_cookie_value(header: &str, name: &str) -> String {
+    header
+        .split("; ")
+        .map(|cookie| {
+            let Some((cookie_name, cookie_value)) = cookie.split_once('=') else {
+                return cookie.to_owned();
+            };
+            if cookie_name == name {
+                format!("{cookie_name}={cookie_value}a")
+            } else {
+                cookie.to_owned()
+            }
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }

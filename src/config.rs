@@ -177,8 +177,9 @@ impl Default for OidcConfig {
 /// Browser authentication settings loaded from `oidc.authentication.*`.
 ///
 /// These settings apply only to [`ApplicationType::WebApp`]. Web-app mode uses
-/// the authorization-code flow, stores state in `tower-sessions`, and validates
-/// the returned ID token or access token through the configured validator.
+/// the authorization-code flow, stores authentication state in an encrypted
+/// cookie, keeps redirect state in `tower-sessions`, and validates the returned
+/// ID token or access token through the configured validator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcAuthenticationConfig {
     /// Redirect URI path or absolute URI used for authorization-code callbacks.
@@ -191,11 +192,17 @@ pub struct OidcAuthenticationConfig {
     pub restore_path_after_redirect: bool,
     /// Extra session lifetime available after token expiry for refresh attempts.
     ///
-    /// This mirrors Quarkus `authentication.session-age-extension`. The actual
-    /// browser cookie lifetime is still owned by the installed `tower-sessions`
-    /// layer; this value is exposed so applications can keep configuration
-    /// vocabulary aligned with Quarkus deployments.
+    /// This mirrors Quarkus `authentication.session-age-extension`. The
+    /// encrypted token-state cookie lifetime is capped by the token expiry,
+    /// token lifespan grace, and this extension when refresh is enabled.
     pub session_age_extension: Duration,
+    /// Base64-encoded key used to encrypt web-app token-state cookies.
+    ///
+    /// If unset, web-app support generates an in-memory key at startup. That is
+    /// suitable for local development, but production deployments should
+    /// configure a stable 64-byte random key so browser sessions survive
+    /// process restarts.
+    pub token_state_cookie_key: Option<String>,
     /// OIDC scopes requested from the provider.
     ///
     /// The list must include `openid`; without it the provider is not required
@@ -209,6 +216,7 @@ impl Default for OidcAuthenticationConfig {
             redirect_path: "/q/oidc/callback".to_owned(),
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
+            token_state_cookie_key: None,
             scopes: vec!["openid".to_owned()],
         }
     }
@@ -259,6 +267,10 @@ impl ConfigProperties for OidcAuthenticationConfig {
             session_age_extension: config
                 .get_optional(&key("session-age-extension"))?
                 .unwrap_or_else(|| Duration::from_secs(300)),
+            token_state_cookie_key: load_optional_non_empty_string(
+                config,
+                &key("token-state-cookie-key"),
+            )?,
             scopes,
         })
     }

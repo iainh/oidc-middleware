@@ -63,9 +63,10 @@
 //!   provider calls and default Keycloak resource-role extraction.
 //! - `oidc.application-type` maps to [`OidcConfig::application_type`]. Use
 //!   `service` for APIs and `web-app` for browser login.
-//! - `oidc.authentication.*` configures browser redirects for `web-app`
-//!   applications. Web-app middleware expects a `tower_sessions::Session`
-//!   extension supplied by `tower-sessions`.
+//! - `oidc.authentication.*` configures browser redirects and token-state
+//!   cookies for `web-app` applications. Web-app middleware expects a
+//!   `tower_sessions::Session` extension supplied by `tower-sessions` for
+//!   authorization redirect state.
 //! - `oidc.enabled=false` disables authentication for the layer. This is useful
 //!   for local profiles, but it also means protected handlers must not assume a
 //!   [`Principal`] extension exists.

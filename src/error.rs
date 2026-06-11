@@ -152,6 +152,11 @@ pub enum BuildError {
         /// Parser detail suitable for startup logs or diagnostics.
         message: String,
     },
+    /// OIDC configuration was structurally valid but unusable.
+    InvalidConfiguration {
+        /// Configuration detail suitable for startup logs or diagnostics.
+        message: String,
+    },
     /// Fetching provider metadata or keys failed.
     #[cfg(feature = "http-client")]
     Http(reqwest::Error),
@@ -198,6 +203,9 @@ impl fmt::Display for BuildError {
             ),
             Self::InvalidPublicKey(source) => write!(f, "invalid OIDC public key: {source}"),
             Self::InvalidUrl { url, message } => write!(f, "invalid URL `{url}`: {message}"),
+            Self::InvalidConfiguration { message } => {
+                write!(f, "invalid OIDC configuration: {message}")
+            }
             #[cfg(feature = "http-client")]
             Self::Http(source) => write!(f, "OIDC provider request failed: {source}"),
         }
