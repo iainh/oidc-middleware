@@ -513,7 +513,7 @@ impl WebApp {
             None => None,
         };
         let principal = match validator
-            .validate(Arc::from(token_response.access_token.clone()))
+            .validate(Arc::from(token_response.access_token.as_str()))
             .await
         {
             Ok(principal) => {
@@ -871,7 +871,7 @@ async fn validate_id_token(
     // If this crate starts sending a nonce in the Authentication Request,
     // OpenID Connect Core 1.0 Section 3.1.3.7 requires checking the returned
     // ID Token `nonce` here against the stored redirect state.
-    let principal = validator.validate(Arc::from(token.to_owned())).await?;
+    let principal = validator.validate(Arc::from(token)).await?;
     let claims = decode_id_token_claims(token)?;
     trace!(
         has_subject = claims.sub.is_some(),
