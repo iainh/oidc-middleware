@@ -192,6 +192,8 @@ The current implementation supports:
 - Service and hybrid `oidc.application-type` bearer-token middleware.
 - Browser `web-app` login when provider discovery or explicit authorization and
   token endpoints are configured.
+- Absolute `oidc.authentication.redirect-path` values for deployments where
+  request host or forwarding headers are unavailable.
 - OIDC provider discovery from `oidc.auth-server-url` and discovered `jwks_uri`.
 - Direct `oidc.jwks-path` loading when `oidc.discovery-enabled=false`.
 - Local JWT verification with `oidc.public-key`.

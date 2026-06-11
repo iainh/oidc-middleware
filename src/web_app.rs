@@ -14,7 +14,7 @@ use http::{HeaderValue, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::sync::Arc;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use url::form_urlencoded;
 
 const TOKEN_STATE_COOKIE_NAME: &str = "q_oidc";
@@ -450,16 +450,19 @@ impl WebApp {
             trace!(redirect_uri = %self.redirect_path, "using absolute OIDC redirect URI");
             return Ok(self.redirect_path.clone());
         }
-        let host = request
-            .headers()
-            .get("x-forwarded-host")
-            .or_else(|| request.headers().get(HOST))
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| {
-                Error::Session(
-                    std::io::Error::other("missing Host header for OIDC redirect URI").into(),
+        let host = request_host(request).ok_or_else(|| {
+            warn!(
+                path = %request.uri().path(),
+                redirect_path = %self.redirect_path,
+                "cannot build OIDC redirect URI without Host, X-Forwarded-Host, URI authority, or an absolute redirect path"
+            );
+            Error::Session(
+                std::io::Error::other(
+                    "missing request host for OIDC redirect URI; set Host/X-Forwarded-Host or configure an absolute oidc.authentication.redirect-path",
                 )
-            })?;
+                .into(),
+            )
+        })?;
         let scheme = request
             .headers()
             .get("x-forwarded-proto")
@@ -467,7 +470,7 @@ impl WebApp {
             .or_else(|| request.uri().scheme_str())
             .unwrap_or("http");
         let redirect_uri = format!("{scheme}://{host}{}", self.redirect_path);
-        trace!(redirect_uri = %redirect_uri, "built OIDC redirect URI from request headers");
+        trace!(redirect_uri = %redirect_uri, "built OIDC redirect URI from request origin");
         Ok(redirect_uri)
     }
 }
@@ -565,6 +568,15 @@ fn path_matches(configured: &str, actual: &str) -> bool {
             .unwrap_or(false);
     }
     configured == actual
+}
+
+fn request_host(request: &Request<Body>) -> Option<&str> {
+    request
+        .headers()
+        .get("x-forwarded-host")
+        .or_else(|| request.headers().get(HOST))
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri().authority().map(http::uri::Authority::as_str))
 }
 
 #[derive(Clone)]

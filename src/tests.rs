@@ -1892,6 +1892,109 @@ async fn web_app_redirects_without_external_session_layer() {
     assert!(response.headers().get(LOCATION).is_some());
 }
 
+#[tokio::test]
+async fn web_app_redirect_uri_uses_absolute_request_authority_without_host_header() {
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            redirect_path: "/login/callback".to_owned(),
+            restore_path_after_redirect: true,
+            session_age_extension: Duration::from_secs(300),
+            token_state_cookie_key: None,
+            scopes: vec!["openid".to_owned()],
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some("https://issuer.example/realms/app/token".to_owned()),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        JwkSet { keys: vec![] },
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("https://app.example/protected")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    let location = reqwest::Url::parse(location).expect("redirect location should be a URL");
+    let query = location.query_pairs().collect::<HashMap<_, _>>();
+    assert_eq!(
+        query.get("redirect_uri").map(|value| value.as_ref()),
+        Some("https://app.example/login/callback")
+    );
+}
+
+#[tokio::test]
+async fn web_app_redirect_uri_requires_request_origin_for_relative_redirect_path() {
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            redirect_path: "/login/callback".to_owned(),
+            restore_path_after_redirect: true,
+            session_age_extension: Duration::from_secs(300),
+            token_state_cookie_key: None,
+            scopes: vec!["openid".to_owned()],
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some("https://issuer.example/realms/app/token".to_owned()),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        JwkSet { keys: vec![] },
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
 #[test]
 fn web_app_rejects_invalid_token_state_cookie_key() {
     let Err(error) = Oidc::builder(OidcConfig {
