@@ -2,6 +2,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 
+const MAX_CLAIM_PATH_BYTES: usize = 512;
+const MAX_CLAIM_PATH_PARTS: usize = 32;
+
 pub(crate) fn extract_roles(claims: &Value, paths: &[String], separator: &str) -> Vec<String> {
     let mut roles = Vec::new();
     for path in paths {
@@ -43,6 +46,57 @@ pub(crate) fn claim_path_parts(path: &str) -> Vec<String> {
     }
 
     parts
+}
+
+pub(crate) fn validate_claim_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("claim path must not be empty".to_owned());
+    }
+    if path.len() > MAX_CLAIM_PATH_BYTES {
+        return Err(format!(
+            "claim path must be at most {MAX_CLAIM_PATH_BYTES} bytes"
+        ));
+    }
+
+    let mut quoted = false;
+    let mut current_empty = true;
+    let mut part_count = 0_usize;
+
+    for character in path.chars() {
+        match character {
+            '"' => {
+                quoted = !quoted;
+                current_empty = false;
+            }
+            '.' | '/' if !quoted => {
+                if current_empty {
+                    return Err("claim path must not contain empty segments".to_owned());
+                }
+                part_count += 1;
+                if part_count > MAX_CLAIM_PATH_PARTS {
+                    return Err(format!(
+                        "claim path must contain at most {MAX_CLAIM_PATH_PARTS} segments"
+                    ));
+                }
+                current_empty = true;
+            }
+            _ => current_empty = false,
+        }
+    }
+
+    if quoted {
+        return Err("claim path contains an unmatched quote".to_owned());
+    }
+    if current_empty {
+        return Err("claim path must not contain empty segments".to_owned());
+    }
+    if part_count + 1 > MAX_CLAIM_PATH_PARTS {
+        return Err(format!(
+            "claim path must contain at most {MAX_CLAIM_PATH_PARTS} segments"
+        ));
+    }
+
+    Ok(())
 }
 
 fn collect_roles(value: &Value, roles: &mut Vec<String>, separator: &str) {

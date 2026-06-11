@@ -1,3 +1,4 @@
+use crate::claims::validate_claim_path;
 use mp_config::Config;
 use std::collections::{BTreeSet, HashMap};
 
@@ -6,14 +7,14 @@ pub(crate) fn load_optional_non_empty_string(
     key: &str,
 ) -> mp_config::Result<Option<String>> {
     let value = config.get_optional::<String>(key)?;
-    if let Some(value) = &value {
-        if value.trim().is_empty() {
-            return Err(mp_config::ConfigError::Conversion {
-                name: key.to_owned(),
-                value: value.clone(),
-                message: "value must not be empty when configured".to_owned(),
-            });
-        }
+    if let Some(value) = &value
+        && value.trim().is_empty()
+    {
+        return Err(mp_config::ConfigError::Conversion {
+            name: key.to_owned(),
+            value: value.clone(),
+            message: "value must not be empty when configured".to_owned(),
+        });
     }
     Ok(value)
 }
@@ -35,6 +36,11 @@ pub(crate) fn load_required_claims(
 
         let value = config.get::<String>(&key)?;
         let expected_values = split_csv(&value);
+        validate_claim_path(&claim_name).map_err(|message| mp_config::ConfigError::Conversion {
+            name: key.clone(),
+            value: claim_name.clone(),
+            message,
+        })?;
         if expected_values.is_empty() {
             return Err(mp_config::ConfigError::Conversion {
                 name: key,

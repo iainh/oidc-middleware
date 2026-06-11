@@ -1,3 +1,4 @@
+use crate::claims::validate_claim_path;
 use crate::config_helpers::{
     load_optional_non_empty_string, load_required_claims, load_string_map, split_csv,
 };
@@ -339,18 +340,17 @@ impl ConfigProperties for OidcLogoutConfig {
 
         let post_logout_path = load_optional_non_empty_string(config, &key("post-logout-path"))?
             .or_else(|| Some("/".to_owned()));
-        if let Some(post_logout_path) = &post_logout_path {
-            if !post_logout_path.starts_with('/')
-                && !post_logout_path.starts_with("http://")
-                && !post_logout_path.starts_with("https://")
-            {
-                return Err(mp_config::ConfigError::Conversion {
-                    name: key("post-logout-path"),
-                    value: post_logout_path.clone(),
-                    message: "post-logout-path must start with `/`, `http://`, or `https://`"
-                        .to_owned(),
-                });
-            }
+        if let Some(post_logout_path) = &post_logout_path
+            && !post_logout_path.starts_with('/')
+            && !post_logout_path.starts_with("http://")
+            && !post_logout_path.starts_with("https://")
+        {
+            return Err(mp_config::ConfigError::Conversion {
+                name: key("post-logout-path"),
+                value: post_logout_path.clone(),
+                message: "post-logout-path must start with `/`, `http://`, or `https://`"
+                    .to_owned(),
+            });
         }
 
         let post_logout_uri_param = config
@@ -759,18 +759,27 @@ impl ConfigProperties for OidcTokenConfig {
 
         let audience_key = key("audience");
         let audience = config.get_optional::<String>(&audience_key)?;
-        if let Some(value) = &audience {
-            if split_csv(value).is_empty() {
-                return Err(mp_config::ConfigError::Conversion {
-                    name: audience_key,
-                    value: value.clone(),
-                    message: "token audience must include at least one audience".to_owned(),
-                });
-            }
+        if let Some(value) = &audience
+            && split_csv(value).is_empty()
+        {
+            return Err(mp_config::ConfigError::Conversion {
+                name: audience_key,
+                value: value.clone(),
+                message: "token audience must include at least one audience".to_owned(),
+            });
         }
 
         let token_type = load_optional_non_empty_string(config, &key("token-type"))?;
         let principal_claim = load_optional_non_empty_string(config, &key("principal-claim"))?;
+        if let Some(principal_claim) = &principal_claim {
+            validate_claim_path(principal_claim).map_err(|message| {
+                mp_config::ConfigError::Conversion {
+                    name: key("principal-claim"),
+                    value: principal_claim.clone(),
+                    message,
+                }
+            })?;
+        }
         let refresh_token_time_skew =
             config.get_optional::<Duration>(&key("refresh-token-time-skew"))?;
 
@@ -920,6 +929,13 @@ impl ConfigProperties for OidcRolesConfig {
                 message: "role-claim-path must include at least one claim path".to_owned(),
             });
         }
+        for path in split_csv(&role_claim_path) {
+            validate_claim_path(&path).map_err(|message| mp_config::ConfigError::Conversion {
+                name: role_claim_path_key.clone(),
+                value: path,
+                message,
+            })?;
+        }
 
         Ok(Self {
             source: config.get_optional(&key("source"))?.unwrap_or_default(),
@@ -939,14 +955,13 @@ impl OidcRolesConfig {
 
 fn role_claim_paths(config: &OidcConfig) -> Vec<String> {
     let mut paths = config.roles.claim_paths();
-    if config.roles.role_claim_path == DEFAULT_ROLE_CLAIM_PATH {
-        if let Some(client_id) = config
+    if config.roles.role_claim_path == DEFAULT_ROLE_CLAIM_PATH
+        && let Some(client_id) = config
             .client_id
             .as_deref()
             .filter(|value| !value.is_empty())
-        {
-            paths.push(format!(r#"resource_access."{client_id}".roles"#));
-        }
+    {
+        paths.push(format!(r#"resource_access."{client_id}".roles"#));
     }
     paths
 }

@@ -401,10 +401,10 @@ pub(crate) fn introspection_request<'a>(
     ) {
         (client_id, Some(client_auth_name), Some(client_secret), ClientSecretMethod::Basic) => {
             let mut form = vec![("token", token)];
-            if auth.include_client_id {
-                if let Some(client_id) = client_id {
-                    form.push(("client_id", client_id));
-                }
+            if auth.include_client_id
+                && let Some(client_id) = client_id
+            {
+                form.push(("client_id", client_id));
             }
             client
                 .post(endpoint)

@@ -28,6 +28,8 @@ use url::form_urlencoded;
 const TOKEN_STATE_COOKIE_NAME: &str = "q_oidc";
 const REDIRECT_STATE_COOKIE_NAME: &str = "q_oidc_redirect";
 const REDIRECT_STATE_COOKIE_MAX_AGE_SECS: i64 = 600;
+const MAX_COOKIE_HEADER_BYTES: usize = 16 * 1024;
+const MAX_COOKIE_SEGMENTS: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct WebApp {
@@ -1234,11 +1236,27 @@ fn request_cookie_jar(request: &Request<Body>) -> CookieJar {
     let mut parsed = 0_usize;
     let mut ignored = 0_usize;
     for header in request.headers().get_all(COOKIE) {
+        if header.as_bytes().len() > MAX_COOKIE_HEADER_BYTES {
+            ignored += 1;
+            trace!(
+                header_bytes = header.as_bytes().len(),
+                max_header_bytes = MAX_COOKIE_HEADER_BYTES,
+                "ignored oversized cookie header while parsing web-app state"
+            );
+            continue;
+        }
         let Ok(header) = header.to_str() else {
             ignored += 1;
             continue;
         };
         for cookie in header.split(';') {
+            if parsed + ignored >= MAX_COOKIE_SEGMENTS {
+                trace!(
+                    max_cookie_segments = MAX_COOKIE_SEGMENTS,
+                    "stopped parsing request cookies after reaching segment limit"
+                );
+                break;
+            }
             let Ok(cookie) = Cookie::parse_encoded(cookie.trim().to_owned()) else {
                 ignored += 1;
                 continue;
@@ -1264,7 +1282,7 @@ fn web_app_cookie_key(configured_key: Option<&str>) -> crate::BuildResult<Key> {
 
 fn generated_cookie_key() -> crate::BuildResult<Key> {
     let mut bytes = [0_u8; 64];
-    getrandom::getrandom(&mut bytes).map_err(|error| BuildError::InvalidConfiguration {
+    getrandom::fill(&mut bytes).map_err(|error| BuildError::InvalidConfiguration {
         message: format!("failed to generate web-app token-state cookie key: {error}"),
     })?;
     warn!(
@@ -1327,7 +1345,7 @@ fn redirect_response(location: &str) -> Result<Response> {
 
 fn random_state() -> Result<String> {
     let mut bytes = [0_u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|error| {
+    getrandom::fill(&mut bytes).map_err(|error| {
         Error::Session(
             std::io::Error::other(format!("failed to generate OIDC state: {error}")).into(),
         )

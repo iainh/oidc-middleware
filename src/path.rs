@@ -15,10 +15,10 @@ pub(crate) fn path_match_score(pattern: &str, request_path: &str) -> Option<usiz
         return Some(1);
     }
 
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        if let Some(score) = trailing_wildcard_match_score(prefix, request_path) {
-            return Some(score);
-        }
+    if let Some(prefix) = pattern.strip_suffix('*')
+        && let Some(score) = trailing_wildcard_match_score(prefix, request_path)
+    {
+        return Some(score);
     }
 
     segment_wildcard_match_score(pattern, request_path)

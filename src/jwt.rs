@@ -165,7 +165,7 @@ impl TokenValidator for JwtValidator {
                 "starting JWT validation"
             );
             let key = keys.decoding_key(&token).await?;
-            let data = match decode::<TokenClaims>(&token, &key, &validation) {
+            let data = match decode::<TokenClaims>(token.as_ref(), &key, &validation) {
                 Ok(data) => data,
                 Err(error) => {
                     debug!(error = %error, "JWT decode or standard claim validation failed");

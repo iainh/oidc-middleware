@@ -233,13 +233,13 @@ impl TokenValidator for UserInfoRolesValidator {
                 "UserInfo response received for role extraction"
             );
 
-            if let Some(user_info_subject) = claims.sub.as_deref() {
-                if user_info_subject != principal.subject() {
-                    debug!("UserInfo subject did not match access-token subject");
-                    return Err(Error::TokenRejected(
-                        "UserInfo subject did not match access token subject".into(),
-                    ));
-                }
+            if let Some(user_info_subject) = claims.sub.as_deref()
+                && user_info_subject != principal.subject()
+            {
+                debug!("UserInfo subject did not match access-token subject");
+                return Err(Error::TokenRejected(
+                    "UserInfo subject did not match access token subject".into(),
+                ));
             }
 
             let groups = extract_roles(&claims.extra, &role_claim_paths, &role_claim_separator)

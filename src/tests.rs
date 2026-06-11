@@ -1,5 +1,5 @@
 use super::*;
-use crate::claims::claim_path_parts;
+use crate::claims::{claim_path_parts, validate_claim_path};
 use crate::config_helpers::named_tenant_names;
 use crate::introspection::{
     IntrospectionRequestAuth, http_token_introspector, introspection_request,
@@ -294,6 +294,26 @@ fn config_rejects_empty_role_claim_path() {
             .contains("role-claim-path must include at least one claim path"),
         "{error}"
     );
+}
+
+#[test]
+fn config_rejects_malformed_role_claim_path() {
+    for path in ["resource_access..roles", "resource_access.\"roles"] {
+        let config = Config::builder()
+            .add_source(
+                MapSource::new("malformed-role-claim-path", 100)
+                    .with("oidc.roles.role-claim-path", path),
+            )
+            .build();
+
+        let error =
+            OidcConfig::from_config(&config).expect_err("malformed role claim path should fail");
+
+        assert!(
+            error.to_string().contains("oidc.roles.role-claim-path"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -4446,6 +4466,44 @@ fn config_rejects_empty_principal_claim() {
     );
 }
 
+#[test]
+fn config_rejects_malformed_principal_claim() {
+    let config = Config::builder()
+        .add_source(
+            MapSource::new("malformed-principal-claim", 100)
+                .with("oidc.token.principal-claim", "profile..email"),
+        )
+        .build();
+
+    let error =
+        OidcConfig::from_config(&config).expect_err("malformed principal claim should be rejected");
+
+    assert!(
+        error.to_string().contains("oidc.token.principal-claim"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("empty segments"), "{error}");
+}
+
+#[test]
+fn config_rejects_malformed_required_claim_path() {
+    let config = Config::builder()
+        .add_source(MapSource::new("malformed-required-claim", 100).with(
+            "oidc.token.required-claims.\"profile..email\"",
+            "alice@example.com",
+        ))
+        .build();
+
+    let error = OidcConfig::from_config(&config)
+        .expect_err("malformed required claim path should be rejected");
+
+    assert!(
+        error.to_string().contains("oidc.token.required-claims"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("empty segments"), "{error}");
+}
+
 #[tokio::test]
 async fn jwt_validator_rejects_missing_required_claim() {
     let config = OidcConfig {
@@ -6205,6 +6263,22 @@ fn claim_path_parts_preserve_quoted_segments() {
         claim_path_parts("\"https://claims.example/roles\""),
         vec!["https://claims.example/roles".to_owned()]
     );
+}
+
+#[test]
+fn claim_path_validation_rejects_ambiguous_paths() {
+    for path in [
+        "",
+        "profile..email",
+        ".email",
+        "profile.",
+        "profile.\"email",
+    ] {
+        assert!(
+            validate_claim_path(path).is_err(),
+            "{path:?} should be rejected"
+        );
+    }
 }
 
 fn oidc() -> Oidc {

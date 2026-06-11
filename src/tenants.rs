@@ -155,30 +155,29 @@ impl Tenants {
     fn select(&self, request: &Request<Body>) -> Option<&Oidc> {
         let path = request.uri().path();
         trace!(path = %path, "selecting OIDC tenant for request");
-        if let Some(header_name) = &self.header_name {
-            if let Some(value) = request
+        if let Some(header_name) = &self.header_name
+            && let Some(value) = request
                 .headers()
                 .get(header_name)
                 .and_then(|value| value.to_str().ok())
-            {
-                if let Some(tenant) = self.tenants.iter().find(|tenant| tenant.matches_id(value)) {
-                    debug!(
-                        path = %path,
-                        source = "header",
-                        header = %header_name,
-                        tenant = %tenant.name,
-                        tenant_id = %tenant.id,
-                        "selected OIDC tenant"
-                    );
-                    return Some(&tenant.oidc);
-                }
-                trace!(
+        {
+            if let Some(tenant) = self.tenants.iter().find(|tenant| tenant.matches_id(value)) {
+                debug!(
                     path = %path,
+                    source = "header",
                     header = %header_name,
-                    tenant_header_value = %value,
-                    "tenant header did not match a configured tenant"
+                    tenant = %tenant.name,
+                    tenant_id = %tenant.id,
+                    "selected OIDC tenant"
                 );
+                return Some(&tenant.oidc);
             }
+            trace!(
+                path = %path,
+                header = %header_name,
+                tenant_header_value = %value,
+                "tenant header did not match a configured tenant"
+            );
         }
 
         if self.resolve_with_issuer {
@@ -228,14 +227,14 @@ fn validate_configured_tenant_paths(
     config: &OidcConfig,
     property_name: &str,
 ) -> mp_config::Result<()> {
-    if let Some(value) = &config.tenant_paths {
-        if split_csv(value).is_empty() {
-            return Err(mp_config::ConfigError::Conversion {
-                name: property_name.to_owned(),
-                value: value.clone(),
-                message: "tenant-paths must include at least one path".to_owned(),
-            });
-        }
+    if let Some(value) = &config.tenant_paths
+        && split_csv(value).is_empty()
+    {
+        return Err(mp_config::ConfigError::Conversion {
+            name: property_name.to_owned(),
+            value: value.clone(),
+            message: "tenant-paths must include at least one path".to_owned(),
+        });
     }
 
     Ok(())

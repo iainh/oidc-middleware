@@ -483,7 +483,12 @@ fn oidc_fields(input: &DeriveInput) -> syn::Result<Vec<OidcField<'_>>> {
         .named
         .iter()
         .map(|field| {
-            let ident = field.ident.as_ref().expect("named fields have identifiers");
+            let Some(ident) = field.ident.as_ref() else {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "OIDC derives support named fields only",
+                ));
+            };
             Ok(OidcField {
                 field,
                 ident,
