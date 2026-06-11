@@ -7,7 +7,7 @@ use http::{HeaderValue, Request};
 use serde_json::Value;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::trace;
+use tracing::{debug, trace};
 
 pub(crate) const MAX_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_AUTHORIZATION_HEADER_BYTES: usize = MAX_TOKEN_BYTES + 128;
@@ -107,6 +107,11 @@ fn validate_header_size(header: &HeaderValue) -> Result<()> {
         return Ok(());
     }
 
+    debug!(
+        header_bytes = header.as_bytes().len(),
+        max_header_bytes = MAX_AUTHORIZATION_HEADER_BYTES,
+        "authorization token header exceeded size limit"
+    );
     Err(Error::AuthorizationHeaderTooLarge)
 }
 
@@ -115,6 +120,12 @@ fn validate_token_shape(token: &str) -> Result<()> {
         return Ok(());
     }
 
+    debug!(
+        token_bytes = token.len(),
+        max_token_bytes = MAX_TOKEN_BYTES,
+        contains_whitespace = token.bytes().any(|byte| byte.is_ascii_whitespace()),
+        "authorization token had invalid shape"
+    );
     Err(Error::InvalidAuthorizationHeader)
 }
 
@@ -135,10 +146,21 @@ fn token_with_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
 
 pub(crate) fn unverified_token_issuer(token: &str) -> Option<String> {
     if !token_has_valid_shape(token) {
+        trace!(
+            token_bytes = token.len(),
+            max_token_bytes = MAX_TOKEN_BYTES,
+            contains_whitespace = token.bytes().any(|byte| byte.is_ascii_whitespace()),
+            "skipping unverified issuer extraction for invalid token shape"
+        );
         return None;
     }
     let payload = token.split('.').nth(1)?;
     if payload.len() > MAX_TOKEN_BYTES {
+        trace!(
+            payload_bytes = payload.len(),
+            max_token_bytes = MAX_TOKEN_BYTES,
+            "skipping unverified issuer extraction for oversized JWT payload"
+        );
         return None;
     }
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;

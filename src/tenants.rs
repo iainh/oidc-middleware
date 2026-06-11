@@ -355,9 +355,11 @@ async fn discover_tenants_from_config(
                 message: error.to_string(),
             }
         })?;
+        debug!(header = %parsed, "configured OIDC tenant selection header");
         builder = builder.tenant_header(parsed);
     }
     if has_default_tenant_config(config) {
+        debug!("loading default OIDC tenant for provider discovery");
         let default_config = OidcConfig::from_config(config)?;
         let default_tenant = oidc_builder_from_config(
             default_config,
@@ -376,6 +378,7 @@ async fn discover_tenants_from_config(
     }
 
     for tenant in named_tenant_configs(config) {
+        debug!(tenant = %tenant.name, "loading named OIDC tenant for provider discovery");
         let prefix = format!("oidc.{}", tenant.prefix_segment);
         let tenant_config = OidcConfig::from_config_prefix(config, &prefix)?;
         validate_configured_tenant_paths(&tenant_config, &format!("{prefix}.tenant-paths"))?;
@@ -403,6 +406,10 @@ async fn discover_oidc_builder(
     builder: OidcBuilder,
     client: Option<&reqwest::Client>,
 ) -> BuildResult<Oidc> {
+    trace!(
+        uses_supplied_client = client.is_some(),
+        "discovering OIDC tenant provider metadata"
+    );
     match client {
         Some(client) => builder.discover_with_client(client.clone()).await,
         None => builder.discover().await,

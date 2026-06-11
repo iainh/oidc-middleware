@@ -234,7 +234,7 @@ impl Oidc {
                 path = %request.uri().path(),
                 groups = session.principal.groups().count(),
                 has_id_token = session.id_token.is_some(),
-                "restored principal from web-app session"
+                "restored principal from web-app token state"
             );
             request.extensions_mut().insert(session.principal);
             if let Some(id_token) = session.id_token {

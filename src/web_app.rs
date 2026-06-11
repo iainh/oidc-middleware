@@ -94,6 +94,14 @@ impl WebApp {
             restore_path_after_redirect = config.authentication.restore_path_after_redirect,
             scopes = ?config.authentication.scopes,
             has_client_secret = config.credentials.effective_client_secret().is_some(),
+            refresh_expired = config.token.refresh_expired,
+            refresh_token_time_skew_secs = ?config
+                .token
+                .refresh_token_time_skew
+                .map(|duration| duration.as_secs()),
+            lifespan_grace_secs = config.token.lifespan_grace.unwrap_or_default(),
+            session_age_extension_secs = config.authentication.session_age_extension.as_secs(),
+            has_token_state_cookie_key = config.authentication.token_state_cookie_key.is_some(),
             "configured OIDC web-app flow"
         );
         Ok(Self {
@@ -158,12 +166,21 @@ impl WebApp {
         let stored_id_token = stored_authentication.id_token;
         let stored_token_state = stored_authentication.token_state;
 
-        match stored_token_state.freshness(
+        let freshness = stored_token_state.freshness(
             unix_timestamp()?,
             self.refresh_token_time_skew,
             self.lifespan_grace,
             self.session_age_extension,
-        ) {
+        );
+        trace!(
+            freshness = freshness.as_str(),
+            expires_at = ?stored_token_state.expires_at,
+            has_refresh_token = stored_token_state.refresh_token.is_some(),
+            refresh_enabled = self.refresh_enabled(),
+            "classified web-app token-state freshness"
+        );
+
+        match freshness {
             TokenFreshness::Current => Ok(Some(WebAppSession {
                 principal: stored_principal.into_principal(),
                 id_token: stored_id_token.map(StoredIdToken::into_id_token),
@@ -171,9 +188,19 @@ impl WebApp {
             TokenFreshness::RefreshNeeded if self.refresh_enabled() => {
                 let Some(refresh_token) = stored_token_state.refresh_token.as_deref() else {
                     if stored_token_state.is_expired(unix_timestamp()?, self.lifespan_grace) {
+                        debug!(
+                            expires_at = ?stored_token_state.expires_at,
+                            lifespan_grace_secs = self.lifespan_grace,
+                            "web-app token state is expired without a refresh token"
+                        );
                         clear_authentication(&session, request, &self.token_state_cookie).await?;
                         return Ok(None);
                     }
+                    trace!(
+                        expires_at = ?stored_token_state.expires_at,
+                        lifespan_grace_secs = self.lifespan_grace,
+                        "web-app token state needs refresh but remains within grace without refresh token"
+                    );
                     return Ok(Some(WebAppSession {
                         principal: stored_principal.into_principal(),
                         id_token: stored_id_token.map(StoredIdToken::into_id_token),
@@ -193,6 +220,12 @@ impl WebApp {
                                 return Ok(None);
                             }
                         };
+                        debug!(
+                            expires_at = ?refreshed.token_state.expires_at,
+                            has_id_token = refreshed.id_token.is_some(),
+                            has_refresh_token = refreshed.token_state.refresh_token.is_some(),
+                            "OIDC token refresh succeeded"
+                        );
                         store_authentication(
                             &session,
                             request,
@@ -351,6 +384,15 @@ impl WebApp {
     }
 
     async fn token_request(&self, form: &[(&str, &str)]) -> Result<TokenResponse> {
+        let grant_type = form
+            .iter()
+            .find_map(|(name, value)| (*name == "grant_type").then_some(*value))
+            .unwrap_or("unknown");
+        trace!(
+            grant_type,
+            token_endpoint = %self.token_endpoint,
+            "sending OIDC token endpoint request"
+        );
         let response = self
             .client
             .post(&self.token_endpoint)
@@ -364,6 +406,13 @@ impl WebApp {
             .json::<TokenResponse>()
             .await
             .map_err(|error| Error::TokenRejected(error.into()))?;
+        trace!(
+            grant_type,
+            has_id_token = response.id_token.is_some(),
+            has_refresh_token = response.refresh_token.is_some(),
+            expires_in = ?response.expires_in,
+            "received OIDC token endpoint response"
+        );
         Ok(response)
     }
 
@@ -373,6 +422,13 @@ impl WebApp {
         validator: Arc<dyn TokenValidator>,
         previous_refresh_token: Option<&str>,
     ) -> Result<AuthenticatedTokens> {
+        trace!(
+            has_id_token = token_response.id_token.is_some(),
+            has_refresh_token = token_response.refresh_token.is_some(),
+            expires_in = ?token_response.expires_in,
+            previous_refresh_token = previous_refresh_token.is_some(),
+            "validating OIDC web-app token response"
+        );
         let validated_id_token = match token_response.id_token.as_deref() {
             Some(raw) => Some(validate_id_token(raw, validator.clone()).await?),
             None => None,
@@ -381,9 +437,18 @@ impl WebApp {
             .validate(Arc::from(token_response.access_token.clone()))
             .await
         {
-            Ok(principal) => principal,
+            Ok(principal) => {
+                trace!("validated OIDC access token from web-app token response");
+                principal
+            }
             Err(error) => match &validated_id_token {
-                Some((_, principal)) => principal.clone(),
+                Some((_, principal)) => {
+                    debug!(
+                        error = %error,
+                        "access token validation failed; using validated ID token principal"
+                    );
+                    principal.clone()
+                }
                 None => return Err(error),
             },
         };
@@ -454,8 +519,16 @@ async fn validate_id_token(
     token: &str,
     validator: Arc<dyn TokenValidator>,
 ) -> Result<(IdToken, Principal)> {
+    trace!("validating OIDC ID token from web-app token response");
     let principal = validator.validate(Arc::from(token.to_owned())).await?;
     let claims = decode_id_token_claims(token)?;
+    trace!(
+        has_subject = claims.sub.is_some(),
+        has_issuer = claims.iss.is_some(),
+        audiences = claims.aud.len(),
+        expires_at = ?claims.exp,
+        "decoded OIDC ID token claims"
+    );
     Ok((IdToken::with_raw(claims, token), principal))
 }
 
@@ -526,6 +599,10 @@ pub(crate) struct PendingWebAppCookies(Vec<HeaderValue>);
 
 impl PendingWebAppCookies {
     pub(crate) fn append_to(self, response: &mut Response) {
+        trace!(
+            cookies = self.0.len(),
+            "appending pending web-app cookies to response"
+        );
         for cookie in self.0 {
             response.headers_mut().append(SET_COOKIE, cookie);
         }
@@ -650,6 +727,13 @@ impl CookieTokenStateManager {
             Some(configured_key) => key_from_config(configured_key)?,
             None => generated_cookie_key()?,
         };
+        debug!(
+            has_configured_key = configured_key.is_some(),
+            lifespan_grace_secs = lifespan_grace,
+            session_age_extension_secs = session_age_extension,
+            refresh_enabled,
+            "configured web-app token-state cookie manager"
+        );
         Ok(Self {
             key,
             lifespan_grace,
@@ -661,8 +745,10 @@ impl CookieTokenStateManager {
     fn load(&self, request: &Request<Body>) -> Result<Option<StoredAuthentication>> {
         let jar = request_cookie_jar(request);
         let Some(cookie) = jar.private(&self.key).get(TOKEN_STATE_COOKIE_NAME) else {
+            trace!("web-app token-state cookie was not present or could not be decrypted");
             return Ok(None);
         };
+        trace!("loaded encrypted web-app token-state cookie");
         serde_json::from_str(cookie.value())
             .map(Some)
             .map_err(session_error)
@@ -681,10 +767,16 @@ impl CookieTokenStateManager {
     fn store_stored(&self, authentication: &StoredAuthentication) -> Result<HeaderValue> {
         let value = serde_json::to_string(authentication).map_err(session_error)?;
         let mut jar = CookieJar::new();
-        jar.private_mut(&self.key).add(
-            self.cookie_builder(value, authentication.token_state.expires_at)
-                .build(),
+        let max_age = self.max_age(authentication.token_state.expires_at);
+        trace!(
+            expires_at = ?authentication.token_state.expires_at,
+            max_age_secs = ?max_age.map(|duration| duration.whole_seconds()),
+            has_refresh_token = authentication.token_state.refresh_token.is_some(),
+            has_id_token = authentication.id_token.is_some(),
+            "storing web-app token state in encrypted cookie"
         );
+        jar.private_mut(&self.key)
+            .add(self.cookie_builder(value, max_age).build());
         let encrypted = jar.get(TOKEN_STATE_COOKIE_NAME).ok_or_else(|| {
             session_error(std::io::Error::other("token-state cookie was not created"))
         })?;
@@ -692,6 +784,7 @@ impl CookieTokenStateManager {
     }
 
     fn clear(&self) -> Result<HeaderValue> {
+        trace!("clearing web-app token-state cookie");
         header_value(
             Cookie::build((TOKEN_STATE_COOKIE_NAME, ""))
                 .path("/")
@@ -707,13 +800,13 @@ impl CookieTokenStateManager {
     fn cookie_builder(
         &self,
         value: String,
-        expires_at: Option<u64>,
+        max_age: Option<CookieDuration>,
     ) -> cookie::CookieBuilder<'static> {
         let mut builder = Cookie::build((TOKEN_STATE_COOKIE_NAME, value))
             .path("/")
             .http_only(true)
             .same_site(SameSite::Lax);
-        if let Some(max_age) = self.max_age(expires_at) {
+        if let Some(max_age) = max_age {
             builder = builder.max_age(max_age);
         }
         builder
@@ -737,17 +830,27 @@ impl CookieTokenStateManager {
 
 fn request_cookie_jar(request: &Request<Body>) -> CookieJar {
     let mut jar = CookieJar::new();
+    let mut parsed = 0_usize;
+    let mut ignored = 0_usize;
     for header in request.headers().get_all(COOKIE) {
         let Ok(header) = header.to_str() else {
+            ignored += 1;
             continue;
         };
         for cookie in header.split(';') {
             let Ok(cookie) = Cookie::parse_encoded(cookie.trim().to_owned()) else {
+                ignored += 1;
                 continue;
             };
+            parsed += 1;
             jar.add_original(cookie);
         }
     }
+    trace!(
+        parsed_cookies = parsed,
+        ignored_cookie_segments = ignored,
+        "parsed request cookies for web-app token state"
+    );
     jar
 }
 
@@ -756,6 +859,7 @@ fn generated_cookie_key() -> crate::BuildResult<Key> {
     getrandom::getrandom(&mut bytes).map_err(|error| BuildError::InvalidConfiguration {
         message: format!("failed to generate web-app token-state cookie key: {error}"),
     })?;
+    debug!("generated ephemeral web-app token-state cookie key");
     Ok(Key::from(&bytes))
 }
 
@@ -768,9 +872,15 @@ fn key_from_config(value: &str) -> crate::BuildResult<Key> {
                 "oidc.authentication.token-state-cookie-key must be base64-encoded key material: {error}"
             ),
         })?;
-    Key::try_from(decoded.as_slice()).map_err(|error| BuildError::InvalidConfiguration {
-        message: format!("oidc.authentication.token-state-cookie-key is invalid: {error}"),
-    })
+    let key =
+        Key::try_from(decoded.as_slice()).map_err(|error| BuildError::InvalidConfiguration {
+            message: format!("oidc.authentication.token-state-cookie-key is invalid: {error}"),
+        })?;
+    debug!(
+        key_bytes = decoded.len(),
+        "loaded configured web-app token-state cookie key"
+    );
+    Ok(key)
 }
 
 fn header_value(cookie: String) -> Result<HeaderValue> {
@@ -862,6 +972,16 @@ enum TokenFreshness {
     Current,
     RefreshNeeded,
     Expired,
+}
+
+impl TokenFreshness {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::RefreshNeeded => "refresh-needed",
+            Self::Expired => "expired",
+        }
+    }
 }
 
 impl StoredTokenState {
