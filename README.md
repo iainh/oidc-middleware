@@ -24,6 +24,8 @@ compliance, operational, and provider-compatibility requirements.
 - Bearer-token authentication for service APIs.
 - Browser `web-app` authorization-code flow with encrypted redirect-state and
   token-state cookies.
+- Web-app logout route helper that clears local OIDC cookies and redirects to
+  the provider end-session endpoint when one is configured or discovered.
 - Static public-key, JWKS, refreshable JWKS, introspection, and UserInfo-backed
   validation options.
 - Multi-tenant OIDC routing by path, tenant ID header, or token issuer.
@@ -185,6 +187,30 @@ struct WebUser {
 This keeps OIDC mechanics at the edge of the application while letting route
 handlers receive the identity shape the rest of the codebase understands.
 
+Add logout outside the protected OIDC layer so it can clear local cookies even
+when the browser session is already expired or invalid:
+
+```rust
+use axum::{Router, routing::get};
+use oidc_middleware::Oidc;
+
+# fn app(oidc: Oidc) -> Router {
+let protected = Router::new()
+    .route("/", get(|| async { "ok" }))
+    .layer(oidc.clone().layer());
+
+Router::new()
+    .route("/logout", oidc.logout_route())
+    .merge(protected)
+# }
+```
+
+The logout route clears the web-app token-state and redirect-state cookies. If
+provider discovery or `oidc.end-session-path` supplies an end-session endpoint,
+the route redirects there with `id_token_hint` and `post_logout_redirect_uri`
+when available. Otherwise it redirects locally to `/`; use
+`OidcLogoutOptions` to choose a different post-logout location.
+
 ## Configuration highlights
 
 The current implementation supports:
@@ -192,6 +218,9 @@ The current implementation supports:
 - Service and hybrid `oidc.application-type` bearer-token middleware.
 - Browser `web-app` login when provider discovery or explicit authorization and
   token endpoints are configured.
+- Browser `web-app` logout with `Oidc::logout_route`; the route clears local
+  OIDC cookies and uses discovered or configured end-session endpoints when
+  available.
 - Absolute `oidc.authentication.redirect-path` values for deployments where
   request host or forwarding headers are unavailable.
 - OIDC provider discovery from `oidc.auth-server-url` and discovered `jwks_uri`.
@@ -215,7 +244,7 @@ Default features preserve the full convenience API:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.6.3" }
+oidc-middleware = { version = "0.7.0" }
 ```
 
 Applications that provide their own validators can opt into a smaller dependency
@@ -223,7 +252,7 @@ surface:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.6.3", default-features = false }
+oidc-middleware = { version = "0.7.0", default-features = false }
 ```
 
 Available features:
@@ -251,7 +280,7 @@ one TLS backend for HTTPS provider calls:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.6.3", default-features = false, features = ["web-app", "rustls-native-certs"] }
+oidc-middleware = { version = "0.7.0", default-features = false, features = ["web-app", "rustls-native-certs"] }
 ```
 
 ## Design guidance

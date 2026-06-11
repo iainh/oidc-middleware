@@ -135,6 +135,8 @@ pub use user_info::{
     UserInfoProvider, UserInfoResponse, UserInfoRolesValidator, UserInfoValidator,
 };
 pub use validator::{StaticTokenValidator, TokenValidator};
+#[cfg(feature = "web-app")]
+pub use web_app::{OidcLogoutOptions, OidcLogoutService};
 
 pub(crate) use config::role_claim_paths_for_source;
 use std::error::Error as StdError;

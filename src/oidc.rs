@@ -18,7 +18,9 @@ use crate::jwks::HttpJwksProvider;
 use crate::provider::{auth_server_url_from_config, provider_validation_config};
 #[cfg(all(feature = "http-client", feature = "jwt"))]
 use crate::provider::{discovery_url, provider_endpoint_url};
-use crate::token::{bearer_token, unverified_token_from_request};
+use crate::token::bearer_token;
+#[cfg(feature = "web-app")]
+use crate::token::unverified_token_from_request;
 #[cfg(feature = "http-client")]
 use crate::user_info::HttpUserInfoProvider;
 use crate::validator::RejectAllTokens;
@@ -26,12 +28,16 @@ use crate::validator::RejectAllTokens;
 use crate::web_app::PendingWebAppCookies;
 #[cfg(feature = "web-app")]
 use crate::web_app::WebApp;
+#[cfg(feature = "web-app")]
+use crate::web_app::{OidcLogoutOptions, OidcLogoutService};
 use crate::{
     ApplicationType, Error, IntrospectionValidator, OidcConfig, Principal, Result, RolesSource,
     TokenIntrospector, TokenValidator, UserInfoProvider, UserInfoValidator,
 };
 use axum::body::Body;
 use axum::response::Response;
+#[cfg(feature = "web-app")]
+use axum::routing::MethodRouter;
 use http::Request;
 #[cfg(all(feature = "http-client", feature = "jwt"))]
 use jsonwebtoken::jwk::JwkSet;
@@ -43,7 +49,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
-use tracing::{debug, trace, warn};
+#[cfg(feature = "web-app")]
+use tracing::warn;
+use tracing::{debug, trace};
 
 #[cfg(feature = "web-app")]
 enum WebAppPrincipal {
@@ -139,6 +147,71 @@ impl Oidc {
     /// created the principal.
     pub fn layer(self) -> OidcLayer {
         OidcLayer { oidc: self }
+    }
+
+    /// Returns a route that performs web-app logout.
+    ///
+    /// Add this route outside [`Oidc::layer`] so it can clear local OIDC
+    /// cookies even when the current browser session is missing, expired, or
+    /// tampered with:
+    ///
+    /// ```
+    /// use axum::{Router, routing::get};
+    /// use oidc_middleware::{ApplicationType, Oidc, OidcConfig};
+    ///
+    /// # fn app() -> Router {
+    /// let oidc = Oidc::builder(OidcConfig {
+    ///     application_type: ApplicationType::WebApp,
+    ///     client_id: Some("orders-web".to_owned()),
+    ///     ..OidcConfig::default()
+    /// })
+    /// .build();
+    ///
+    /// let protected = Router::new()
+    ///     .route("/", get(|| async { "ok" }))
+    ///     .layer(oidc.clone().layer());
+    ///
+    /// Router::new()
+    ///     .route("/logout", oidc.logout_route())
+    ///     .merge(protected)
+    /// # }
+    /// ```
+    ///
+    /// The route clears the local token-state and redirect-state cookies. When
+    /// provider metadata or configuration includes an end-session endpoint, it
+    /// redirects there with `id_token_hint` and `post_logout_redirect_uri` when
+    /// available. Otherwise it redirects to `/`.
+    #[cfg(feature = "web-app")]
+    pub fn logout_route<S>(&self) -> MethodRouter<S>
+    where
+        S: Clone,
+    {
+        self.logout_service().route()
+    }
+
+    /// Returns a web-app logout route with caller-supplied options.
+    #[cfg(feature = "web-app")]
+    pub fn logout_route_with_options<S>(&self, options: OidcLogoutOptions) -> MethodRouter<S>
+    where
+        S: Clone,
+    {
+        self.logout_service_with_options(options).route()
+    }
+
+    /// Returns the service used by [`Oidc::logout_route`].
+    #[cfg(feature = "web-app")]
+    pub fn logout_service(&self) -> OidcLogoutService {
+        self.logout_service_with_options(OidcLogoutOptions::default())
+    }
+
+    /// Returns the service used by [`Oidc::logout_route_with_options`].
+    #[cfg(feature = "web-app")]
+    pub fn logout_service_with_options(&self, options: OidcLogoutOptions) -> OidcLogoutService {
+        OidcLogoutService::new(
+            self.web_app.clone(),
+            options,
+            self.config.token.authorization_scheme.clone(),
+        )
     }
 
     pub(crate) async fn authenticate(&self, request: &mut Request<Body>) -> Result<()> {
@@ -988,6 +1061,7 @@ impl OidcBuilder {
             client,
             metadata.authorization_endpoint.clone(),
             metadata.token_endpoint.clone(),
+            metadata.end_session_endpoint.clone(),
         )?));
         Ok(())
     }
@@ -1126,8 +1200,12 @@ where
             match oidc.authenticate_or_response(&mut request).await {
                 Ok(Some(response)) => Ok(response),
                 Ok(None) => {
+                    #[cfg(feature = "web-app")]
                     let pending_cookies = request.extensions_mut().remove::<PendingWebAppCookies>();
-                    let mut response = inner.call(request).await?;
+                    let response = inner.call(request).await?;
+                    #[cfg(feature = "web-app")]
+                    let mut response = response;
+                    #[cfg(feature = "web-app")]
                     if let Some(pending_cookies) = pending_cookies {
                         pending_cookies.append_to(&mut response);
                     }

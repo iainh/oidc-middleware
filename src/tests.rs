@@ -2433,6 +2433,256 @@ async fn web_app_clears_tampered_token_state_cookie() {
 }
 
 #[tokio::test]
+async fn web_app_logout_route_clears_local_session_and_redirects_locally() {
+    let token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com"
+        }),
+    );
+    let token_endpoint = one_shot_token_endpoint("opaque-access-token".to_owned(), Some(token));
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route(
+            "/logout",
+            oidc.logout_route_with_options(OidcLogoutOptions {
+                post_logout_redirect: Some("/signed-out".to_owned()),
+                ..OidcLogoutOptions::default()
+            }),
+        )
+        .merge(
+            Router::new()
+                .route("/protected", get(|| async { "ok" }))
+                .layer(oidc.layer()),
+        );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/q/oidc/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let session_cookie = cookie_header(&response);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/logout")
+                .header(HOST, "app.example")
+                .header(COOKIE, session_cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response.headers().get(LOCATION),
+        Some(&HeaderValue::from_static("/signed-out"))
+    );
+    let cleared =
+        set_cookie_header(&response, "q_oidc").expect("logout should clear token-state cookie");
+    assert!(cleared.contains("Max-Age=0"));
+    let cleared_redirect = set_cookie_header(&response, "q_oidc_redirect")
+        .expect("logout should clear redirect-state cookie");
+    assert!(cleared_redirect.contains("Max-Age=0"));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie_header(&response))
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    assert!(location.starts_with("https://issuer.example/realms/app/auth?"));
+}
+
+#[tokio::test]
+async fn web_app_logout_route_redirects_to_provider_end_session_endpoint() {
+    let token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com"
+        }),
+    );
+    let token_endpoint =
+        one_shot_token_endpoint("opaque-access-token".to_owned(), Some(token.clone()));
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: Some(
+                "https://issuer.example/realms/app/logout?client_id=orders-web".to_owned(),
+            ),
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route(
+            "/logout",
+            oidc.logout_route_with_options(OidcLogoutOptions {
+                post_logout_redirect: Some("/signed-out".to_owned()),
+                ..OidcLogoutOptions::default()
+            }),
+        )
+        .merge(
+            Router::new()
+                .route("/protected", get(|| async { "ok" }))
+                .layer(oidc.layer()),
+        );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/q/oidc/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let session_cookie = cookie_header(&response);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/logout")
+                .header(HOST, "app.example")
+                .header("x-forwarded-proto", "https")
+                .header(COOKIE, session_cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    let location = reqwest::Url::parse(location).expect("logout redirect should be a URL");
+    assert_eq!(
+        location.as_str().split('?').next().unwrap(),
+        "https://issuer.example/realms/app/logout"
+    );
+    let query = location.query_pairs().collect::<HashMap<_, _>>();
+    assert_eq!(
+        query.get("client_id").map(|value| value.as_ref()),
+        Some("orders-web")
+    );
+    assert_eq!(
+        query.get("id_token_hint").map(|value| value.as_ref()),
+        Some(token.as_str())
+    );
+    assert_eq!(
+        query
+            .get("post_logout_redirect_uri")
+            .map(|value| value.as_ref()),
+        Some("https://app.example/signed-out")
+    );
+    let cleared =
+        set_cookie_header(&response, "q_oidc").expect("logout should clear token-state cookie");
+    assert!(cleared.contains("Max-Age=0"));
+}
+
+#[tokio::test]
 async fn web_app_token_state_cookie_lifetime_tracks_tokens() {
     let token = jwt_with_kid_and_secret(
         "test-key",

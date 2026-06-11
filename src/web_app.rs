@@ -6,6 +6,7 @@ use crate::{
 };
 use axum::body::Body;
 use axum::response::Response;
+use axum::routing::{MethodRouter, get_service};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use cookie::time::Duration as CookieDuration;
@@ -13,8 +14,12 @@ use cookie::{Cookie, CookieJar, Key, SameSite};
 use http::header::{CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE};
 use http::{HeaderValue, Request, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::error::Error as StdError;
+use std::future::{Ready, ready};
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use tower_service::Service;
 use tracing::{debug, trace, warn};
 use url::form_urlencoded;
 
@@ -30,6 +35,7 @@ pub(crate) struct WebApp {
     client_secret_method: ClientSecretMethod,
     authorization_endpoint: String,
     token_endpoint: String,
+    end_session_endpoint: Option<String>,
     redirect_path: String,
     restore_path_after_redirect: bool,
     refresh_expired: bool,
@@ -57,12 +63,21 @@ impl WebApp {
             config.token_path.as_deref(),
             BuildError::MissingTokenEndpoint,
         )?;
+        let end_session_endpoint =
+            optional_endpoint(auth_server_url, config.end_session_path.as_deref())?;
         debug!(
             authorization_endpoint = %authorization_endpoint,
             token_endpoint = %token_endpoint,
+            end_session_endpoint = ?end_session_endpoint,
             "building web-app support from configured endpoints"
         );
-        Self::new(config, client, authorization_endpoint, token_endpoint)
+        Self::new(
+            config,
+            client,
+            authorization_endpoint,
+            token_endpoint,
+            end_session_endpoint,
+        )
     }
 
     pub(crate) fn from_provider_metadata(
@@ -70,6 +85,7 @@ impl WebApp {
         client: reqwest::Client,
         authorization_endpoint: Option<String>,
         token_endpoint: Option<String>,
+        end_session_endpoint: Option<String>,
     ) -> crate::BuildResult<Self> {
         let authorization_endpoint =
             authorization_endpoint.ok_or(BuildError::MissingAuthorizationEndpoint)?;
@@ -77,9 +93,16 @@ impl WebApp {
         debug!(
             authorization_endpoint = %authorization_endpoint,
             token_endpoint = %token_endpoint,
+            end_session_endpoint = ?end_session_endpoint,
             "building web-app support from provider metadata"
         );
-        Self::new(config, client, authorization_endpoint, token_endpoint)
+        Self::new(
+            config,
+            client,
+            authorization_endpoint,
+            token_endpoint,
+            end_session_endpoint,
+        )
     }
 
     fn new(
@@ -87,6 +110,7 @@ impl WebApp {
         client: reqwest::Client,
         authorization_endpoint: String,
         token_endpoint: String,
+        end_session_endpoint: Option<String>,
     ) -> crate::BuildResult<Self> {
         debug!(
             redirect_path = %config.authentication.redirect_path,
@@ -118,6 +142,7 @@ impl WebApp {
             client_secret_method: config.credentials.client_secret.method,
             authorization_endpoint,
             token_endpoint,
+            end_session_endpoint,
             redirect_path: config.authentication.redirect_path.clone(),
             restore_path_after_redirect: config.authentication.restore_path_after_redirect,
             refresh_expired: config.token.refresh_expired,
@@ -483,38 +508,208 @@ impl WebApp {
     }
 
     fn redirect_uri(&self, request: &Request<Body>) -> Result<String> {
-        if self.redirect_path.starts_with("http://") || self.redirect_path.starts_with("https://") {
-            trace!(redirect_uri = %self.redirect_path, "using absolute OIDC redirect URI");
-            return Ok(self.redirect_path.clone());
-        }
-        let host = request_host(request).ok_or_else(|| {
-            warn!(
-                path = %request.uri().path(),
-                redirect_path = %self.redirect_path,
-                "cannot build OIDC redirect URI without Host, X-Forwarded-Host, URI authority, or an absolute redirect path"
-            );
+        absolute_request_uri(request, &self.redirect_path, "OIDC redirect URI")
+    }
+
+    fn logout(&self, request: Request<Body>, options: &OidcLogoutOptions) -> Result<Response> {
+        let id_token_hint = if options.id_token_hint {
+            match self.token_state_cookie.load(&request) {
+                Ok(authentication) => authentication
+                    .and_then(|authentication| authentication.id_token)
+                    .and_then(|id_token| id_token.raw),
+                Err(error) => {
+                    debug!(error = %error, "OIDC logout could not read token-state cookie for id_token_hint");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut response = match self.end_session_endpoint.as_deref() {
+            Some(endpoint) => {
+                self.end_session_redirect(&request, endpoint, id_token_hint, options)?
+            }
+            None => {
+                let location = options
+                    .post_logout_redirect
+                    .as_deref()
+                    .unwrap_or(OidcLogoutOptions::DEFAULT_POST_LOGOUT_REDIRECT);
+                redirect_response(location)?
+            }
+        };
+        append_logout_cookies(
+            &self.token_state_cookie,
+            &self.redirect_state_cookie,
+            &mut response,
+        )?;
+        Ok(response)
+    }
+
+    fn end_session_redirect(
+        &self,
+        request: &Request<Body>,
+        endpoint: &str,
+        id_token_hint: Option<String>,
+        options: &OidcLogoutOptions,
+    ) -> Result<Response> {
+        let mut url = reqwest::Url::parse(endpoint).map_err(|error| {
             Error::Session(
-                std::io::Error::other(
-                    "missing request host for OIDC redirect URI; set Host/X-Forwarded-Host or configure an absolute oidc.authentication.redirect-path",
-                )
+                std::io::Error::other(format!(
+                    "invalid OIDC end-session endpoint `{endpoint}`: {error}"
+                ))
                 .into(),
             )
         })?;
-        let scheme = request
-            .headers()
-            .get("x-forwarded-proto")
-            .and_then(|value| value.to_str().ok())
-            .or_else(|| request.uri().scheme_str())
-            .unwrap_or("http");
-        let redirect_uri = format!("{scheme}://{host}{}", self.redirect_path);
-        trace!(redirect_uri = %redirect_uri, "built OIDC redirect URI from request origin");
-        Ok(redirect_uri)
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(id_token_hint) = id_token_hint {
+                query.append_pair("id_token_hint", &id_token_hint);
+            }
+            if let Some(post_logout_redirect) = options.post_logout_redirect.as_deref() {
+                let post_logout_redirect_uri = absolute_request_uri(
+                    request,
+                    post_logout_redirect,
+                    "OIDC post-logout redirect URI",
+                )?;
+                query.append_pair("post_logout_redirect_uri", &post_logout_redirect_uri);
+            }
+        }
+        debug!(end_session_endpoint = %endpoint, "redirecting to OIDC provider logout endpoint");
+        redirect_response(url.as_str())
     }
+}
+
+fn absolute_request_uri(
+    request: &Request<Body>,
+    path_or_uri: &str,
+    purpose: &str,
+) -> Result<String> {
+    if path_or_uri.starts_with("http://") || path_or_uri.starts_with("https://") {
+        trace!(uri = %path_or_uri, purpose, "using absolute URI");
+        return Ok(path_or_uri.to_owned());
+    }
+    if !path_or_uri.starts_with('/') {
+        return Err(Error::Session(
+            std::io::Error::other(format!("{purpose} path must start with `/`")).into(),
+        ));
+    }
+    let host = request_host(request).ok_or_else(|| {
+        warn!(
+            path = %request.uri().path(),
+            configured_path = %path_or_uri,
+            "cannot build absolute OIDC URI without Host, X-Forwarded-Host, URI authority, or an absolute configured URI"
+        );
+        Error::Session(
+            std::io::Error::other(
+                format!("missing request host for {purpose}; set Host/X-Forwarded-Host, use an absolute request URI, or configure an absolute URI"),
+            )
+            .into(),
+        )
+    })?;
+    let scheme = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri().scheme_str())
+        .unwrap_or("http");
+    let uri = format!("{scheme}://{host}{path_or_uri}");
+    trace!(uri = %uri, purpose, "built absolute OIDC URI from request origin");
+    Ok(uri)
 }
 
 pub(crate) struct WebAppSession {
     pub(crate) principal: Principal,
     pub(crate) id_token: Option<IdToken>,
+}
+
+/// Options used by the web-app logout route.
+///
+/// The logout route always clears the local OIDC cookies. When the provider
+/// exposes an end-session endpoint, the route redirects there after clearing
+/// local state. Otherwise it redirects to [`Self::post_logout_redirect`], which
+/// defaults to `/`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcLogoutOptions {
+    /// Local or absolute URI to redirect to after logout.
+    ///
+    /// Relative values must start with `/`. For provider logout, relative
+    /// values are expanded to an absolute `post_logout_redirect_uri` from the
+    /// request host and scheme. For local-only logout, the same value is used
+    /// directly as the response `Location`.
+    pub post_logout_redirect: Option<String>,
+    /// Include the current raw ID token as `id_token_hint` when redirecting to
+    /// the provider end-session endpoint.
+    pub id_token_hint: bool,
+}
+
+impl OidcLogoutOptions {
+    const DEFAULT_POST_LOGOUT_REDIRECT: &'static str = "/";
+}
+
+impl Default for OidcLogoutOptions {
+    fn default() -> Self {
+        Self {
+            post_logout_redirect: Some(Self::DEFAULT_POST_LOGOUT_REDIRECT.to_owned()),
+            id_token_hint: true,
+        }
+    }
+}
+
+/// Axum service backing [`crate::Oidc::logout_route`].
+#[derive(Clone)]
+pub struct OidcLogoutService {
+    web_app: Option<Arc<WebApp>>,
+    options: OidcLogoutOptions,
+    authorization_scheme: String,
+}
+
+impl OidcLogoutService {
+    pub(crate) fn new(
+        web_app: Option<Arc<WebApp>>,
+        options: OidcLogoutOptions,
+        authorization_scheme: String,
+    ) -> Self {
+        Self {
+            web_app,
+            options,
+            authorization_scheme,
+        }
+    }
+
+    /// Converts this service into a `GET` route.
+    ///
+    /// Add the route outside [`crate::Oidc::layer`] so logout can clear local
+    /// session cookies without first requiring a valid session.
+    pub fn route<S>(self) -> MethodRouter<S>
+    where
+        S: Clone,
+    {
+        get_service(self)
+    }
+}
+
+impl Service<Request<Body>> for OidcLogoutService {
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Ready<std::result::Result<Response, Infallible>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        let response = match &self.web_app {
+            Some(web_app) => web_app.logout(request, &self.options),
+            None => local_logout_response(&self.options),
+        }
+        .unwrap_or_else(|error| {
+            error.into_response_with_scheme_for_request(&self.authorization_scheme, &method, &path)
+        });
+        ready(Ok(response))
+    }
 }
 
 struct AuthenticatedTokens {
@@ -598,6 +793,20 @@ fn endpoint(
         })
 }
 
+fn optional_endpoint(
+    auth_server_url: Option<&str>,
+    path: Option<&str>,
+) -> crate::BuildResult<Option<String>> {
+    path.map(|path| {
+        endpoint(
+            auth_server_url,
+            Some(path),
+            BuildError::MissingTokenEndpoint,
+        )
+    })
+    .transpose()
+}
+
 fn path_matches(configured: &str, actual: &str) -> bool {
     if configured.starts_with("http://") || configured.starts_with("https://") {
         return reqwest::Url::parse(configured)
@@ -666,6 +875,28 @@ fn store_authentication_cookie(
         .headers_mut()
         .append(SET_COOKIE, token_state_cookie.store(authenticated)?);
     Ok(())
+}
+
+fn append_logout_cookies(
+    token_state_cookie: &CookieTokenStateManager,
+    redirect_state_cookie: &RedirectStateCookieManager,
+    response: &mut Response,
+) -> Result<()> {
+    response
+        .headers_mut()
+        .append(SET_COOKIE, token_state_cookie.clear()?);
+    response
+        .headers_mut()
+        .append(SET_COOKIE, redirect_state_cookie.clear()?);
+    Ok(())
+}
+
+fn local_logout_response(options: &OidcLogoutOptions) -> Result<Response> {
+    let location = options
+        .post_logout_redirect
+        .as_deref()
+        .unwrap_or(OidcLogoutOptions::DEFAULT_POST_LOGOUT_REDIRECT);
+    redirect_response(location)
 }
 
 fn clear_authentication(
