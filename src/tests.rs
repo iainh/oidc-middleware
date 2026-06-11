@@ -2152,6 +2152,112 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
 }
 
 #[tokio::test]
+async fn web_app_callback_uses_configured_basic_client_secret_method() {
+    let token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com",
+            "email_verified": true
+        }),
+    );
+    let (token_endpoint, requests) = token_endpoint_request_sequence(vec![token_response_body(
+        "opaque-access-token",
+        Some(&token),
+        None,
+        None,
+    )]);
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        credentials: OidcCredentialsConfig {
+            client_secret: OidcClientSecretConfig {
+                value: Some("orders-secret".to_owned()),
+                method: ClientSecretMethod::Basic,
+            },
+            ..OidcCredentialsConfig::default()
+        },
+        authentication: OidcAuthenticationConfig {
+            redirect_path: "/login/callback".to_owned(),
+            restore_path_after_redirect: true,
+            token_state_cookie_key: None,
+            scopes: vec!["openid".to_owned()],
+            ..OidcAuthenticationConfig::default()
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/login/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let requests = requests
+        .lock()
+        .expect("captured token endpoint requests should not be poisoned");
+    let request = requests
+        .first()
+        .expect("token endpoint request should be captured");
+    assert!(
+        request.contains("authorization: Basic b3JkZXJzLXdlYjpvcmRlcnMtc2VjcmV0"),
+        "{request}"
+    );
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("request should include a body");
+    assert!(body.contains("grant_type=authorization_code"), "{body}");
+    assert!(!body.contains("client_secret="), "{body}");
+}
+
+#[tokio::test]
 async fn hybrid_callback_uses_web_app_flow_without_bearer_token() {
     let token = jwt_with_kid_and_secret(
         "test-key",
@@ -6071,6 +6177,41 @@ fn token_endpoint_sequence(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Str
         }
     });
     (endpoint, forms)
+}
+
+fn token_endpoint_request_sequence(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("token endpoint should bind");
+    let endpoint = format!(
+        "http://{}/token",
+        listener
+            .local_addr()
+            .expect("token endpoint address should be available")
+    );
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured_requests = requests.clone();
+    std::thread::spawn(move || {
+        use std::io::Write;
+
+        for body in responses {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("token endpoint should accept a request");
+            let request = read_http_request(&mut stream);
+            captured_requests
+                .lock()
+                .expect("captured requests should not be poisoned")
+                .push(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("token endpoint response should write");
+        }
+    });
+    (endpoint, requests)
 }
 
 fn token_response_body(

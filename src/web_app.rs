@@ -1,7 +1,8 @@
 use crate::provider::provider_endpoint_url;
 use crate::validation_claims::unix_timestamp;
 use crate::{
-    BuildError, Error, IdToken, IdTokenClaims, OidcConfig, Principal, Result, TokenValidator,
+    BuildError, ClientSecretMethod, Error, IdToken, IdTokenClaims, OidcConfig, Principal, Result,
+    TokenValidator,
 };
 use axum::body::Body;
 use axum::response::Response;
@@ -26,6 +27,7 @@ pub(crate) struct WebApp {
     client: reqwest::Client,
     client_id: String,
     client_secret: Option<String>,
+    client_secret_method: ClientSecretMethod,
     authorization_endpoint: String,
     token_endpoint: String,
     redirect_path: String,
@@ -113,6 +115,7 @@ impl WebApp {
                 .credentials
                 .effective_client_secret()
                 .map(ToOwned::to_owned),
+            client_secret_method: config.credentials.client_secret.method,
             authorization_endpoint,
             token_endpoint,
             redirect_path: config.authentication.redirect_path.clone(),
@@ -343,29 +346,21 @@ impl WebApp {
     }
 
     async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<TokenResponse> {
-        let mut form = vec![
+        let form = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", redirect_uri),
-            ("client_id", self.client_id.as_str()),
         ];
-        if let Some(secret) = self.client_secret.as_deref() {
-            form.push(("client_secret", secret));
-        }
         debug!(token_endpoint = %self.token_endpoint, "exchanging OIDC authorization code for tokens");
         let response = self.token_request(&form).await?;
         Ok(response)
     }
 
     async fn refresh_tokens(&self, refresh_token: &str) -> Result<TokenResponse> {
-        let mut form = vec![
+        let form = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("client_id", self.client_id.as_str()),
         ];
-        if let Some(secret) = self.client_secret.as_deref() {
-            form.push(("client_secret", secret));
-        }
         debug!(token_endpoint = %self.token_endpoint, "refreshing OIDC web-app tokens");
         self.token_request(&form).await
     }
@@ -378,13 +373,45 @@ impl WebApp {
         trace!(
             grant_type,
             token_endpoint = %self.token_endpoint,
+            client_secret_method = ?self.client_secret_method,
+            has_client_secret = self.client_secret.is_some(),
             "sending OIDC token endpoint request"
         );
-        let response = self
-            .client
-            .post(&self.token_endpoint)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .form(form)
+        let request = match (self.client_secret.as_deref(), self.client_secret_method) {
+            (Some(secret), ClientSecretMethod::Basic) => self
+                .client
+                .post(&self.token_endpoint)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .form(form)
+                .basic_auth(&self.client_id, Some(secret)),
+            (Some(secret), ClientSecretMethod::Post) => {
+                let mut authenticated_form = form.to_vec();
+                authenticated_form.push(("client_id", self.client_id.as_str()));
+                authenticated_form.push(("client_secret", secret));
+                self.client
+                    .post(&self.token_endpoint)
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .form(&authenticated_form)
+            }
+            (Some(secret), ClientSecretMethod::Query) => self
+                .client
+                .post(&self.token_endpoint)
+                .query(&[
+                    ("client_id", self.client_id.as_str()),
+                    ("client_secret", secret),
+                ])
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .form(form),
+            (None, _) => {
+                let mut public_form = form.to_vec();
+                public_form.push(("client_id", self.client_id.as_str()));
+                self.client
+                    .post(&self.token_endpoint)
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .form(&public_form)
+            }
+        };
+        let response = request
             .send()
             .await
             .map_err(|error| Error::TokenRejected(error.into()))?
