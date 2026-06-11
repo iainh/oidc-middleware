@@ -215,7 +215,7 @@ Default features preserve the full convenience API:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.6.2" }
+oidc-middleware = { version = "0.6.3" }
 ```
 
 Applications that provide their own validators can opt into a smaller dependency
@@ -223,7 +223,7 @@ surface:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.6.2", default-features = false }
+oidc-middleware = { version = "0.6.3", default-features = false }
 ```
 
 Available features:
@@ -251,7 +251,7 @@ one TLS backend for HTTPS provider calls:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.6.2", default-features = false, features = ["web-app", "rustls-native-certs"] }
+oidc-middleware = { version = "0.6.3", default-features = false, features = ["web-app", "rustls-native-certs"] }
 ```
 
 ## Design guidance
