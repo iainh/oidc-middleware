@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "oidc-middleware"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Quarkus-inspired OIDC middleware for Axum."
@@ -31,7 +31,7 @@ getrandom = { version = "0.2", optional = true }
 http = "1"
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"], optional = true }
 mp-config = { git = "ssh://git@github.com/iainh/mp-config", tag = "v0.1.1" }
-oidc-middleware-macros = { version = "0.6.0", path = "oidc-middleware-macros", optional = true }
+oidc-middleware-macros = { version = "0.6.1", path = "oidc-middleware-macros", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json"], optional = true }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = "1"
