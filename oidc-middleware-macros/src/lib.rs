@@ -5,6 +5,8 @@
 //! is inseparable from a handler's business operation. The generated code checks
 //! an `OidcAuthorize` value extracted by Axum after OIDC authentication.
 
+#![warn(missing_docs)]
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;

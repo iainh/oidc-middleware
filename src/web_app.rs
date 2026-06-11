@@ -187,7 +187,7 @@ impl WebApp {
                         {
                             Ok(refreshed) => refreshed,
                             Err(error) => {
-                                debug!(%error, "OIDC refreshed tokens were rejected; clearing web-app session");
+                                debug!(error = %error, "OIDC refreshed tokens were rejected; clearing token-state cookie");
                                 clear_authentication(&session, request, &self.token_state_cookie)
                                     .await?;
                                 return Ok(None);
@@ -203,14 +203,14 @@ impl WebApp {
                         Ok(Some(refreshed.into_session()))
                     }
                     Err(error) => {
-                        debug!(%error, "OIDC token refresh failed; clearing web-app session");
+                        debug!(error = %error, "OIDC token refresh failed; clearing token-state cookie");
                         clear_authentication(&session, request, &self.token_state_cookie).await?;
                         Ok(None)
                     }
                 }
             }
             TokenFreshness::RefreshNeeded | TokenFreshness::Expired => {
-                debug!("web-app session tokens are expired and refresh is unavailable");
+                debug!("web-app token-state cookie is expired and refresh is unavailable");
                 clear_authentication(&session, request, &self.token_state_cookie).await?;
                 Ok(None)
             }
@@ -592,7 +592,7 @@ async fn migrate_session_authentication(
         return Ok(());
     };
     let Some(stored_token_state) = stored_token_state else {
-        debug!("web-app session principal did not include token state");
+        debug!("legacy web-app session principal did not include token state");
         clear_authentication(session, request, token_state_cookie).await?;
         return Ok(());
     };

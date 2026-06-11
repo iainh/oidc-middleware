@@ -108,7 +108,8 @@ pub struct OidcConfig {
     /// Quarkus-style application type.
     ///
     /// `service` validates bearer tokens on API requests. `web-app` performs
-    /// browser redirects and requires `tower-sessions`; it also needs provider
+    /// browser redirects, stores authentication state in encrypted cookies, and
+    /// requires `tower-sessions` for redirect state; it also needs provider
     /// discovery or explicit authorization and token endpoints.
     #[config(default)]
     pub application_type: ApplicationType,

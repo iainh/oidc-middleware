@@ -1,8 +1,9 @@
 //! Browser login with `oidc.application-type=web-app`.
 //!
-//! Web-app mode uses the authorization-code flow and stores session state with
-//! `tower-sessions`. Build it through provider discovery or explicit provider
-//! endpoints so the middleware knows the authorization and token URLs.
+//! Web-app mode uses the authorization-code flow, stores authentication state
+//! in an encrypted cookie, and keeps redirect state in `tower-sessions`. Build
+//! it through provider discovery or explicit provider endpoints so the
+//! middleware knows the authorization and token URLs.
 
 use axum::{Extension, Router, routing::get};
 use oidc_middleware::{ApplicationType, Oidc, OidcConfig, Principal};

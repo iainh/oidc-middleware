@@ -210,7 +210,7 @@ impl Oidc {
 
         match self.web_app_principal_or_redirect(request, web_app).await? {
             WebAppPrincipal::Authenticated => {
-                trace!(%method, path = %path, "web-app session authentication succeeded");
+                trace!(%method, path = %path, "web-app token-state authentication succeeded");
                 Ok(None)
             }
             WebAppPrincipal::Redirect(response) => {
@@ -243,7 +243,7 @@ impl Oidc {
             return Ok(WebAppPrincipal::Authenticated);
         }
 
-        trace!(path = %request.uri().path(), "web-app session did not contain a principal");
+        trace!(path = %request.uri().path(), "web-app token state did not contain a principal");
         web_app
             .authorization_redirect(request)
             .await
@@ -925,7 +925,6 @@ impl OidcBuilder {
     }
 
     #[cfg(feature = "web-app")]
-    #[cfg(feature = "web-app")]
     fn install_web_app_from_config(&mut self, client: reqwest::Client) -> BuildResult<()> {
         if self.config.application_type != ApplicationType::WebApp {
             return Ok(());
@@ -943,7 +942,6 @@ impl OidcBuilder {
         Ok(())
     }
 
-    #[cfg(feature = "web-app")]
     #[cfg(feature = "web-app")]
     fn install_web_app_from_metadata(
         &mut self,

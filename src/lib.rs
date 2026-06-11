@@ -78,6 +78,8 @@
 //!
 //! More complete runnable patterns live in the `examples/` directory.
 
+#![warn(missing_docs)]
+
 #[cfg(feature = "macros")]
 pub use oidc_middleware_macros::{
     FromOidcPrincipal, FromOidcSession, OidcAuthorize, authenticated, roles_allowed,

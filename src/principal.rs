@@ -242,10 +242,10 @@ where
 
 /// Axum extractor for authenticated web-app session context.
 ///
-/// Today this exposes the same normalized [`Principal`] as [`OidcPrincipal`].
-/// It is a distinct type so browser-login handlers can depend on session
-/// context without conflating access-token authorization with future
-/// ID-token/profile data.
+/// This exposes the normalized [`Principal`] plus optional validated ID-token
+/// context restored from the web-app token-state cookie. Use it for browser
+/// handlers that need profile claims such as email without changing the
+/// principal used for authorization.
 #[cfg(feature = "web-app")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct OidcSession {
@@ -260,7 +260,7 @@ impl OidcSession {
         &self.principal
     }
 
-    /// Returns the validated ID token restored from the web-app session.
+    /// Returns the validated ID token restored from the web-app token-state cookie.
     pub fn id_token(&self) -> Option<&IdToken> {
         self.id_token.as_ref()
     }
