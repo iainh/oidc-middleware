@@ -14,6 +14,7 @@ use cookie::{Cookie, CookieJar, Key, SameSite};
 use http::header::{CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE};
 use http::{HeaderValue, Request, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error as StdError;
@@ -341,21 +342,20 @@ impl WebApp {
         request: &mut Request<Body>,
         validator: Arc<dyn TokenValidator>,
     ) -> Result<Response> {
-        let query = request.uri().query().unwrap_or_default().to_owned();
         let redirect_uri = self.redirect_uri(request)?;
-        let params = form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>();
+        let params = CallbackQuery::parse(request.uri().query().unwrap_or_default());
         debug!(redirect_uri = %redirect_uri, "processing OIDC authorization callback");
-        if let Some(error) = value(&params, "error") {
+        if let Some(error) = params.error {
             debug!(provider_error = %error, "OIDC authorization endpoint returned an error");
             return Err(Error::TokenRejected(
                 std::io::Error::other(format!("authorization endpoint returned `{error}`")).into(),
             ));
         }
-        let code = value(&params, "code").ok_or_else(|| {
+        let code = params.code.ok_or_else(|| {
             warn!("OIDC callback did not include an authorization code");
             Error::InvalidAuthorizationHeader
         })?;
-        let state = value(&params, "state").ok_or_else(|| {
+        let state = params.state.ok_or_else(|| {
             warn!("OIDC callback did not include a state parameter");
             Error::InvalidAuthorizationHeader
         })?;
@@ -1319,14 +1319,31 @@ fn header_value(cookie: String) -> Result<HeaderValue> {
     })
 }
 
-fn value(
-    params: &[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)],
-    name: &str,
-) -> Option<String> {
-    params
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.to_string())
+struct CallbackQuery<'a> {
+    code: Option<Cow<'a, str>>,
+    state: Option<Cow<'a, str>>,
+    error: Option<Cow<'a, str>>,
+}
+
+impl<'a> CallbackQuery<'a> {
+    fn parse(query: &'a str) -> Self {
+        let mut parsed = Self {
+            code: None,
+            state: None,
+            error: None,
+        };
+
+        for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "code" => parsed.code = Some(value),
+                "state" => parsed.state = Some(value),
+                "error" => parsed.error = Some(value),
+                _ => {}
+            }
+        }
+
+        parsed
+    }
 }
 
 fn redirect_response(location: &str) -> Result<Response> {
