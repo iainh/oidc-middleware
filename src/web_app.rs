@@ -14,9 +14,11 @@ use cookie::{Cookie, CookieJar, Key, SameSite};
 use http::header::{CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE};
 use http::{HeaderValue, Request, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error as StdError;
-use std::future::{Ready, ready};
+use std::future::{Future, Ready, ready};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower_service::Service;
@@ -169,6 +171,23 @@ impl WebApp {
 
     pub(crate) fn is_callback(&self, request: &Request<Body>) -> bool {
         path_matches(&self.redirect_path, request.uri().path())
+    }
+
+    pub(crate) fn callback_path(&self) -> Result<String> {
+        if self.redirect_path.starts_with("http://") || self.redirect_path.starts_with("https://") {
+            return reqwest::Url::parse(&self.redirect_path)
+                .map(|url| url.path().to_owned())
+                .map_err(|error| {
+                    Error::Session(
+                        std::io::Error::other(format!(
+                            "invalid OIDC callback redirect URI `{}`: {error}",
+                            self.redirect_path
+                        ))
+                        .into(),
+                    )
+                });
+        }
+        Ok(self.redirect_path.clone())
     }
 
     pub(crate) async fn session_context(
@@ -572,7 +591,13 @@ impl WebApp {
                     post_logout_redirect,
                     "OIDC post-logout redirect URI",
                 )?;
-                query.append_pair("post_logout_redirect_uri", &post_logout_redirect_uri);
+                query.append_pair(
+                    &options.post_logout_redirect_uri_parameter,
+                    &post_logout_redirect_uri,
+                );
+            }
+            for (name, value) in &options.extra_params {
+                query.append_pair(name, value);
             }
         }
         debug!(end_session_endpoint = %endpoint, "redirecting to OIDC provider logout endpoint");
@@ -638,6 +663,10 @@ pub struct OidcLogoutOptions {
     /// request host and scheme. For local-only logout, the same value is used
     /// directly as the response `Location`.
     pub post_logout_redirect: Option<String>,
+    /// Provider query parameter name used for the post-logout redirect URI.
+    pub post_logout_redirect_uri_parameter: String,
+    /// Extra query parameters sent to the provider end-session endpoint.
+    pub extra_params: HashMap<String, String>,
     /// Include the current raw ID token as `id_token_hint` when redirecting to
     /// the provider end-session endpoint.
     pub id_token_hint: bool,
@@ -651,8 +680,89 @@ impl Default for OidcLogoutOptions {
     fn default() -> Self {
         Self {
             post_logout_redirect: Some(Self::DEFAULT_POST_LOGOUT_REDIRECT.to_owned()),
+            post_logout_redirect_uri_parameter: "post_logout_redirect_uri".to_owned(),
+            extra_params: HashMap::new(),
             id_token_hint: true,
         }
+    }
+}
+
+/// Options used by [`crate::Oidc::web_app_routes`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcWebAppRoutesOptions {
+    /// Relative application path that starts logout.
+    pub logout_path: String,
+    /// Logout route behavior.
+    pub logout: OidcLogoutOptions,
+}
+
+impl Default for OidcWebAppRoutesOptions {
+    fn default() -> Self {
+        Self {
+            logout_path: "/q/oidc/logout".to_owned(),
+            logout: OidcLogoutOptions::default(),
+        }
+    }
+}
+
+/// Axum service backing the OIDC authorization-code callback route.
+#[derive(Clone)]
+pub(crate) struct OidcCallbackService {
+    web_app: Arc<WebApp>,
+    validator: Arc<dyn TokenValidator>,
+    authorization_scheme: String,
+}
+
+impl OidcCallbackService {
+    pub(crate) fn new(
+        web_app: Arc<WebApp>,
+        validator: Arc<dyn TokenValidator>,
+        authorization_scheme: String,
+    ) -> Self {
+        Self {
+            web_app,
+            validator,
+            authorization_scheme,
+        }
+    }
+
+    pub(crate) fn route<S>(self) -> MethodRouter<S>
+    where
+        S: Clone,
+    {
+        get_service(self)
+    }
+}
+
+impl Service<Request<Body>> for OidcCallbackService {
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Response, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        let web_app = self.web_app.clone();
+        let validator = self.validator.clone();
+        let authorization_scheme = self.authorization_scheme.clone();
+
+        Box::pin(async move {
+            let method = request.method().clone();
+            let path = request.uri().path().to_owned();
+            let response = web_app
+                .callback(&mut request, validator)
+                .await
+                .unwrap_or_else(|error| {
+                    error.into_response_with_scheme_for_request(
+                        &authorization_scheme,
+                        &method,
+                        &path,
+                    )
+                });
+            Ok(response)
+        })
     }
 }
 

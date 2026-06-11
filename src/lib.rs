@@ -111,8 +111,8 @@ pub use authorization::{
 };
 pub use config::{
     ApplicationType, ClientSecretMethod, OidcAuthenticationConfig, OidcClientSecretConfig,
-    OidcConfig, OidcCredentialsConfig, OidcIntrospectionCredentialsConfig, OidcRolesConfig,
-    OidcTokenBindingConfig, OidcTokenConfig, RolesSource, TokenSignatureAlgorithm,
+    OidcConfig, OidcCredentialsConfig, OidcIntrospectionCredentialsConfig, OidcLogoutConfig,
+    OidcRolesConfig, OidcTokenBindingConfig, OidcTokenConfig, RolesSource, TokenSignatureAlgorithm,
     WellKnownProvider,
 };
 pub use error::{BuildError, Error};
@@ -136,7 +136,7 @@ pub use user_info::{
 };
 pub use validator::{StaticTokenValidator, TokenValidator};
 #[cfg(feature = "web-app")]
-pub use web_app::{OidcLogoutOptions, OidcLogoutService};
+pub use web_app::{OidcLogoutOptions, OidcLogoutService, OidcWebAppRoutesOptions};
 
 pub(crate) use config::role_claim_paths_for_source;
 use std::error::Error as StdError;

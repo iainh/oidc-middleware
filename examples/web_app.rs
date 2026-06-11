@@ -26,16 +26,13 @@ async fn app() -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
 
     let protected = Router::new()
         .route("/", get(home))
-        // The OIDC layer intercepts the configured callback path before this
-        // handler runs. Keeping a route here makes Axum routing explicit.
-        .route("/q/oidc/callback", get(callback_placeholder))
         .layer(oidc.clone().layer());
 
     Ok(Router::new()
         .route("/health", get(health))
-        // Logout must stay outside the OIDC layer so it can clear stale or
-        // invalid local OIDC cookies without first redirecting to login.
-        .route("/logout", oidc.logout_route())
+        // OIDC-owned callback and logout routes must stay outside the OIDC
+        // layer so they can complete login and logout flows directly.
+        .merge(oidc.routes())
         .merge(protected))
 }
 
@@ -45,8 +42,4 @@ async fn health() -> &'static str {
 
 async fn home(Extension(principal): Extension<Principal>) -> String {
     format!("signed in as {}", principal.subject())
-}
-
-async fn callback_placeholder() -> &'static str {
-    "callback handled by OIDC middleware"
 }

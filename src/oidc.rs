@@ -29,11 +29,15 @@ use crate::web_app::PendingWebAppCookies;
 #[cfg(feature = "web-app")]
 use crate::web_app::WebApp;
 #[cfg(feature = "web-app")]
-use crate::web_app::{OidcLogoutOptions, OidcLogoutService};
+use crate::web_app::{
+    OidcCallbackService, OidcLogoutOptions, OidcLogoutService, OidcWebAppRoutesOptions,
+};
 use crate::{
     ApplicationType, Error, IntrospectionValidator, OidcConfig, Principal, Result, RolesSource,
     TokenIntrospector, TokenValidator, UserInfoProvider, UserInfoValidator,
 };
+#[cfg(feature = "web-app")]
+use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 #[cfg(feature = "web-app")]
@@ -149,12 +153,12 @@ impl Oidc {
         OidcLayer { oidc: self }
     }
 
-    /// Returns a route that performs web-app logout.
+    /// Returns the application routes owned by this OIDC middleware.
     ///
-    /// Add this route outside [`Oidc::layer`] so it can clear local OIDC
-    /// cookies even when the current browser session is missing, expired, or
-    /// tampered with:
-    ///
+    /// Service applications do not expose local OIDC protocol routes, so this
+    /// returns an empty router for [`ApplicationType::Service`]. Web-app and
+    /// hybrid applications return callback and logout routes that should be
+    /// merged outside [`Oidc::layer`].
     /// ```
     /// use axum::{Router, routing::get};
     /// use oidc_middleware::{ApplicationType, Oidc, OidcConfig};
@@ -172,15 +176,88 @@ impl Oidc {
     ///     .layer(oidc.clone().layer());
     ///
     /// Router::new()
-    ///     .route("/logout", oidc.logout_route())
+    ///     .merge(oidc.routes())
     ///     .merge(protected)
     /// # }
     /// ```
+    #[cfg(feature = "web-app")]
+    pub fn routes<S>(&self) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        match self.config.application_type {
+            ApplicationType::Service => Router::new(),
+            ApplicationType::WebApp | ApplicationType::Hybrid => self.web_app_routes(),
+        }
+    }
+
+    /// Returns the web-app callback and logout routes.
+    ///
+    /// Merge these routes outside [`Oidc::layer`] so the callback can complete
+    /// the authorization-code flow and logout can clear local OIDC cookies
+    /// without first requiring an authenticated session.
+    #[cfg(feature = "web-app")]
+    pub fn web_app_routes<S>(&self) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        self.web_app_routes_with_options(self.web_app_routes_options())
+    }
+
+    /// Returns web-app routes with caller-supplied route options.
+    #[cfg(feature = "web-app")]
+    pub fn web_app_routes_with_options<S>(&self, options: OidcWebAppRoutesOptions) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        let Some(web_app) = &self.web_app else {
+            debug!("web-app routes requested but web-app support is not installed");
+            return Router::new();
+        };
+
+        let mut router = Router::new();
+        match web_app.callback_path() {
+            Ok(callback_path) if is_route_path(&callback_path) => {
+                router = router.route(
+                    &callback_path,
+                    OidcCallbackService::new(
+                        web_app.clone(),
+                        self.validator.clone(),
+                        self.config.token.authorization_scheme.clone(),
+                    )
+                    .route(),
+                );
+            }
+            Ok(callback_path) => {
+                warn!(callback_path = %callback_path, "OIDC callback path is not an application route path; callback route was not registered");
+            }
+            Err(error) => {
+                warn!(error = %error, "OIDC callback route could not be registered");
+            }
+        }
+
+        if is_route_path(&options.logout_path) {
+            router = router.route(
+                &options.logout_path,
+                self.logout_service_with_options(options.logout).route(),
+            );
+        } else {
+            warn!(logout_path = %options.logout_path, "OIDC logout path is not an application route path; logout route was not registered");
+        }
+
+        router
+    }
+
+    /// Returns a route that performs web-app logout.
+    ///
+    /// Prefer [`Oidc::routes`] for most web-apps. Use this when an application
+    /// needs to mount only the logout route manually.
     ///
     /// The route clears the local token-state and redirect-state cookies. When
     /// provider metadata or configuration includes an end-session endpoint, it
-    /// redirects there with `id_token_hint` and `post_logout_redirect_uri` when
-    /// available. Otherwise it redirects to `/`.
+    /// redirects there with `id_token_hint` and the configured post-logout
+    /// redirect parameter when available. Otherwise it redirects locally.
+    ///
     #[cfg(feature = "web-app")]
     pub fn logout_route<S>(&self) -> MethodRouter<S>
     where
@@ -201,7 +278,7 @@ impl Oidc {
     /// Returns the service used by [`Oidc::logout_route`].
     #[cfg(feature = "web-app")]
     pub fn logout_service(&self) -> OidcLogoutService {
-        self.logout_service_with_options(OidcLogoutOptions::default())
+        self.logout_service_with_options(self.logout_options())
     }
 
     /// Returns the service used by [`Oidc::logout_route_with_options`].
@@ -212,6 +289,24 @@ impl Oidc {
             options,
             self.config.token.authorization_scheme.clone(),
         )
+    }
+
+    #[cfg(feature = "web-app")]
+    fn web_app_routes_options(&self) -> OidcWebAppRoutesOptions {
+        OidcWebAppRoutesOptions {
+            logout_path: self.config.logout.path.clone(),
+            logout: self.logout_options(),
+        }
+    }
+
+    #[cfg(feature = "web-app")]
+    fn logout_options(&self) -> OidcLogoutOptions {
+        OidcLogoutOptions {
+            post_logout_redirect: self.config.logout.post_logout_path.clone(),
+            post_logout_redirect_uri_parameter: self.config.logout.post_logout_uri_param.clone(),
+            extra_params: self.config.logout.extra_params.clone(),
+            id_token_hint: true,
+        }
     }
 
     pub(crate) async fn authenticate(&self, request: &mut Request<Body>) -> Result<()> {
@@ -1219,4 +1314,9 @@ where
             }
         })
     }
+}
+
+#[cfg(feature = "web-app")]
+fn is_route_path(path: &str) -> bool {
+    path.starts_with('/')
 }

@@ -49,6 +49,35 @@ pub(crate) fn load_required_claims(
     Ok(claims)
 }
 
+pub(crate) fn load_string_map(
+    config: &Config,
+    prefix: &str,
+) -> mp_config::Result<HashMap<String, String>> {
+    let mut values = HashMap::new();
+    let property_prefix = format!("{prefix}.");
+
+    for key in config.property_names() {
+        let Some(entry_name) = key.strip_prefix(&property_prefix) else {
+            continue;
+        };
+        let Some(entry_name) = config_map_entry_name(entry_name) else {
+            continue;
+        };
+
+        let value = config.get::<String>(&key)?;
+        if value.trim().is_empty() {
+            return Err(mp_config::ConfigError::Conversion {
+                name: key,
+                value,
+                message: "map values must not be empty when configured".to_owned(),
+            });
+        }
+        values.insert(entry_name, value);
+    }
+
+    Ok(values)
+}
+
 pub(crate) fn config_map_entry_name(name: &str) -> Option<String> {
     if let Some(quoted) = name
         .strip_prefix('"')
@@ -89,6 +118,7 @@ pub(crate) fn has_default_tenant_config(config: &Config) -> bool {
             || key == "oidc.public-key"
             || key == "oidc.application-type"
             || key.starts_with("oidc.authentication.")
+            || key.starts_with("oidc.logout.")
             || key.starts_with("oidc.credentials.")
             || key.starts_with("oidc.introspection-credentials.")
             || key.starts_with("oidc.token.")
@@ -143,13 +173,19 @@ pub(crate) fn named_tenant_configs(config: &Config) -> Vec<NamedTenantConfig> {
                 | "public-key"
                 | "application-type"
         ) || property.starts_with("authentication.")
+            || property.starts_with("logout.")
             || property.starts_with("token.")
             || property.starts_with("credentials.")
             || property.starts_with("introspection-credentials.")
             || property.starts_with("roles.");
         if !matches!(
             name.as_str(),
-            "authentication" | "credentials" | "introspection-credentials" | "token" | "roles"
+            "authentication"
+                | "logout"
+                | "credentials"
+                | "introspection-credentials"
+                | "token"
+                | "roles"
         ) && tenant_property
         {
             names.insert(NamedTenantConfig {

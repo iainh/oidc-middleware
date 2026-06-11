@@ -1,4 +1,6 @@
-use crate::config_helpers::{load_optional_non_empty_string, load_required_claims, split_csv};
+use crate::config_helpers::{
+    load_optional_non_empty_string, load_required_claims, load_string_map, split_csv,
+};
 use crate::token::validate_authorization_scheme;
 #[cfg(feature = "jwt")]
 use jsonwebtoken::Algorithm;
@@ -116,6 +118,9 @@ pub struct OidcConfig {
     /// Browser authentication settings used by `web-app` applications.
     #[config(nested)]
     pub authentication: OidcAuthenticationConfig,
+    /// Browser logout settings used by `web-app` applications.
+    #[config(nested)]
+    pub logout: OidcLogoutConfig,
     /// Client credential settings used for provider calls.
     #[config(nested)]
     pub credentials: OidcCredentialsConfig,
@@ -167,6 +172,7 @@ impl Default for OidcConfig {
             public_key: None,
             application_type: ApplicationType::Service,
             authentication: OidcAuthenticationConfig::default(),
+            logout: OidcLogoutConfig::default(),
             credentials: OidcCredentialsConfig::default(),
             introspection_credentials: OidcIntrospectionCredentialsConfig::default(),
             token: OidcTokenConfig::default(),
@@ -274,6 +280,95 @@ impl ConfigProperties for OidcAuthenticationConfig {
                 &key("token-state-cookie-key"),
             )?,
             scopes,
+        })
+    }
+}
+
+/// Browser logout settings loaded from `oidc.logout.*`.
+///
+/// The names mirror Quarkus OIDC logout configuration. The local logout route
+/// is an application endpoint; [`OidcConfig::end_session_path`] remains the
+/// provider-side end-session endpoint used for RP-initiated logout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OidcLogoutConfig {
+    /// Relative application path that starts web-app logout.
+    pub path: String,
+    /// Relative or absolute application URI to return to after provider logout.
+    pub post_logout_path: Option<String>,
+    /// Provider query parameter name for the post-logout redirect URI.
+    pub post_logout_uri_param: String,
+    /// Extra query parameters sent to the provider end-session endpoint.
+    pub extra_params: HashMap<String, String>,
+}
+
+impl Default for OidcLogoutConfig {
+    fn default() -> Self {
+        Self {
+            path: "/q/oidc/logout".to_owned(),
+            post_logout_path: Some("/".to_owned()),
+            post_logout_uri_param: "post_logout_redirect_uri".to_owned(),
+            extra_params: HashMap::new(),
+        }
+    }
+}
+
+impl ConfigProperties for OidcLogoutConfig {
+    fn from_config(config: &Config) -> mp_config::Result<Self> {
+        Self::from_config_prefix(config, "")
+    }
+
+    fn from_config_prefix(config: &Config, prefix: &str) -> mp_config::Result<Self> {
+        let key = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+
+        let path = config
+            .get_optional::<String>(&key("path"))?
+            .unwrap_or_else(|| "/q/oidc/logout".to_owned());
+        if !path.starts_with('/') {
+            return Err(mp_config::ConfigError::Conversion {
+                name: key("path"),
+                value: path,
+                message: "logout path must start with `/`".to_owned(),
+            });
+        }
+
+        let post_logout_path = load_optional_non_empty_string(config, &key("post-logout-path"))?
+            .or_else(|| Some("/".to_owned()));
+        if let Some(post_logout_path) = &post_logout_path {
+            if !post_logout_path.starts_with('/')
+                && !post_logout_path.starts_with("http://")
+                && !post_logout_path.starts_with("https://")
+            {
+                return Err(mp_config::ConfigError::Conversion {
+                    name: key("post-logout-path"),
+                    value: post_logout_path.clone(),
+                    message: "post-logout-path must start with `/`, `http://`, or `https://`"
+                        .to_owned(),
+                });
+            }
+        }
+
+        let post_logout_uri_param = config
+            .get_optional::<String>(&key("post-logout-uri-param"))?
+            .unwrap_or_else(|| "post_logout_redirect_uri".to_owned());
+        if post_logout_uri_param.trim().is_empty() {
+            return Err(mp_config::ConfigError::Conversion {
+                name: key("post-logout-uri-param"),
+                value: post_logout_uri_param,
+                message: "post-logout-uri-param must not be empty".to_owned(),
+            });
+        }
+
+        Ok(Self {
+            path,
+            post_logout_path,
+            post_logout_uri_param,
+            extra_params: load_string_map(config, &key("extra-params"))?,
         })
     }
 }

@@ -24,8 +24,8 @@ compliance, operational, and provider-compatibility requirements.
 - Bearer-token authentication for service APIs.
 - Browser `web-app` authorization-code flow with encrypted redirect-state and
   token-state cookies.
-- Web-app logout route helper that clears local OIDC cookies and redirects to
-  the provider end-session endpoint when one is configured or discovered.
+- Web-app callback and logout route helpers for authorization-code flow
+  completion and RP-initiated logout.
 - Static public-key, JWKS, refreshable JWKS, introspection, and UserInfo-backed
   validation options.
 - Multi-tenant OIDC routing by path, tenant ID header, or token issuer.
@@ -187,8 +187,8 @@ struct WebUser {
 This keeps OIDC mechanics at the edge of the application while letting route
 handlers receive the identity shape the rest of the codebase understands.
 
-Add logout outside the protected OIDC layer so it can clear local cookies even
-when the browser session is already expired or invalid:
+Add the OIDC-owned web-app routes outside the protected OIDC layer so callback
+and logout can complete without first requiring an authenticated session:
 
 ```rust
 use axum::{Router, routing::get};
@@ -200,27 +200,29 @@ let protected = Router::new()
     .layer(oidc.clone().layer());
 
 Router::new()
-    .route("/logout", oidc.logout_route())
+    .merge(oidc.routes())
     .merge(protected)
 # }
 ```
 
-The logout route clears the web-app token-state and redirect-state cookies. If
-provider discovery or `oidc.end-session-path` supplies an end-session endpoint,
-the route redirects there with `id_token_hint` and `post_logout_redirect_uri`
-when available. Otherwise it redirects locally to `/`; use
-`OidcLogoutOptions` to choose a different post-logout location.
+For `web-app` and `hybrid` applications, `Oidc::routes()` registers the
+configured callback path and logout path. For `service` applications, it returns
+an empty router. The logout route clears the web-app token-state and
+redirect-state cookies. If provider discovery or `oidc.end-session-path`
+supplies an end-session endpoint, the route redirects there with
+`id_token_hint`, the configured post-logout redirect parameter, and any
+configured extra logout parameters.
 
 ## Configuration highlights
 
 The current implementation supports:
 
 - Service and hybrid `oidc.application-type` bearer-token middleware.
-- Browser `web-app` login when provider discovery or explicit authorization and
-  token endpoints are configured.
-- Browser `web-app` logout with `Oidc::logout_route`; the route clears local
-  OIDC cookies and uses discovered or configured end-session endpoints when
-  available.
+- Browser `web-app` login routes with `Oidc::routes()` when provider discovery
+  or explicit authorization and token endpoints are configured.
+- Browser `web-app` logout with Quarkus-style `oidc.logout.path`,
+  `oidc.logout.post-logout-path`, `oidc.logout.post-logout-uri-param`, and
+  `oidc.logout.extra-params.*` settings.
 - Absolute `oidc.authentication.redirect-path` values for deployments where
   request host or forwarding headers are unavailable.
 - OIDC provider discovery from `oidc.auth-server-url` and discovered `jwks_uri`.
@@ -293,8 +295,8 @@ A typical API should:
 3. Apply `Oidc::layer()` only to protected routes.
 4. Use `RequireAuthenticatedLayer`, `RequireRolesLayer`, or handler macros for
    authorization.
-5. Keep health checks, static assets, and public callbacks outside protected
-   routers unless they should also require authentication.
+5. Merge `Oidc::routes()` outside protected routers for web-app callback and
+   logout endpoints.
 
 This keeps provider setup declarative while keeping authorization visible in the
 Axum router.

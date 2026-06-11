@@ -110,6 +110,11 @@ fn config_loads_quarkus_oidc_properties() {
                     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 )
                 .with("oidc.authentication.scopes", "openid,email,profile")
+                .with("oidc.logout.path", "/signout")
+                .with("oidc.logout.post-logout-path", "/signed-out")
+                .with("oidc.logout.post-logout-uri-param", "returnTo")
+                .with("oidc.logout.extra-params.ui_locales", "en-CA")
+                .with("oidc.logout.extra-params.\"client.name\"", "orders")
                 .with("oidc.token.audience", "orders-api")
                 .with("oidc.token.token-type", "bearer")
                 .with("oidc.token.signature-algorithm", "rs256")
@@ -186,6 +191,15 @@ fn config_loads_quarkus_oidc_properties() {
                     "email".to_owned(),
                     "profile".to_owned(),
                 ],
+            },
+            logout: OidcLogoutConfig {
+                path: "/signout".to_owned(),
+                post_logout_path: Some("/signed-out".to_owned()),
+                post_logout_uri_param: "returnTo".to_owned(),
+                extra_params: HashMap::from([
+                    ("ui_locales".to_owned(), "en-CA".to_owned()),
+                    ("client.name".to_owned(), "orders".to_owned()),
+                ]),
             },
             credentials: OidcCredentialsConfig {
                 secret: Some("orders-secret".to_owned()),
@@ -280,6 +294,31 @@ fn config_rejects_empty_role_claim_path() {
             .contains("role-claim-path must include at least one claim path"),
         "{error}"
     );
+}
+
+#[test]
+fn config_rejects_invalid_logout_path() {
+    let config = Config::builder()
+        .add_source(MapSource::new("invalid-logout-path", 100).with("oidc.logout.path", "logout"))
+        .build();
+
+    let error = OidcConfig::from_config(&config).expect_err("logout path should be rejected");
+
+    assert!(error.to_string().contains("logout path"), "{error}");
+}
+
+#[test]
+fn config_rejects_invalid_post_logout_path() {
+    let config = Config::builder()
+        .add_source(
+            MapSource::new("invalid-post-logout-path", 100)
+                .with("oidc.logout.post-logout-path", "signed-out"),
+        )
+        .build();
+
+    let error = OidcConfig::from_config(&config).expect_err("post logout path should be rejected");
+
+    assert!(error.to_string().contains("post-logout-path"), "{error}");
 }
 
 #[test]
@@ -2433,6 +2472,18 @@ async fn web_app_clears_tampered_token_state_cookie() {
 }
 
 #[tokio::test]
+async fn routes_are_empty_for_service_applications() {
+    let app = Router::new().merge(oidc().routes());
+
+    let response = app
+        .oneshot(request("/q/oidc/logout", None))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn web_app_logout_route_clears_local_session_and_redirects_locally() {
     let token = jwt_with_kid_and_secret(
         "test-key",
@@ -2451,6 +2502,12 @@ async fn web_app_logout_route_clears_local_session_and_redirects_locally() {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
+        logout: OidcLogoutConfig {
+            path: "/signout".to_owned(),
+            post_logout_path: Some("/signed-out".to_owned()),
+            post_logout_uri_param: "returnTo".to_owned(),
+            extra_params: HashMap::from([("ui_locales".to_owned(), "en-CA".to_owned())]),
+        },
         ..OidcConfig::default()
     })
     .provider_metadata(
@@ -2576,6 +2633,12 @@ async fn web_app_logout_route_redirects_to_provider_end_session_endpoint() {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
+        logout: OidcLogoutConfig {
+            path: "/signout".to_owned(),
+            post_logout_path: Some("/signed-out".to_owned()),
+            post_logout_uri_param: "returnTo".to_owned(),
+            extra_params: HashMap::from([("ui_locales".to_owned(), "en-CA".to_owned())]),
+        },
         ..OidcConfig::default()
     })
     .provider_metadata(
@@ -2595,19 +2658,11 @@ async fn web_app_logout_route_redirects_to_provider_end_session_endpoint() {
         test_jwks(),
     )
     .expect("web-app provider metadata should build");
-    let app = Router::new()
-        .route(
-            "/logout",
-            oidc.logout_route_with_options(OidcLogoutOptions {
-                post_logout_redirect: Some("/signed-out".to_owned()),
-                ..OidcLogoutOptions::default()
-            }),
-        )
-        .merge(
-            Router::new()
-                .route("/protected", get(|| async { "ok" }))
-                .layer(oidc.layer()),
-        );
+    let app = Router::new().merge(oidc.routes()).merge(
+        Router::new()
+            .route("/protected", get(|| async { "ok" }))
+            .layer(oidc.layer()),
+    );
 
     let response = app
         .clone()
@@ -2641,7 +2696,7 @@ async fn web_app_logout_route_redirects_to_provider_end_session_endpoint() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/logout")
+                .uri("/signout")
                 .header(HOST, "app.example")
                 .header("x-forwarded-proto", "https")
                 .header(COOKIE, session_cookie)
@@ -2672,10 +2727,12 @@ async fn web_app_logout_route_redirects_to_provider_end_session_endpoint() {
         Some(token.as_str())
     );
     assert_eq!(
-        query
-            .get("post_logout_redirect_uri")
-            .map(|value| value.as_ref()),
+        query.get("returnTo").map(|value| value.as_ref()),
         Some("https://app.example/signed-out")
+    );
+    assert_eq!(
+        query.get("ui_locales").map(|value| value.as_ref()),
+        Some("en-CA")
     );
     let cleared =
         set_cookie_header(&response, "q_oidc").expect("logout should clear token-state cookie");
