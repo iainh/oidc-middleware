@@ -35,7 +35,7 @@ pub enum Error {
     Forbidden,
     /// The validator rejected the token.
     TokenRejected(BoxError),
-    /// Web-app session handling failed.
+    /// Web-app redirect or token-state handling failed.
     Session(BoxError),
 }
 
@@ -117,7 +117,7 @@ impl fmt::Display for Error {
             Self::TenantDisabled => write!(f, "OIDC tenant is disabled"),
             Self::Forbidden => write!(f, "authenticated principal is not allowed"),
             Self::TokenRejected(source) => write!(f, "token rejected: {source}"),
-            Self::Session(source) => write!(f, "OIDC web-app session failed: {source}"),
+            Self::Session(source) => write!(f, "OIDC web-app state handling failed: {source}"),
         }
     }
 }

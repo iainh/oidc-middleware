@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tower::ServiceExt;
-use tower_sessions::{MemoryStore, SessionManagerLayer};
 
 const TEST_IAT: u64 = 1_700_000_000;
 
@@ -1801,8 +1800,7 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
     .expect("web-app provider metadata should build");
     let app = Router::new()
         .route("/protected", get(|| async { "ok" }))
-        .layer(oidc.layer())
-        .layer(SessionManagerLayer::new(MemoryStore::default()));
+        .layer(oidc.layer());
 
     let response = app
         .oneshot(
@@ -1847,7 +1845,7 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
 }
 
 #[tokio::test]
-async fn web_app_returns_internal_error_without_session_extension() {
+async fn web_app_redirects_without_external_session_layer() {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
@@ -1890,7 +1888,8 @@ async fn web_app_returns_internal_error_without_session_extension() {
         .await
         .expect("request should complete");
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert!(response.headers().get(LOCATION).is_some());
 }
 
 #[test]
@@ -1930,7 +1929,7 @@ fn web_app_rejects_invalid_token_state_cookie_key() {
 }
 
 #[tokio::test]
-async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
+async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
     let token = jwt_with_kid_and_secret(
         "test-key",
         b"secret",
@@ -1984,8 +1983,7 @@ async fn web_app_callback_exchanges_code_and_stores_principal_in_session() {
                 )
             }),
         )
-        .layer(oidc.layer())
-        .layer(SessionManagerLayer::new(MemoryStore::default()));
+        .layer(oidc.layer());
 
     let response = app
         .clone()
@@ -2088,8 +2086,7 @@ async fn web_app_clears_tampered_token_state_cookie() {
     .expect("web-app provider metadata should build");
     let app = Router::new()
         .route("/protected", get(|| async { "ok" }))
-        .layer(oidc.layer())
-        .layer(SessionManagerLayer::new(MemoryStore::default()));
+        .layer(oidc.layer());
 
     let response = app
         .clone()
@@ -2196,8 +2193,7 @@ async fn web_app_token_state_cookie_lifetime_tracks_tokens() {
     .expect("web-app provider metadata should build");
     let app = Router::new()
         .route("/protected", get(|| async { "ok" }))
-        .layer(oidc.layer())
-        .layer(SessionManagerLayer::new(MemoryStore::default()));
+        .layer(oidc.layer());
 
     let response = app
         .clone()
@@ -2312,8 +2308,7 @@ async fn web_app_refreshes_expired_session_tokens() {
                     .to_owned()
             }),
         )
-        .layer(oidc.layer())
-        .layer(SessionManagerLayer::new(MemoryStore::default()));
+        .layer(oidc.layer());
 
     let response = app
         .clone()
@@ -2410,8 +2405,7 @@ async fn web_app_redirects_when_expired_session_refresh_is_disabled() {
     .expect("web-app provider metadata should build");
     let app = Router::new()
         .route("/protected", get(|| async { "ok" }))
-        .layer(oidc.layer())
-        .layer(SessionManagerLayer::new(MemoryStore::default()));
+        .layer(oidc.layer());
 
     let response = app
         .clone()
@@ -2538,8 +2532,7 @@ async fn web_app_refresh_token_time_skew_enables_proactive_refresh() {
                     .to_owned()
             }),
         )
-        .layer(oidc.layer())
-        .layer(SessionManagerLayer::new(MemoryStore::default()));
+        .layer(oidc.layer());
 
     let response = app
         .clone()
@@ -2663,8 +2656,7 @@ async fn web_app_session_age_extension_bounds_expired_token_refresh() {
     .expect("web-app provider metadata should build");
     let app = Router::new()
         .route("/protected", get(|| async { "ok" }))
-        .layer(oidc.layer())
-        .layer(SessionManagerLayer::new(MemoryStore::default()));
+        .layer(oidc.layer());
 
     let response = app
         .clone()

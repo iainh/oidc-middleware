@@ -108,9 +108,9 @@ pub struct OidcConfig {
     /// Quarkus-style application type.
     ///
     /// `service` validates bearer tokens on API requests. `web-app` performs
-    /// browser redirects, stores authentication state in encrypted cookies, and
-    /// requires `tower-sessions` for redirect state; it also needs provider
-    /// discovery or explicit authorization and token endpoints.
+    /// browser redirects and stores redirect/authentication state in encrypted
+    /// cookies; it also needs provider discovery or explicit authorization and
+    /// token endpoints.
     #[config(default)]
     pub application_type: ApplicationType,
     /// Browser authentication settings used by `web-app` applications.
@@ -179,8 +179,8 @@ impl Default for OidcConfig {
 ///
 /// These settings apply only to [`ApplicationType::WebApp`]. Web-app mode uses
 /// the authorization-code flow, stores authentication state in an encrypted
-/// cookie, keeps redirect state in `tower-sessions`, and validates the returned
-/// ID token or access token through the configured validator.
+/// cookie, keeps redirect state in an encrypted cookie, and validates the
+/// returned ID token or access token through the configured validator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcAuthenticationConfig {
     /// Redirect URI path or absolute URI used for authorization-code callbacks.

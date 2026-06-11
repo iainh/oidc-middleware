@@ -1,13 +1,12 @@
 //! Browser login with `oidc.application-type=web-app`.
 //!
-//! Web-app mode uses the authorization-code flow, stores authentication state
-//! in an encrypted cookie, and keeps redirect state in `tower-sessions`. Build
-//! it through provider discovery or explicit provider endpoints so the
-//! middleware knows the authorization and token URLs.
+//! Web-app mode uses the authorization-code flow and stores redirect and
+//! authentication state in encrypted cookies. Build it through provider
+//! discovery or explicit provider endpoints so the middleware knows the
+//! authorization and token URLs.
 
 use axum::{Extension, Router, routing::get};
 use oidc_middleware::{ApplicationType, Oidc, OidcConfig, Principal};
-use tower_sessions::{MemoryStore, SessionManagerLayer};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -32,10 +31,7 @@ async fn app() -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
         .route("/q/oidc/callback", get(callback_placeholder))
         .layer(oidc.layer());
 
-    Ok(Router::new()
-        .route("/health", get(health))
-        .merge(protected)
-        .layer(SessionManagerLayer::new(MemoryStore::default())))
+    Ok(Router::new().route("/health", get(health)).merge(protected))
 }
 
 async fn health() -> &'static str {

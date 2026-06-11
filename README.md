@@ -22,8 +22,8 @@ compliance, operational, and provider-compatibility requirements.
 - Axum and Tower middleware for protecting routers and routes.
 - Quarkus-inspired `oidc.*` configuration through `mp-config`.
 - Bearer-token authentication for service APIs.
-- Browser `web-app` authorization-code flow with encrypted token-state cookies
-  and `tower-sessions` redirect state.
+- Browser `web-app` authorization-code flow with encrypted redirect-state and
+  token-state cookies.
 - Static public-key, JWKS, refreshable JWKS, introspection, and UserInfo-backed
   validation options.
 - Multi-tenant OIDC routing by path, tenant ID header, or token issuer.
@@ -90,7 +90,7 @@ to be easier to evaluate than a single large demo application.
 - [`user_info.rs`](examples/user_info.rs): Validate bearer tokens through
   UserInfo.
 - [`web_app.rs`](examples/web_app.rs): Configure browser login with encrypted
-  token-state cookies and `tower-sessions`; web-app handlers can extract
+  redirect-state and token-state cookies; web-app handlers can extract
   `OidcSession` to access the principal and validated ID token claims.
 - [`multi_tenant.rs`](examples/multi_tenant.rs): Select tenant-specific OIDC
   middleware by path.
@@ -236,13 +236,13 @@ Available features:
   the default features.
 - `rustls-native-certs`: Enables the rustls TLS backend with platform-native
   certificate roots.
-- `web-app`: Enables browser login support with encrypted token-state cookies
-  and `tower-sessions`; this also enables `http-client` and `jwt`.
+- `web-app`: Enables browser login support with encrypted redirect-state and
+  token-state cookies; this also enables `http-client` and `jwt`.
 
 With `default-features = false`, the crate keeps the Axum middleware, config
 model, route authorization layers, custom validator traits, introspection model,
 and UserInfo model, while avoiding the optional HTTP client, TLS, JWT, proc
-macro, cookie, session, random-state, and URL-parsing stacks.
+macro, cookie, random-state, and URL-parsing stacks.
 
 When enabling `http-client` or `web-app` without default features, also enable
 one TLS backend for HTTPS provider calls:

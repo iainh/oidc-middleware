@@ -14,16 +14,12 @@ use http::{HeaderValue, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::sync::Arc;
-use tower_sessions::Session;
 use tracing::{debug, trace};
 use url::form_urlencoded;
 
-const PRINCIPAL_KEY: &str = "oidc.principal";
-const ID_TOKEN_KEY: &str = "oidc.id-token";
-const TOKEN_STATE_KEY: &str = "oidc.token-state";
 const TOKEN_STATE_COOKIE_NAME: &str = "q_oidc";
-const STATE_KEY: &str = "oidc.state";
-const ORIGINAL_URI_KEY: &str = "oidc.original-uri";
+const REDIRECT_STATE_COOKIE_NAME: &str = "q_oidc_redirect";
+const REDIRECT_STATE_COOKIE_MAX_AGE_SECS: i64 = 600;
 
 #[derive(Clone)]
 pub(crate) struct WebApp {
@@ -40,6 +36,7 @@ pub(crate) struct WebApp {
     session_age_extension: u64,
     scopes: Vec<String>,
     token_state_cookie: CookieTokenStateManager,
+    redirect_state_cookie: RedirectStateCookieManager,
 }
 
 impl WebApp {
@@ -132,6 +129,9 @@ impl WebApp {
                 config.authentication.session_age_extension.as_secs(),
                 config.token.refresh_expired || config.token.refresh_token_time_skew.is_some(),
             )?,
+            redirect_state_cookie: RedirectStateCookieManager::new(
+                config.authentication.token_state_cookie_key.as_deref(),
+            )?,
         })
     }
 
@@ -144,10 +144,6 @@ impl WebApp {
         request: &mut Request<Body>,
         validator: Arc<dyn TokenValidator>,
     ) -> Result<Option<WebAppSession>> {
-        let Some(session) = session(request) else {
-            trace!(path = %request.uri().path(), "web-app request has no session extension");
-            return Ok(None);
-        };
         let stored_authentication = self.token_state_cookie.load(request)?;
         trace!(
             path = %request.uri().path(),
@@ -159,7 +155,6 @@ impl WebApp {
                 debug!("web-app token-state cookie could not be decrypted; clearing it");
                 queue_cookie(request, self.token_state_cookie.clear()?);
             }
-            migrate_session_authentication(&session, request, &self.token_state_cookie).await?;
             return Ok(None);
         };
         let stored_principal = stored_authentication.principal;
@@ -193,7 +188,7 @@ impl WebApp {
                             lifespan_grace_secs = self.lifespan_grace,
                             "web-app token state is expired without a refresh token"
                         );
-                        clear_authentication(&session, request, &self.token_state_cookie).await?;
+                        clear_authentication(request, &self.token_state_cookie)?;
                         return Ok(None);
                     }
                     trace!(
@@ -215,8 +210,7 @@ impl WebApp {
                             Ok(refreshed) => refreshed,
                             Err(error) => {
                                 debug!(error = %error, "OIDC refreshed tokens were rejected; clearing token-state cookie");
-                                clear_authentication(&session, request, &self.token_state_cookie)
-                                    .await?;
+                                clear_authentication(request, &self.token_state_cookie)?;
                                 return Ok(None);
                             }
                         };
@@ -226,25 +220,19 @@ impl WebApp {
                             has_refresh_token = refreshed.token_state.refresh_token.is_some(),
                             "OIDC token refresh succeeded"
                         );
-                        store_authentication(
-                            &session,
-                            request,
-                            &self.token_state_cookie,
-                            &refreshed,
-                        )
-                        .await?;
+                        store_authentication(request, &self.token_state_cookie, &refreshed)?;
                         Ok(Some(refreshed.into_session()))
                     }
                     Err(error) => {
                         debug!(error = %error, "OIDC token refresh failed; clearing token-state cookie");
-                        clear_authentication(&session, request, &self.token_state_cookie).await?;
+                        clear_authentication(request, &self.token_state_cookie)?;
                         Ok(None)
                     }
                 }
             }
             TokenFreshness::RefreshNeeded | TokenFreshness::Expired => {
                 debug!("web-app token-state cookie is expired and refresh is unavailable");
-                clear_authentication(&session, request, &self.token_state_cookie).await?;
+                clear_authentication(request, &self.token_state_cookie)?;
                 Ok(None)
             }
         }
@@ -254,9 +242,6 @@ impl WebApp {
         &self,
         request: &mut Request<Body>,
     ) -> Result<Response> {
-        let session = session(request).ok_or_else(|| {
-            Error::Session(std::io::Error::other("missing tower-sessions Session extension").into())
-        })?;
         let original_uri = request.uri().to_string();
         let redirect_uri = self.redirect_uri(request)?;
         let state = random_state()?;
@@ -266,17 +251,12 @@ impl WebApp {
             authorization_endpoint = %self.authorization_endpoint,
             "creating OIDC authorization redirect"
         );
-        session
-            .insert(STATE_KEY, state.clone())
-            .await
-            .map_err(session_error)?;
-        if self.restore_path_after_redirect {
-            trace!(original_uri = %original_uri, "storing original URI before OIDC redirect");
-            session
-                .insert(ORIGINAL_URI_KEY, original_uri)
-                .await
-                .map_err(session_error)?;
-        }
+        let redirect_state = RedirectState {
+            state: state.clone(),
+            original_uri: self
+                .restore_path_after_redirect
+                .then_some(original_uri.clone()),
+        };
 
         let mut serializer = form_urlencoded::Serializer::new(String::new());
         serializer
@@ -285,11 +265,15 @@ impl WebApp {
             .append_pair("redirect_uri", &redirect_uri)
             .append_pair("scope", &self.scopes.join(" "))
             .append_pair("state", &state);
-        let response = redirect_response(&format!(
+        let mut response = redirect_response(&format!(
             "{}?{}",
             self.authorization_endpoint,
             serializer.finish()
         ))?;
+        response.headers_mut().append(
+            SET_COOKIE,
+            self.redirect_state_cookie.store(&redirect_state)?,
+        );
         with_pending_cookies(request, response)
     }
 
@@ -298,9 +282,6 @@ impl WebApp {
         request: &mut Request<Body>,
         validator: Arc<dyn TokenValidator>,
     ) -> Result<Response> {
-        let session = session(request).ok_or_else(|| {
-            Error::Session(std::io::Error::other("missing tower-sessions Session extension").into())
-        })?;
         let query = request.uri().query().unwrap_or_default().to_owned();
         let redirect_uri = self.redirect_uri(request)?;
         let params = form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>();
@@ -313,19 +294,14 @@ impl WebApp {
         }
         let code = value(&params, "code").ok_or(Error::InvalidAuthorizationHeader)?;
         let state = value(&params, "state").ok_or(Error::InvalidAuthorizationHeader)?;
-        let expected_state = session
-            .get::<String>(STATE_KEY)
-            .await
-            .map_err(session_error)?
+        let redirect_state = self
+            .redirect_state_cookie
+            .load(request)?
             .ok_or(Error::InvalidAuthorizationHeader)?;
-        if expected_state != state {
-            debug!("OIDC callback state did not match session state");
+        if redirect_state.state != state {
+            debug!("OIDC callback state did not match redirect-state cookie");
             return Err(Error::InvalidAuthorizationHeader);
         }
-        session
-            .remove::<String>(STATE_KEY)
-            .await
-            .map_err(session_error)?;
 
         let token_response = self.exchange_code(&code, &redirect_uri).await?;
         trace!(
@@ -335,12 +311,13 @@ impl WebApp {
         let authenticated = self
             .validated_tokens(token_response, validator, None)
             .await?;
-        let redirect_to = session
-            .remove::<String>(ORIGINAL_URI_KEY)
-            .await
-            .map_err(session_error)?
+        let redirect_to = redirect_state
+            .original_uri
             .unwrap_or_else(|| "/".to_owned());
         let mut response = redirect_response(&redirect_to)?;
+        response
+            .headers_mut()
+            .append(SET_COOKIE, self.redirect_state_cookie.clear()?);
         store_authentication_cookie(&self.token_state_cookie, &mut response, &authenticated)?;
 
         trace!(
@@ -590,10 +567,6 @@ fn path_matches(configured: &str, actual: &str) -> bool {
     configured == actual
 }
 
-fn session(request: &Request<Body>) -> Option<Session> {
-    request.extensions().get::<Session>().cloned()
-}
-
 #[derive(Clone)]
 pub(crate) struct PendingWebAppCookies(Vec<HeaderValue>);
 
@@ -626,13 +599,11 @@ fn with_pending_cookies(request: &mut Request<Body>, mut response: Response) -> 
     Ok(response)
 }
 
-async fn store_authentication(
-    session: &Session,
+fn store_authentication(
     request: &mut Request<Body>,
     token_state_cookie: &CookieTokenStateManager,
     authenticated: &AuthenticatedTokens,
 ) -> Result<()> {
-    clear_session_authentication(session).await?;
     queue_cookie(request, token_state_cookie.store(authenticated)?);
     Ok(())
 }
@@ -648,62 +619,10 @@ fn store_authentication_cookie(
     Ok(())
 }
 
-async fn migrate_session_authentication(
-    session: &Session,
+fn clear_authentication(
     request: &mut Request<Body>,
     token_state_cookie: &CookieTokenStateManager,
 ) -> Result<()> {
-    let stored_principal = session
-        .get::<StoredPrincipal>(PRINCIPAL_KEY)
-        .await
-        .map_err(session_error)?;
-    let stored_id_token = session
-        .get::<StoredIdToken>(ID_TOKEN_KEY)
-        .await
-        .map_err(session_error)?;
-    let stored_token_state = session
-        .get::<StoredTokenState>(TOKEN_STATE_KEY)
-        .await
-        .map_err(session_error)?;
-    let Some(stored_principal) = stored_principal else {
-        return Ok(());
-    };
-    let Some(stored_token_state) = stored_token_state else {
-        debug!("legacy web-app session principal did not include token state");
-        clear_authentication(session, request, token_state_cookie).await?;
-        return Ok(());
-    };
-    let authentication = StoredAuthentication {
-        principal: stored_principal,
-        id_token: stored_id_token,
-        token_state: stored_token_state,
-    };
-    queue_cookie(request, token_state_cookie.store_stored(&authentication)?);
-    clear_session_authentication(session).await
-}
-
-async fn clear_session_authentication(session: &Session) -> Result<()> {
-    session
-        .remove::<StoredPrincipal>(PRINCIPAL_KEY)
-        .await
-        .map_err(session_error)?;
-    session
-        .remove::<StoredIdToken>(ID_TOKEN_KEY)
-        .await
-        .map_err(session_error)?;
-    session
-        .remove::<StoredTokenState>(TOKEN_STATE_KEY)
-        .await
-        .map_err(session_error)?;
-    Ok(())
-}
-
-async fn clear_authentication(
-    session: &Session,
-    request: &mut Request<Body>,
-    token_state_cookie: &CookieTokenStateManager,
-) -> Result<()> {
-    clear_session_authentication(session).await?;
     queue_cookie(request, token_state_cookie.clear()?);
     Ok(())
 }
@@ -828,6 +747,78 @@ impl CookieTokenStateManager {
     }
 }
 
+#[derive(Clone)]
+struct RedirectStateCookieManager {
+    key: Key,
+}
+
+impl RedirectStateCookieManager {
+    fn new(configured_key: Option<&str>) -> crate::BuildResult<Self> {
+        let key = match configured_key {
+            Some(configured_key) => key_from_config(configured_key)?,
+            None => generated_cookie_key()?,
+        };
+        debug!(
+            has_configured_key = configured_key.is_some(),
+            max_age_secs = REDIRECT_STATE_COOKIE_MAX_AGE_SECS,
+            "configured web-app redirect-state cookie manager"
+        );
+        Ok(Self { key })
+    }
+
+    fn load(&self, request: &Request<Body>) -> Result<Option<RedirectState>> {
+        let jar = request_cookie_jar(request);
+        let Some(cookie) = jar.private(&self.key).get(REDIRECT_STATE_COOKIE_NAME) else {
+            trace!("web-app redirect-state cookie was not present or could not be decrypted");
+            return Ok(None);
+        };
+        trace!("loaded encrypted web-app redirect-state cookie");
+        serde_json::from_str(cookie.value())
+            .map(Some)
+            .map_err(session_error)
+    }
+
+    fn store(&self, redirect_state: &RedirectState) -> Result<HeaderValue> {
+        let value = serde_json::to_string(redirect_state).map_err(session_error)?;
+        let mut jar = CookieJar::new();
+        trace!(
+            has_original_uri = redirect_state.original_uri.is_some(),
+            max_age_secs = REDIRECT_STATE_COOKIE_MAX_AGE_SECS,
+            "storing web-app redirect state in encrypted cookie"
+        );
+        jar.private_mut(&self.key)
+            .add(self.cookie_builder(value).build());
+        let encrypted = jar.get(REDIRECT_STATE_COOKIE_NAME).ok_or_else(|| {
+            session_error(std::io::Error::other(
+                "redirect-state cookie was not created",
+            ))
+        })?;
+        header_value(encrypted.encoded().to_string())
+    }
+
+    fn clear(&self) -> Result<HeaderValue> {
+        trace!("clearing web-app redirect-state cookie");
+        header_value(
+            Cookie::build((REDIRECT_STATE_COOKIE_NAME, ""))
+                .path("/")
+                .http_only(true)
+                .same_site(SameSite::Lax)
+                .max_age(CookieDuration::ZERO)
+                .build()
+                .encoded()
+                .to_string(),
+        )
+    }
+
+    fn cookie_builder(&self, value: String) -> cookie::CookieBuilder<'static> {
+        Cookie::build((REDIRECT_STATE_COOKIE_NAME, value))
+            .path("/")
+            .http_only(true)
+            .same_site(SameSite::Lax)
+            .max_age(CookieDuration::seconds(REDIRECT_STATE_COOKIE_MAX_AGE_SECS))
+    }
+}
+
 fn request_cookie_jar(request: &Request<Body>) -> CookieJar {
     let mut jar = CookieJar::new();
     let mut parsed = 0_usize;
@@ -849,7 +840,7 @@ fn request_cookie_jar(request: &Request<Body>) -> CookieJar {
     trace!(
         parsed_cookies = parsed,
         ignored_cookie_segments = ignored,
-        "parsed request cookies for web-app token state"
+        "parsed request cookies for web-app state"
     );
     jar
 }
@@ -959,6 +950,12 @@ struct StoredAuthentication {
     principal: StoredPrincipal,
     id_token: Option<StoredIdToken>,
     token_state: StoredTokenState,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RedirectState {
+    state: String,
+    original_uri: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
