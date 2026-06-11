@@ -42,7 +42,7 @@ use axum::body::Body;
 use axum::response::Response;
 #[cfg(feature = "web-app")]
 use axum::routing::MethodRouter;
-use http::Request;
+use http::{HeaderName, Request};
 #[cfg(all(feature = "http-client", feature = "jwt"))]
 use jsonwebtoken::jwk::JwkSet;
 use mp_config::Config;
@@ -77,6 +77,7 @@ enum WebAppPrincipal {
 pub struct Oidc {
     pub(crate) config: OidcConfig,
     validator: Arc<dyn TokenValidator>,
+    pub(crate) token_header_name: Option<HeaderName>,
     #[cfg(feature = "web-app")]
     web_app: Option<Arc<WebApp>>,
 }
@@ -422,7 +423,7 @@ impl Oidc {
     }
 
     async fn authenticate_principal(&self, request: &mut Request<Body>) -> Result<usize> {
-        let token = bearer_token(request, &self.config.token)?;
+        let token = bearer_token(request, &self.config.token, self.token_header_name.as_ref())?;
         trace!(path = %request.uri().path(), "validating extracted OIDC token");
         let principal = self.validator.validate(token).await?;
         let groups = principal.groups().count();
@@ -455,7 +456,13 @@ impl Oidc {
                     {
                         return self.authenticate_web_app(request).await;
                     }
-                    if unverified_token_from_request(request, &self.config.token).is_some() {
+                    if unverified_token_from_request(
+                        request,
+                        &self.config.token,
+                        self.token_header_name.as_ref(),
+                    )
+                    .is_some()
+                    {
                         self.authenticate(request).await?;
                         return Ok(None);
                     }
@@ -1238,9 +1245,11 @@ impl OidcBuilder {
         #[cfg(not(feature = "web-app"))]
         let has_web_app = false;
         debug!(has_validator, has_web_app, "building OIDC middleware");
+        let token_header_name = self.config.token.header.parse::<HeaderName>().ok();
         Oidc {
             config: self.config,
             validator: self.validator.unwrap_or_else(|| Arc::new(RejectAllTokens)),
+            token_header_name,
             #[cfg(feature = "web-app")]
             web_app: self.web_app,
         }

@@ -447,8 +447,12 @@ impl RegisteredTenant {
     }
 
     fn unverified_request_issuer(&self, request: &Request<Body>) -> Option<String> {
-        unverified_token_from_request(request, &self.oidc.config.token)
-            .and_then(unverified_token_issuer)
+        unverified_token_from_request(
+            request,
+            &self.oidc.config.token,
+            self.oidc.token_header_name.as_ref(),
+        )
+        .and_then(unverified_token_issuer)
     }
 }
 

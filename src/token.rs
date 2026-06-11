@@ -3,9 +3,8 @@ use axum::body::Body;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::header::AUTHORIZATION;
-use http::{HeaderValue, Request};
+use http::{HeaderName, HeaderValue, Request};
 use serde_json::Value;
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
@@ -34,10 +33,13 @@ fn is_http_token_char(byte: u8) -> bool {
     )
 }
 
-pub(crate) fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) -> Result<Arc<str>> {
-    let header_name = http::HeaderName::from_str(&config.header)
-        .map_err(|_| Error::InvalidAuthorizationHeader)?;
-    let Some(header) = request.headers().get(&header_name) else {
+pub(crate) fn bearer_token(
+    request: &Request<Body>,
+    config: &OidcTokenConfig,
+    header_name: Option<&HeaderName>,
+) -> Result<Arc<str>> {
+    let header_name = header_name.ok_or(Error::InvalidAuthorizationHeader)?;
+    let Some(header) = request.headers().get(header_name) else {
         trace!(
             configured_header = %config.header,
             "authorization token header was not present"
@@ -68,9 +70,10 @@ pub(crate) fn bearer_token(request: &Request<Body>, config: &OidcTokenConfig) ->
 pub(crate) fn unverified_token_from_request<'a>(
     request: &'a Request<Body>,
     config: &OidcTokenConfig,
+    header_name: Option<&HeaderName>,
 ) -> Option<&'a str> {
-    let header_name = http::HeaderName::from_str(&config.header).ok()?;
-    let header = request.headers().get(&header_name)?;
+    let header_name = header_name?;
+    let header = request.headers().get(header_name)?;
     if header.as_bytes().len() > MAX_AUTHORIZATION_HEADER_BYTES {
         return None;
     }
