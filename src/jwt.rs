@@ -209,6 +209,10 @@ impl TokenValidator for JwtValidator {
 fn apply_validation_config(validation: &mut Validation, config: &OidcConfig) {
     validation.leeway = config.token.lifespan_grace.unwrap_or_default();
 
+    // OpenID Connect Core 1.0 ID Token validation requires exact issuer
+    // matching and audience validation against the client. For bearer services
+    // the same checks are applied to access-token JWTs when configured; Quarkus
+    // exposes the same escape hatch with `token.issuer=any` and `audience=any`.
     let issuer = config
         .token
         .issuer
@@ -248,6 +252,11 @@ fn apply_jwks_algorithm_config(validation: &mut Validation, jwks: &JwkSet, confi
         return;
     }
 
+    // Discovery metadata points clients at the provider JWKS. Restricting the
+    // accepted algorithms to JWK `alg` values, when present, keeps validation
+    // aligned with the provider-published key material while still allowing
+    // providers that omit `alg` to fall back to jsonwebtoken's configured
+    // default.
     let algorithms = supported_algorithms(jwks);
     if !algorithms.is_empty() {
         trace!(algorithms = ?algorithms, "configuring JWT algorithms from JWKS metadata");

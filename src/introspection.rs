@@ -97,9 +97,11 @@ fn token_looks_like_jwt(token: &str) -> bool {
 /// issuer, audience, token type, age, required claims, principal selection, and
 /// role extraction are all applied after the provider says the token is active.
 ///
-/// The standard `active` member controls whether the token is accepted. Common
-/// JWT-style members are modelled directly and remaining claims are preserved
-/// for role, principal, and required-claim extraction.
+/// RFC 7662 Section 2.2 makes the `active` member the normative acceptance
+/// gate; inactive responses are not protocol errors and must be rejected
+/// without relying on any other fields. Common JWT-style members are modelled
+/// directly and remaining claims are preserved for role, principal, and
+/// required-claim extraction.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct IntrospectionResponse {
     /// Whether the token is currently active.

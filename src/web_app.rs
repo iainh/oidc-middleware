@@ -310,6 +310,12 @@ impl WebApp {
         };
 
         let mut serializer = form_urlencoded::Serializer::new(String::new());
+        // OpenID Connect Core 1.0 Section 3.1.2.1 requires `scope` with
+        // `openid`, `response_type=code`, `client_id`, and the `redirect_uri`
+        // used for the token request. Section 3.1.2.2 leaves `state`
+        // RECOMMENDED; Quarkus and Payara both bind the code flow to local
+        // state. We store that state in an encrypted cookie instead of sending
+        // a nonce, which is optional for Authorization Code Flow unless sent.
         serializer
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.client_id)
@@ -360,6 +366,10 @@ impl WebApp {
             return Err(Error::InvalidAuthorizationHeader);
         }
 
+        // OpenID Connect Core 1.0 Section 3.1.3.1 requires the authorization
+        // code grant token request to include the code and redirect_uri used in
+        // the Authentication Request. The state check above is the local
+        // correlation guard before exchanging the code.
         let token_response = self.exchange_code(&code, &redirect_uri).await?;
         trace!(
             has_id_token = token_response.id_token.is_some(),
@@ -421,6 +431,10 @@ impl WebApp {
             has_client_secret = self.client_secret.is_some(),
             "sending OIDC token endpoint request"
         );
+        // OpenID Connect Core 1.0 Section 9 defines client authentication for
+        // token endpoint calls. This maps the Quarkus-compatible
+        // `credentials.client-secret.method` setting to the common
+        // client_secret_basic, client_secret_post, and query-parameter shapes.
         let request = match (self.client_secret.as_deref(), self.client_secret_method) {
             (Some(secret), ClientSecretMethod::Basic) => self
                 .client
@@ -487,6 +501,11 @@ impl WebApp {
             previous_refresh_token = previous_refresh_token.is_some(),
             "validating OIDC web-app token response"
         );
+        // OpenID Connect Core 1.0 Section 3.1.3.7 requires ID Token validation
+        // after a successful code exchange. Access-token validation is
+        // deliberately application-specific in Section 3.1.3.8, so the same
+        // configured validator is used for both token shapes and provider
+        // conventions can be selected by configuration.
         let validated_id_token = match token_response.id_token.as_deref() {
             Some(raw) => Some(validate_id_token(raw, validator.clone()).await?),
             None => None,
@@ -545,6 +564,10 @@ impl WebApp {
             None
         };
 
+        // RP-Initiated Logout 1.0 defines `id_token_hint` and
+        // `post_logout_redirect_uri`. Quarkus and Payara both treat provider
+        // notification as an optional redirect to the discovered or configured
+        // end-session endpoint after clearing local RP state.
         let mut response = match self.end_session_endpoint.as_deref() {
             Some(endpoint) => {
                 self.end_session_redirect(&request, endpoint, id_token_hint, options)?
@@ -842,6 +865,10 @@ async fn validate_id_token(
     validator: Arc<dyn TokenValidator>,
 ) -> Result<(IdToken, Principal)> {
     trace!("validating OIDC ID token from web-app token response");
+    // The validator enforces signature, issuer, audience, exp, and iat policy.
+    // If this crate starts sending a nonce in the Authentication Request,
+    // OpenID Connect Core 1.0 Section 3.1.3.7 requires checking the returned
+    // ID Token `nonce` here against the stored redirect state.
     let principal = validator.validate(Arc::from(token.to_owned())).await?;
     let claims = decode_id_token_claims(token)?;
     trace!(

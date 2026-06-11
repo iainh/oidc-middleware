@@ -7,7 +7,8 @@ use serde::Deserialize;
 /// This models the provider fields this crate needs rather than the full OIDC
 /// discovery document. Unknown metadata is ignored; endpoint-specific features
 /// are enabled only when the corresponding field is present or explicitly
-/// configured.
+/// configured. The field names follow OpenID Connect Discovery 1.0 Section 3,
+/// with `end_session_endpoint` included for RP-Initiated Logout discovery.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct ProviderMetadata {
     /// Canonical issuer returned by the provider.
