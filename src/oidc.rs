@@ -311,31 +311,29 @@ impl Oidc {
     }
 
     pub(crate) async fn authenticate(&self, request: &mut Request<Body>) -> Result<()> {
-        let method = request.method().clone();
-        let path = request.uri().path().to_owned();
-        trace!(%method, path = %path, "starting bearer-service authentication");
+        trace!(method = %request.method(), path = %request.uri().path(), "starting bearer-service authentication");
         if !self.config.enabled {
-            debug!(%method, path = %path, "OIDC middleware is disabled; request is passed through");
+            debug!(method = %request.method(), path = %request.uri().path(), "OIDC middleware is disabled; request is passed through");
             return Ok(());
         }
 
         if !self.config.tenant_enabled {
-            debug!(%method, path = %path, "OIDC tenant is disabled; request will be hidden");
+            debug!(method = %request.method(), path = %request.uri().path(), "OIDC tenant is disabled; request will be hidden");
             return Err(Error::TenantDisabled);
         }
 
         match self.authenticate_principal(request).await {
             Ok(groups) => {
                 trace!(
-                    %method,
-                    path = %path,
+                    method = %request.method(),
+                    path = %request.uri().path(),
                     groups,
                     "bearer-service authentication succeeded"
                 );
                 Ok(())
             }
             Err(error) => {
-                debug!(%method, path = %path, error = %error, "bearer-service authentication failed");
+                debug!(method = %request.method(), path = %request.uri().path(), error = %error, "bearer-service authentication failed");
                 Err(error)
             }
         }
@@ -346,21 +344,19 @@ impl Oidc {
         &self,
         request: &mut Request<Body>,
     ) -> Result<Option<Response>> {
-        let method = request.method().clone();
-        let path = request.uri().path().to_owned();
-        trace!(%method, path = %path, "starting web-app authentication");
+        trace!(method = %request.method(), path = %request.uri().path(), "starting web-app authentication");
         if !self.config.enabled {
-            debug!(%method, path = %path, "OIDC web-app middleware is disabled; request is passed through");
+            debug!(method = %request.method(), path = %request.uri().path(), "OIDC web-app middleware is disabled; request is passed through");
             return Ok(None);
         }
 
         if !self.config.tenant_enabled {
-            debug!(%method, path = %path, "OIDC web-app tenant is disabled; request will be hidden");
+            debug!(method = %request.method(), path = %request.uri().path(), "OIDC web-app tenant is disabled; request will be hidden");
             return Err(Error::TenantDisabled);
         }
 
         let Some(web_app) = &self.web_app else {
-            debug!(%method, path = %path, "web-app middleware has no authorization-code endpoints configured");
+            debug!(method = %request.method(), path = %request.uri().path(), "web-app middleware has no authorization-code endpoints configured");
             return Err(Error::Session(
                 std::io::Error::other(
                     "`web-app` requires provider discovery or configured authorization and token endpoints",
@@ -370,11 +366,11 @@ impl Oidc {
         };
 
         if web_app.is_callback(request) {
-            debug!(%method, path = %path, "handling OIDC web-app callback");
+            debug!(method = %request.method(), path = %request.uri().path(), "handling OIDC web-app callback");
             return match web_app.callback(request, self.validator.clone()).await {
                 Ok(response) => Ok(Some(response)),
                 Err(error) => {
-                    warn!(%method, path = %path, error = %error, "OIDC web-app callback failed");
+                    warn!(method = %request.method(), path = %request.uri().path(), error = %error, "OIDC web-app callback failed");
                     Err(error)
                 }
             };
@@ -382,11 +378,11 @@ impl Oidc {
 
         match self.web_app_principal_or_redirect(request, web_app).await? {
             WebAppPrincipal::Authenticated => {
-                trace!(%method, path = %path, "web-app token-state authentication succeeded");
+                trace!(method = %request.method(), path = %request.uri().path(), "web-app token-state authentication succeeded");
                 Ok(None)
             }
             WebAppPrincipal::Redirect(response) => {
-                debug!(%method, path = %path, "web-app request requires authorization redirect");
+                debug!(method = %request.method(), path = %request.uri().path(), "web-app request requires authorization redirect");
                 Ok(Some(response))
             }
         }

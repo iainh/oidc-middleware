@@ -551,9 +551,9 @@ impl WebApp {
         absolute_request_uri(request, &self.redirect_path, "OIDC redirect URI")
     }
 
-    fn logout(&self, request: Request<Body>, options: &OidcLogoutOptions) -> Result<Response> {
+    fn logout(&self, request: &Request<Body>, options: &OidcLogoutOptions) -> Result<Response> {
         let id_token_hint = if options.id_token_hint {
-            match self.token_state_cookie.load(&request) {
+            match self.token_state_cookie.load(request) {
                 Ok(authentication) => authentication
                     .and_then(|authentication| authentication.id_token)
                     .and_then(|id_token| id_token.raw),
@@ -572,7 +572,7 @@ impl WebApp {
         // end-session endpoint after clearing local RP state.
         let mut response = match self.end_session_endpoint.as_deref() {
             Some(endpoint) => {
-                self.end_session_redirect(&request, endpoint, id_token_hint, options)?
+                self.end_session_redirect(request, endpoint, id_token_hint, options)?
             }
             None => {
                 let location = options
@@ -774,16 +774,14 @@ impl Service<Request<Body>> for OidcCallbackService {
         let authorization_scheme = self.authorization_scheme.clone();
 
         Box::pin(async move {
-            let method = request.method().clone();
-            let path = request.uri().path().to_owned();
             let response = web_app
                 .callback(&mut request, validator)
                 .await
                 .unwrap_or_else(|error| {
                     error.into_response_with_scheme_for_request(
                         &authorization_scheme,
-                        &method,
-                        &path,
+                        request.method(),
+                        request.uri().path(),
                     )
                 });
             Ok(response)
@@ -834,14 +832,16 @@ impl Service<Request<Body>> for OidcLogoutService {
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let method = request.method().clone();
-        let path = request.uri().path().to_owned();
         let response = match &self.web_app {
-            Some(web_app) => web_app.logout(request, &self.options),
+            Some(web_app) => web_app.logout(&request, &self.options),
             None => local_logout_response(&self.options),
         }
         .unwrap_or_else(|error| {
-            error.into_response_with_scheme_for_request(&self.authorization_scheme, &method, &path)
+            error.into_response_with_scheme_for_request(
+                &self.authorization_scheme,
+                request.method(),
+                request.uri().path(),
+            )
         });
         ready(Ok(response))
     }
