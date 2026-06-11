@@ -6677,9 +6677,7 @@ fn jwt_value_with_header(
     include_default_iat: bool,
 ) -> String {
     let mut claims = serde_json::to_value(claims).expect("test claims should serialize");
-    if include_default_iat
-        && let Value::Object(claims) = &mut claims
-    {
+    if include_default_iat && let Value::Object(claims) = &mut claims {
         claims.entry("iat").or_insert_with(|| Value::from(TEST_IAT));
     }
     encode(&header, &claims, &EncodingKey::from_secret(b"secret"))
