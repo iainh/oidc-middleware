@@ -509,9 +509,11 @@ where
             match tenant.authenticate_or_response(&mut request).await {
                 Ok(Some(response)) => Ok(response),
                 Ok(None) => inner.call(request).await,
-                Err(error) => {
-                    Ok(error.into_response_with_scheme(&tenant.config.token.authorization_scheme))
-                }
+                Err(error) => Ok(error.into_response_with_scheme_for_request(
+                    &tenant.config.token.authorization_scheme,
+                    request.method(),
+                    request.uri().path(),
+                )),
             }
         })
     }

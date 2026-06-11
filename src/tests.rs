@@ -1846,6 +1846,53 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
     assert!(query.get("state").is_some());
 }
 
+#[tokio::test]
+async fn web_app_returns_internal_error_without_session_extension() {
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            redirect_path: "/login/callback".to_owned(),
+            restore_path_after_redirect: true,
+            session_age_extension: Duration::from_secs(300),
+            token_state_cookie_key: None,
+            scopes: vec!["openid".to_owned()],
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some("https://issuer.example/realms/app/token".to_owned()),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        JwkSet { keys: vec![] },
+    )
+    .expect("web-app provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
 #[test]
 fn web_app_rejects_invalid_token_state_cookie_key() {
     let Err(error) = Oidc::builder(OidcConfig {

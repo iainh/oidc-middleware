@@ -1,9 +1,10 @@
 use crate::{BoxError, WellKnownProvider};
 use axum::response::{IntoResponse, Response};
 use http::header::WWW_AUTHENTICATE;
-use http::{HeaderValue, StatusCode};
+use http::{HeaderValue, Method, StatusCode};
 use std::error::Error as StdError;
 use std::fmt;
+use tracing::error;
 
 /// Error type returned while authenticating a request.
 ///
@@ -67,8 +68,14 @@ impl Error {
         HeaderValue::from_str(&value).unwrap_or_else(|_| self.challenge())
     }
 
-    pub(crate) fn into_response_with_scheme(self, scheme: &str) -> Response {
+    pub(crate) fn into_response_with_scheme_for_request(
+        self,
+        scheme: &str,
+        method: &Method,
+        path: &str,
+    ) -> Response {
         let status = self.status();
+        self.log_opaque_server_error_for_request(status, method, path);
         let mut response = status.into_response();
         if status == StatusCode::UNAUTHORIZED {
             response
@@ -76,6 +83,28 @@ impl Error {
                 .insert(WWW_AUTHENTICATE, self.challenge_with_scheme(scheme));
         }
         response
+    }
+
+    fn log_opaque_server_error(&self, status: StatusCode) {
+        if status.is_server_error() {
+            error!(
+                status = status.as_u16(),
+                error = %self,
+                "OIDC authentication failed with an opaque server error response"
+            );
+        }
+    }
+
+    fn log_opaque_server_error_for_request(&self, status: StatusCode, method: &Method, path: &str) {
+        if status.is_server_error() {
+            error!(
+                %method,
+                path,
+                status = status.as_u16(),
+                error = %self,
+                "OIDC authentication failed with an opaque server error response"
+            );
+        }
     }
 }
 
@@ -106,6 +135,7 @@ impl StdError for Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = self.status();
+        self.log_opaque_server_error(status);
         let mut response = status.into_response();
         if status == StatusCode::UNAUTHORIZED {
             response

@@ -1102,7 +1102,11 @@ where
                     }
                     Ok(response)
                 }
-                Err(error) => Ok(error.into_response_with_scheme(&authorization_scheme)),
+                Err(error) => Ok(error.into_response_with_scheme_for_request(
+                    &authorization_scheme,
+                    request.method(),
+                    request.uri().path(),
+                )),
             }
         })
     }
