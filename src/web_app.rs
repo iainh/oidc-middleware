@@ -101,6 +101,8 @@ impl WebApp {
             has_token_state_cookie_key = config.authentication.token_state_cookie_key.is_some(),
             "configured OIDC web-app flow"
         );
+        let configured_cookie_key = config.authentication.token_state_cookie_key.as_deref();
+        let cookie_key = web_app_cookie_key(configured_cookie_key)?;
         Ok(Self {
             client,
             client_id: config
@@ -124,14 +126,16 @@ impl WebApp {
             session_age_extension: config.authentication.session_age_extension.as_secs(),
             scopes: config.authentication.scopes.clone(),
             token_state_cookie: CookieTokenStateManager::new(
-                config.authentication.token_state_cookie_key.as_deref(),
+                cookie_key.clone(),
+                configured_cookie_key.is_some(),
                 config.token.lifespan_grace.unwrap_or_default(),
                 config.authentication.session_age_extension.as_secs(),
                 config.token.refresh_expired || config.token.refresh_token_time_skew.is_some(),
             )?,
             redirect_state_cookie: RedirectStateCookieManager::new(
-                config.authentication.token_state_cookie_key.as_deref(),
-            )?,
+                cookie_key,
+                configured_cookie_key.is_some(),
+            ),
         })
     }
 
@@ -292,14 +296,20 @@ impl WebApp {
                 std::io::Error::other(format!("authorization endpoint returned `{error}`")).into(),
             ));
         }
-        let code = value(&params, "code").ok_or(Error::InvalidAuthorizationHeader)?;
-        let state = value(&params, "state").ok_or(Error::InvalidAuthorizationHeader)?;
-        let redirect_state = self
-            .redirect_state_cookie
-            .load(request)?
-            .ok_or(Error::InvalidAuthorizationHeader)?;
+        let code = value(&params, "code").ok_or_else(|| {
+            warn!("OIDC callback did not include an authorization code");
+            Error::InvalidAuthorizationHeader
+        })?;
+        let state = value(&params, "state").ok_or_else(|| {
+            warn!("OIDC callback did not include a state parameter");
+            Error::InvalidAuthorizationHeader
+        })?;
+        let redirect_state = self.redirect_state_cookie.load(request)?.ok_or_else(|| {
+            warn!("OIDC callback did not include a readable redirect-state cookie");
+            Error::InvalidAuthorizationHeader
+        })?;
         if redirect_state.state != state {
-            debug!("OIDC callback state did not match redirect-state cookie");
+            warn!("OIDC callback state did not match redirect-state cookie");
             return Err(Error::InvalidAuthorizationHeader);
         }
 
@@ -649,17 +659,14 @@ struct CookieTokenStateManager {
 
 impl CookieTokenStateManager {
     fn new(
-        configured_key: Option<&str>,
+        key: Key,
+        has_configured_key: bool,
         lifespan_grace: u64,
         session_age_extension: u64,
         refresh_enabled: bool,
     ) -> crate::BuildResult<Self> {
-        let key = match configured_key {
-            Some(configured_key) => key_from_config(configured_key)?,
-            None => generated_cookie_key()?,
-        };
         debug!(
-            has_configured_key = configured_key.is_some(),
+            has_configured_key,
             lifespan_grace_secs = lifespan_grace,
             session_age_extension_secs = session_age_extension,
             refresh_enabled,
@@ -765,17 +772,13 @@ struct RedirectStateCookieManager {
 }
 
 impl RedirectStateCookieManager {
-    fn new(configured_key: Option<&str>) -> crate::BuildResult<Self> {
-        let key = match configured_key {
-            Some(configured_key) => key_from_config(configured_key)?,
-            None => generated_cookie_key()?,
-        };
+    fn new(key: Key, has_configured_key: bool) -> Self {
         debug!(
-            has_configured_key = configured_key.is_some(),
+            has_configured_key,
             max_age_secs = REDIRECT_STATE_COOKIE_MAX_AGE_SECS,
             "configured web-app redirect-state cookie manager"
         );
-        Ok(Self { key })
+        Self { key }
     }
 
     fn load(&self, request: &Request<Body>) -> Result<Option<RedirectState>> {
@@ -857,12 +860,21 @@ fn request_cookie_jar(request: &Request<Body>) -> CookieJar {
     jar
 }
 
+fn web_app_cookie_key(configured_key: Option<&str>) -> crate::BuildResult<Key> {
+    match configured_key {
+        Some(configured_key) => key_from_config(configured_key),
+        None => generated_cookie_key(),
+    }
+}
+
 fn generated_cookie_key() -> crate::BuildResult<Key> {
     let mut bytes = [0_u8; 64];
     getrandom::getrandom(&mut bytes).map_err(|error| BuildError::InvalidConfiguration {
         message: format!("failed to generate web-app token-state cookie key: {error}"),
     })?;
-    debug!("generated ephemeral web-app token-state cookie key");
+    warn!(
+        "generated ephemeral web-app cookie key; configure oidc.authentication.token-state-cookie-key when callbacks can be handled by another process or middleware instance"
+    );
     Ok(Key::from(&bytes))
 }
 

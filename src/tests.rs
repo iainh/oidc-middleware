@@ -2152,6 +2152,88 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
 }
 
 #[tokio::test]
+async fn hybrid_callback_uses_web_app_flow_without_bearer_token() {
+    let token = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice",
+            "iss": "https://issuer.example/realms/app",
+            "aud": "orders-web",
+            "exp": 4_102_444_800_u64,
+            "groups": [],
+            "realm_access": { "roles": [] },
+            "email": "alice@example.com",
+            "email_verified": true
+        }),
+    );
+    let token_endpoint = one_shot_token_endpoint("opaque-access-token".to_owned(), Some(token));
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::Hybrid,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            redirect_path: "/login/callback".to_owned(),
+            restore_path_after_redirect: true,
+            session_age_extension: Duration::from_secs(300),
+            token_state_cookie_key: None,
+            scopes: vec!["openid".to_owned()],
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some(token_endpoint),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        test_jwks(),
+    )
+    .expect("hybrid provider metadata should build");
+    let app = Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let cookie = cookie_header(&response);
+    let state = redirect_state(&response);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/login/callback?code=good-code&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_ne!(
+        response.headers().get(WWW_AUTHENTICATE),
+        Some(&HeaderValue::from_static("Bearer"))
+    );
+}
+
+#[tokio::test]
 async fn web_app_clears_tampered_token_state_cookie() {
     let token = jwt_with_kid_and_secret(
         "test-key",

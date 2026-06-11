@@ -18,7 +18,7 @@ use crate::jwks::HttpJwksProvider;
 use crate::provider::{auth_server_url_from_config, provider_validation_config};
 #[cfg(all(feature = "http-client", feature = "jwt"))]
 use crate::provider::{discovery_url, provider_endpoint_url};
-use crate::token::bearer_token;
+use crate::token::{bearer_token, unverified_token_from_request};
 #[cfg(feature = "http-client")]
 use crate::user_info::HttpUserInfoProvider;
 use crate::validator::RejectAllTokens;
@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 #[cfg(feature = "web-app")]
 enum WebAppPrincipal {
@@ -202,10 +202,13 @@ impl Oidc {
 
         if web_app.is_callback(request) {
             debug!(%method, path = %path, "handling OIDC web-app callback");
-            return web_app
-                .callback(request, self.validator.clone())
-                .await
-                .map(Some);
+            return match web_app.callback(request, self.validator.clone()).await {
+                Ok(response) => Ok(Some(response)),
+                Err(error) => {
+                    warn!(%method, path = %path, error = %error, "OIDC web-app callback failed");
+                    Err(error)
+                }
+            };
         }
 
         match self.web_app_principal_or_redirect(request, web_app).await? {
@@ -267,28 +270,56 @@ impl Oidc {
         &self,
         request: &mut Request<Body>,
     ) -> Result<Option<Response>> {
-        if self.config.application_type != ApplicationType::WebApp {
-            self.authenticate(request).await?;
-            return Ok(None);
-        }
+        match self.config.application_type {
+            ApplicationType::Service => {
+                self.authenticate(request).await?;
+                Ok(None)
+            }
+            ApplicationType::WebApp => self.authenticate_web_app_or_feature_error(request).await,
+            ApplicationType::Hybrid => {
+                #[cfg(feature = "web-app")]
+                {
+                    if self
+                        .web_app
+                        .as_ref()
+                        .is_some_and(|web_app| web_app.is_callback(request))
+                    {
+                        return self.authenticate_web_app(request).await;
+                    }
+                    if unverified_token_from_request(request, &self.config.token).is_some() {
+                        self.authenticate(request).await?;
+                        return Ok(None);
+                    }
+                    if self.web_app.is_some() {
+                        return self.authenticate_web_app(request).await;
+                    }
+                }
 
-        #[cfg(feature = "web-app")]
-        {
-            match self.authenticate_web_app(request).await {
-                Ok(response) => Ok(response),
-                Err(error) => Err(error),
+                self.authenticate(request).await?;
+                Ok(None)
             }
         }
+    }
 
-        #[cfg(not(feature = "web-app"))]
-        {
-            Err(Error::Session(
-                std::io::Error::other(
-                    "OIDC web-app authentication requires the `web-app` crate feature",
-                )
-                .into(),
-            ))
-        }
+    #[cfg(feature = "web-app")]
+    async fn authenticate_web_app_or_feature_error(
+        &self,
+        request: &mut Request<Body>,
+    ) -> Result<Option<Response>> {
+        self.authenticate_web_app(request).await
+    }
+
+    #[cfg(not(feature = "web-app"))]
+    async fn authenticate_web_app_or_feature_error(
+        &self,
+        _request: &mut Request<Body>,
+    ) -> Result<Option<Response>> {
+        Err(Error::Session(
+            std::io::Error::other(
+                "OIDC web-app authentication requires the `web-app` crate feature",
+            )
+            .into(),
+        ))
     }
 }
 
@@ -926,7 +957,7 @@ impl OidcBuilder {
 
     #[cfg(feature = "web-app")]
     fn install_web_app_from_config(&mut self, client: reqwest::Client) -> BuildResult<()> {
-        if self.config.application_type != ApplicationType::WebApp {
+        if self.config.application_type == ApplicationType::Service {
             return Ok(());
         }
         debug!("installing web-app support from configured endpoints");
@@ -936,7 +967,7 @@ impl OidcBuilder {
 
     #[cfg(all(feature = "http-client", feature = "jwt", not(feature = "web-app")))]
     fn install_web_app_from_config(&mut self, _client: reqwest::Client) -> BuildResult<()> {
-        if self.config.application_type == ApplicationType::WebApp {
+        if self.config.application_type != ApplicationType::Service {
             return Err(BuildError::WebAppFeatureDisabled);
         }
         Ok(())
@@ -948,7 +979,7 @@ impl OidcBuilder {
         metadata: &ProviderMetadata,
         client: reqwest::Client,
     ) -> BuildResult<()> {
-        if self.config.application_type != ApplicationType::WebApp {
+        if self.config.application_type == ApplicationType::Service {
             return Ok(());
         }
         debug!("installing web-app support from provider metadata");
@@ -967,7 +998,7 @@ impl OidcBuilder {
         _metadata: &ProviderMetadata,
         _client: reqwest::Client,
     ) -> BuildResult<()> {
-        if self.config.application_type == ApplicationType::WebApp {
+        if self.config.application_type != ApplicationType::Service {
             return Err(BuildError::WebAppFeatureDisabled);
         }
         Ok(())
