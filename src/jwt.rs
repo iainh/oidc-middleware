@@ -1,3 +1,4 @@
+use crate::claims::{ClaimPath, compile_claim_paths};
 use crate::jwks::{JwtKeys, supported_algorithms};
 use crate::validation_claims::{
     TokenClaims, validate_issued_at, validate_required_claims, validate_subject,
@@ -19,7 +20,7 @@ use tracing::{debug, trace};
 pub struct JwtValidator {
     keys: JwtKeys,
     validation: Validation,
-    role_claim_paths: Arc<[String]>,
+    role_claim_paths: Arc<[ClaimPath]>,
     role_claim_separator: Arc<str>,
     token_type: Option<Arc<str>>,
     subject_required: bool,
@@ -44,7 +45,7 @@ impl JwtValidator {
         Self {
             keys: JwtKeys::single(DecodingKey::from_secret(secret.as_ref())),
             validation,
-            role_claim_paths: Arc::from(role_claim_paths_for_source(
+            role_claim_paths: compile_claim_paths(&role_claim_paths_for_source(
                 config,
                 RolesSource::AccessToken,
             )),
@@ -73,7 +74,7 @@ impl JwtValidator {
         Self {
             keys: JwtKeys::set(jwks),
             validation,
-            role_claim_paths: Arc::from(role_claim_paths_for_source(
+            role_claim_paths: compile_claim_paths(&role_claim_paths_for_source(
                 config,
                 RolesSource::AccessToken,
             )),
@@ -98,7 +99,7 @@ impl JwtValidator {
         Ok(Self {
             keys: JwtKeys::single(key),
             validation,
-            role_claim_paths: Arc::from(role_claim_paths_for_source(
+            role_claim_paths: compile_claim_paths(&role_claim_paths_for_source(
                 config,
                 RolesSource::AccessToken,
             )),
@@ -128,7 +129,7 @@ impl JwtValidator {
         Self {
             keys: JwtKeys::refreshing(jwks, provider, config.token.forced_jwk_refresh_interval),
             validation,
-            role_claim_paths: Arc::from(role_claim_paths_for_source(
+            role_claim_paths: compile_claim_paths(&role_claim_paths_for_source(
                 config,
                 RolesSource::AccessToken,
             )),

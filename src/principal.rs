@@ -1,4 +1,4 @@
-use crate::claims::extract_roles;
+use crate::claims::{ClaimPath, extract_roles};
 use crate::validation_claims::{TokenClaims, principal_name};
 use crate::{Error, IdToken, Result};
 use axum::extract::FromRequestParts;
@@ -89,7 +89,7 @@ impl Principal {
 
     pub(crate) fn from_claims(
         claims: TokenClaims,
-        role_claim_paths: &[String],
+        role_claim_paths: &[ClaimPath],
         role_claim_separator: &str,
         principal_claim: Option<&str>,
     ) -> Result<Self> {

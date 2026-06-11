@@ -1,6 +1,7 @@
 #[cfg(feature = "http-client")]
 use crate::ClientSecretMethod;
 use crate::claims::deserialize_audience;
+use crate::claims::{ClaimPath, compile_claim_paths};
 use crate::validation_claims::{
     TokenClaims, validate_introspection_audience, validate_introspection_issuer,
     validate_issued_at, validate_required_claims, validate_subject, validate_token_age,
@@ -179,7 +180,7 @@ pub struct IntrospectionValidator {
     expected_issuer: Option<Arc<str>>,
     audiences: Arc<[String]>,
     accepts_any_audience: bool,
-    role_claim_paths: Arc<[String]>,
+    role_claim_paths: Arc<[ClaimPath]>,
     role_claim_separator: Arc<str>,
     token_type: Option<Arc<str>>,
     subject_required: bool,
@@ -217,7 +218,7 @@ impl IntrospectionValidator {
             expected_issuer,
             audiences: Arc::from(audiences.into_boxed_slice()),
             accepts_any_audience: config.token.accepts_any_audience(),
-            role_claim_paths: Arc::from(role_claim_paths_for_source(
+            role_claim_paths: compile_claim_paths(&role_claim_paths_for_source(
                 config,
                 RolesSource::AccessToken,
             )),

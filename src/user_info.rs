@@ -1,4 +1,4 @@
-use crate::claims::{deserialize_audience, extract_roles};
+use crate::claims::{ClaimPath, compile_claim_paths, deserialize_audience, extract_roles};
 use crate::validation_claims::{
     TokenClaims, validate_required_claims, validate_subject, validate_token_age,
 };
@@ -95,7 +95,7 @@ where
 #[derive(Clone)]
 pub struct UserInfoValidator {
     provider: Arc<dyn UserInfoProvider>,
-    role_claim_paths: Arc<[String]>,
+    role_claim_paths: Arc<[ClaimPath]>,
     role_claim_separator: Arc<str>,
     subject_required: bool,
     required_claims: Arc<HashMap<String, Vec<String>>>,
@@ -117,7 +117,10 @@ impl UserInfoValidator {
         );
         Self {
             provider: Arc::new(provider),
-            role_claim_paths: Arc::from(role_claim_paths_for_source(config, RolesSource::UserInfo)),
+            role_claim_paths: compile_claim_paths(&role_claim_paths_for_source(
+                config,
+                RolesSource::UserInfo,
+            )),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             subject_required: config.token.subject_required,
             required_claims: Arc::new(config.token.required_claims.clone()),
@@ -180,7 +183,7 @@ impl TokenValidator for UserInfoValidator {
 pub struct UserInfoRolesValidator {
     token_validator: Arc<dyn TokenValidator>,
     provider: Arc<dyn UserInfoProvider>,
-    role_claim_paths: Arc<[String]>,
+    role_claim_paths: Arc<[ClaimPath]>,
     role_claim_separator: Arc<str>,
 }
 
@@ -206,7 +209,10 @@ impl UserInfoRolesValidator {
         Self {
             token_validator,
             provider,
-            role_claim_paths: Arc::from(role_claim_paths_for_source(config, RolesSource::UserInfo)),
+            role_claim_paths: compile_claim_paths(&role_claim_paths_for_source(
+                config,
+                RolesSource::UserInfo,
+            )),
             role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
         }
     }

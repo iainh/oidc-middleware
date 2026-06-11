@@ -1,14 +1,44 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const MAX_CLAIM_PATH_BYTES: usize = 512;
 const MAX_CLAIM_PATH_PARTS: usize = 32;
 
-pub(crate) fn extract_roles(claims: &Value, paths: &[String], separator: &str) -> Vec<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClaimPath {
+    parts: Arc<[String]>,
+}
+
+impl ClaimPath {
+    pub(crate) fn new(path: &str) -> Self {
+        Self {
+            parts: Arc::from(claim_path_parts(path)),
+        }
+    }
+
+    pub(crate) fn value<'a>(&self, claims: &'a Value) -> Option<&'a Value> {
+        let mut value = claims;
+        for part in self.parts.iter() {
+            value = value.get(part)?;
+        }
+        Some(value)
+    }
+}
+
+pub(crate) fn compile_claim_paths(paths: &[String]) -> Arc<[ClaimPath]> {
+    paths
+        .iter()
+        .map(|path| ClaimPath::new(path))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+pub(crate) fn extract_roles(claims: &Value, paths: &[ClaimPath], separator: &str) -> Vec<String> {
     let mut roles = Vec::new();
     for path in paths {
-        if let Some(value) = claim_path_value(claims, path) {
+        if let Some(value) = path.value(claims) {
             collect_roles(value, &mut roles, separator);
         }
     }
