@@ -33,7 +33,7 @@ use crate::web_app::{
     OidcCallbackService, OidcLogoutOptions, OidcLogoutService, OidcWebAppRoutesOptions,
 };
 use crate::{
-    ApplicationType, Error, IntrospectionValidator, OidcConfig, Principal, Result, RolesSource,
+    ApplicationType, Error, IntrospectionValidator, OidcConfig, Result, RolesSource,
     TokenIntrospector, TokenValidator, UserInfoProvider, UserInfoValidator,
 };
 #[cfg(feature = "web-app")]
@@ -324,11 +324,11 @@ impl Oidc {
         }
 
         match self.authenticate_principal(request).await {
-            Ok(principal) => {
+            Ok(groups) => {
                 trace!(
                     %method,
                     path = %path,
-                    groups = principal.groups().count(),
+                    groups,
                     "bearer-service authentication succeeded"
                 );
                 Ok(())
@@ -421,17 +421,18 @@ impl Oidc {
             .map(WebAppPrincipal::Redirect)
     }
 
-    async fn authenticate_principal(&self, request: &mut Request<Body>) -> Result<Principal> {
+    async fn authenticate_principal(&self, request: &mut Request<Body>) -> Result<usize> {
         let token = bearer_token(request, &self.config.token)?;
         trace!(path = %request.uri().path(), "validating extracted OIDC token");
         let principal = self.validator.validate(token).await?;
-        request.extensions_mut().insert(principal.clone());
+        let groups = principal.groups().count();
+        request.extensions_mut().insert(principal);
         trace!(
             path = %request.uri().path(),
-            groups = principal.groups().count(),
+            groups,
             "inserted authenticated principal into request extensions"
         );
-        Ok(principal)
+        Ok(groups)
     }
 
     pub(crate) async fn authenticate_or_response(
