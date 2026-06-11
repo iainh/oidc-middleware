@@ -104,12 +104,12 @@ pub(crate) fn validate_required_claims(
     required_claims: &HashMap<String, Vec<String>>,
 ) -> Result<()> {
     for (claim_name, expected_values) in required_claims {
-        let actual_values = claim_string_values(claims, claim_name).ok_or_else(|| {
+        let actual_values = claim_values(claims, claim_name).ok_or_else(|| {
             Error::TokenRejected(format!("JWT claim `{claim_name}` is required").into())
         })?;
 
         for expected in expected_values {
-            if !actual_values.iter().any(|actual| actual == expected) {
+            if !actual_values.contains(expected) {
                 return Err(Error::TokenRejected(
                     format!("JWT claim `{claim_name}` did not include required value `{expected}`")
                         .into(),
@@ -194,30 +194,53 @@ fn claim_string_value(claims: &TokenClaims, claim_name: &str) -> Option<String> 
     }
 }
 
-fn claim_string_values(claims: &TokenClaims, claim_name: &str) -> Option<Vec<String>> {
-    match claim_name {
-        "sub" => claims.sub.clone().map(|subject| vec![subject]),
-        "iss" => claims.iss.clone().map(|issuer| vec![issuer]),
-        "aud" => Some(claims.aud.clone()),
-        "typ" => claims.typ.clone().map(|token_type| vec![token_type]),
-        "iat" => claims.iat.map(|issued_at| vec![issued_at.to_string()]),
-        _ => json_string_values(claim_path_value(&claims.extra, claim_name)?),
+enum ClaimValues<'a> {
+    Single(&'a str),
+    Audience(&'a [String]),
+    IssuedAt(String),
+    Json(&'a Value),
+}
+
+impl ClaimValues<'_> {
+    fn contains(&self, expected: &str) -> bool {
+        match self {
+            Self::Single(value) => *value == expected,
+            Self::Audience(audience) => audience.iter().any(|value| value == expected),
+            Self::IssuedAt(value) => value == expected,
+            Self::Json(value) => json_value_contains_string(value, expected).unwrap_or(false),
+        }
     }
 }
 
-fn json_string_values(value: &Value) -> Option<Vec<String>> {
+fn claim_values<'a>(claims: &'a TokenClaims, claim_name: &str) -> Option<ClaimValues<'a>> {
+    match claim_name {
+        "sub" => claims.sub.as_deref().map(ClaimValues::Single),
+        "iss" => claims.iss.as_deref().map(ClaimValues::Single),
+        "aud" => Some(ClaimValues::Audience(&claims.aud)),
+        "typ" => claims.typ.as_deref().map(ClaimValues::Single),
+        "iat" => claims
+            .iat
+            .map(|issued_at| ClaimValues::IssuedAt(issued_at.to_string())),
+        _ => Some(ClaimValues::Json(claim_path_value(
+            &claims.extra,
+            claim_name,
+        )?)),
+    }
+}
+
+fn json_value_contains_string(value: &Value, expected: &str) -> Option<bool> {
     match value {
         Value::String(value) => {
-            let mut values = vec![value.clone()];
-            values.extend(value.split_whitespace().map(ToOwned::to_owned));
-            values.sort();
-            values.dedup();
-            Some(values)
+            Some(value == expected || value.split_whitespace().any(|part| part == expected))
         }
-        Value::Array(values) => values
-            .iter()
-            .map(|value| value.as_str().map(ToOwned::to_owned))
-            .collect(),
+        Value::Array(values) => {
+            let mut found = false;
+            for value in values {
+                let value = value.as_str()?;
+                found |= value == expected;
+            }
+            Some(found)
+        }
         _ => None,
     }
 }
