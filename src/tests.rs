@@ -1828,6 +1828,55 @@ fn oidc_from_config_accepts_web_app_application_type() {
     let _builder = Oidc::from_config(&config).expect("web-app should be accepted");
 }
 
+fn web_app_redirect_test_app() -> Router {
+    let oidc = Oidc::builder(OidcConfig {
+        application_type: ApplicationType::WebApp,
+        client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            redirect_path: "/login/callback".to_owned(),
+            restore_path_after_redirect: true,
+            session_age_extension: Duration::from_secs(300),
+            token_state_cookie_key: None,
+            scopes: vec!["openid".to_owned()],
+        },
+        ..OidcConfig::default()
+    })
+    .provider_metadata(
+        ProviderMetadata {
+            issuer: Some("https://issuer.example/realms/app".to_owned()),
+            jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
+            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            token_endpoint: Some("https://issuer.example/realms/app/token".to_owned()),
+            registration_endpoint: None,
+            revocation_endpoint: None,
+            introspection_endpoint: None,
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+        },
+        JwkSet { keys: vec![] },
+    )
+    .expect("web-app provider metadata should build");
+
+    Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .layer(oidc.layer())
+}
+
+async fn web_app_authorization_redirect_location(request: Request<Body>) -> reqwest::Url {
+    let response = web_app_redirect_test_app()
+        .oneshot(request)
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    reqwest::Url::parse(location).expect("redirect location should be a URL")
+}
+
 #[tokio::test]
 async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
     let oidc = Oidc::builder(OidcConfig {
@@ -2005,6 +2054,65 @@ async fn web_app_redirect_uri_uses_absolute_request_authority_without_host_heade
     assert_eq!(
         query.get("redirect_uri").map(|value| value.as_ref()),
         Some("https://app.example/login/callback")
+    );
+}
+
+#[tokio::test]
+async fn web_app_redirect_uri_uses_forwarded_header_origin() {
+    let location = web_app_authorization_redirect_location(
+        Request::builder()
+            .uri("/protected")
+            .header("forwarded", "proto=https;host=app.example")
+            .body(Body::empty())
+            .expect("request should be valid"),
+    )
+    .await;
+    let query = location.query_pairs().collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        query.get("redirect_uri").map(|value| value.as_ref()),
+        Some("https://app.example/login/callback")
+    );
+}
+
+#[tokio::test]
+async fn web_app_redirect_uri_prefers_x_forwarded_headers_over_forwarded() {
+    let location = web_app_authorization_redirect_location(
+        Request::builder()
+            .uri("/protected")
+            .header("forwarded", "proto=http;host=forwarded.example")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "x-forwarded.example")
+            .body(Body::empty())
+            .expect("request should be valid"),
+    )
+    .await;
+    let query = location.query_pairs().collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        query.get("redirect_uri").map(|value| value.as_ref()),
+        Some("https://x-forwarded.example/login/callback")
+    );
+}
+
+#[tokio::test]
+async fn web_app_redirect_uri_ignores_invalid_forwarded_origin_headers() {
+    let location = web_app_authorization_redirect_location(
+        Request::builder()
+            .uri("/protected")
+            .header("forwarded", "proto=https;host=forwarded.example")
+            .header("x-forwarded-proto", "javascript")
+            .header("x-forwarded-host", "attacker.example/path")
+            .header(HOST, "app.example")
+            .body(Body::empty())
+            .expect("request should be valid"),
+    )
+    .await;
+    let query = location.query_pairs().collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        query.get("redirect_uri").map(|value| value.as_ref()),
+        Some("https://forwarded.example/login/callback")
     );
 }
 

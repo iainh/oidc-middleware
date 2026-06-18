@@ -192,10 +192,10 @@ impl Default for OidcConfig {
 pub struct OidcAuthenticationConfig {
     /// Redirect URI path or absolute URI used for authorization-code callbacks.
     ///
-    /// Relative paths are expanded from `X-Forwarded-Host`, `Host`, or the
-    /// request URI authority. Use an absolute URI when the public callback URL
-    /// differs from the internal Axum request, for example behind a reverse
-    /// proxy that does not forward host information.
+    /// Relative paths are expanded from `X-Forwarded-Host`, `Forwarded`,
+    /// `Host`, or the request URI authority. Use an absolute URI when the
+    /// public callback URL differs from the internal Axum request, for example
+    /// behind a reverse proxy that does not forward host information.
     pub redirect_path: String,
     /// Return users to their original path after completing the code flow.
     pub restore_path_after_redirect: bool,

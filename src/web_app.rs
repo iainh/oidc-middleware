@@ -31,6 +31,12 @@ const REDIRECT_STATE_COOKIE_NAME: &str = "q_oidc_redirect";
 const REDIRECT_STATE_COOKIE_MAX_AGE_SECS: i64 = 600;
 const MAX_COOKIE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_COOKIE_SEGMENTS: usize = 64;
+// Local defensive bounds for RFC 7239 parsing; the header ABNF is a list
+// grammar and does not provide operational size limits.
+const MAX_FORWARDED_HEADER_BYTES: usize = 8 * 1024;
+const MAX_FORWARDED_HEADER_FIELDS: usize = 16;
+const MAX_FORWARDED_ELEMENTS: usize = 32;
+const MAX_FORWARDED_PARAMETERS: usize = 16;
 
 #[derive(Clone)]
 pub(crate) struct WebApp {
@@ -636,6 +642,11 @@ fn absolute_request_uri(
     purpose: &str,
 ) -> Result<String> {
     if path_or_uri.starts_with("http://") || path_or_uri.starts_with("https://") {
+        reqwest::Url::parse(path_or_uri).map_err(|error| {
+            Error::Session(
+                std::io::Error::other(format!("invalid {purpose} `{path_or_uri}`: {error}")).into(),
+            )
+        })?;
         trace!(uri = %path_or_uri, purpose, "using absolute URI");
         return Ok(path_or_uri.to_owned());
     }
@@ -644,28 +655,36 @@ fn absolute_request_uri(
             std::io::Error::other(format!("{purpose} path must start with `/`")).into(),
         ));
     }
-    let host = request_host(request).ok_or_else(|| {
+    let forwarded = forwarded_origin(request);
+    let host = request_host(request, forwarded.as_ref().and_then(|origin| origin.host.as_deref()))
+        .ok_or_else(|| {
         warn!(
             path = %request.uri().path(),
             configured_path = %path_or_uri,
-            "cannot build absolute OIDC URI without Host, X-Forwarded-Host, URI authority, or an absolute configured URI"
+            "cannot build absolute OIDC URI without Host, X-Forwarded-Host, Forwarded host, URI authority, or an absolute configured URI"
         );
         Error::Session(
             std::io::Error::other(
-                format!("missing request host for {purpose}; set Host/X-Forwarded-Host, use an absolute request URI, or configure an absolute URI"),
+                format!("missing request host for {purpose}; set Host/X-Forwarded-Host/Forwarded, use an absolute request URI, or configure an absolute URI"),
             )
             .into(),
         )
     })?;
-    let scheme = request
-        .headers()
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| request.uri().scheme_str())
-        .unwrap_or("http");
+    let scheme = request_scheme(request, forwarded.as_ref().and_then(|origin| origin.proto));
     let uri = format!("{scheme}://{host}{path_or_uri}");
+    reqwest::Url::parse(&uri).map_err(|error| {
+        Error::Session(
+            std::io::Error::other(format!("invalid generated {purpose} `{uri}`: {error}")).into(),
+        )
+    })?;
     trace!(uri = %uri, purpose, "built absolute OIDC URI from request origin");
     Ok(uri)
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ForwardedOrigin {
+    host: Option<String>,
+    proto: Option<&'static str>,
 }
 
 pub(crate) struct WebAppSession {
@@ -955,13 +974,542 @@ fn path_matches(configured: &str, actual: &str) -> bool {
     configured == actual
 }
 
-fn request_host(request: &Request<Body>) -> Option<&str> {
+fn request_scheme(request: &Request<Body>, forwarded_proto: Option<&'static str>) -> &'static str {
+    // RFC 7239 Section 8.1: forwarded values can be client-modified, so treat
+    // every origin source as untrusted and validate before URL construction.
+    request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(header_proto)
+        .or(forwarded_proto)
+        .or_else(|| request.uri().scheme_str().and_then(header_proto))
+        .unwrap_or("http")
+}
+
+fn request_host<'a>(
+    request: &'a Request<Body>,
+    forwarded_host: Option<&'a str>,
+) -> Option<Cow<'a, str>> {
+    // RFC 7239 Section 8.1 applies to forwarded hosts; apply the same
+    // authority validation to legacy X-Forwarded-Host and Host as well.
     request
         .headers()
         .get("x-forwarded-host")
-        .or_else(|| request.headers().get(HOST))
         .and_then(|value| value.to_str().ok())
-        .or_else(|| request.uri().authority().map(http::uri::Authority::as_str))
+        .map(trim_ows_str)
+        .and_then(valid_authority)
+        .map(Cow::Borrowed)
+        .or_else(|| forwarded_host.and_then(valid_authority).map(Cow::Borrowed))
+        .or_else(|| {
+            request
+                .headers()
+                .get(HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(trim_ows_str)
+                .and_then(valid_authority)
+                .map(Cow::Borrowed)
+        })
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(http::uri::Authority::as_str)
+                .and_then(valid_authority)
+                .map(Cow::Borrowed)
+        })
+}
+
+fn forwarded_origin(request: &Request<Body>) -> Option<ForwardedOrigin> {
+    // RFC 7239 Sections 4 and 7.1: Forwarded is an HTTP list that may be split
+    // over multiple header fields. Each list element is one proxy hop; use the
+    // first valid element that supplies the origin data needed for callbacks.
+    let mut header_count = 0;
+    for header in request.headers().get_all("forwarded") {
+        header_count += 1;
+        if header_count > MAX_FORWARDED_HEADER_FIELDS {
+            return None;
+        }
+        if header.as_bytes().len() > MAX_FORWARDED_HEADER_BYTES {
+            continue;
+        }
+        let Some(elements) = split_forwarded(header.as_bytes(), b',') else {
+            continue;
+        };
+        let mut element_count = 0;
+        for element in elements {
+            element_count += 1;
+            if element_count > MAX_FORWARDED_ELEMENTS {
+                continue;
+            }
+            let Some(origin) = parse_forwarded_element(element) else {
+                continue;
+            };
+            if origin.host.is_some() || origin.proto.is_some() {
+                return Some(origin);
+            }
+        }
+    }
+    None
+}
+
+fn parse_forwarded_element(element: &[u8]) -> Option<ForwardedOrigin> {
+    // RFC 7239 Section 4: a forwarded-element is semicolon-separated
+    // token=value pairs, names are case-insensitive, values are token or
+    // quoted-string, and each parameter name may appear only once.
+    let params = split_forwarded(element, b';')?;
+    let mut parameter_count = 0;
+    let mut seen_host = false;
+    let mut seen_proto = false;
+    let mut origin = ForwardedOrigin::default();
+
+    for param in params {
+        parameter_count += 1;
+        if parameter_count > MAX_FORWARDED_PARAMETERS {
+            return None;
+        }
+        let param = trim_ows(param);
+        if param.is_empty() {
+            continue;
+        }
+        let (name, value) = split_once_byte(param, b'=')?;
+        let name = trim_ows(name);
+        if !is_token(name) {
+            return None;
+        }
+
+        let value = trim_ows(value);
+        if name.eq_ignore_ascii_case(b"host") {
+            // RFC 7239 Section 5.3: host is the original Host field value and
+            // must conform to Host syntax after quoted-string unescaping.
+            if seen_host {
+                return None;
+            }
+            seen_host = true;
+            let value = parse_forwarded_value(value)?;
+            origin.host = Some(forwarded_host(&value)?);
+        } else if name.eq_ignore_ascii_case(b"proto") {
+            // RFC 7239 Section 5.4: proto is a URI scheme; this crate only
+            // accepts http/https because those are valid OIDC redirect bases.
+            if seen_proto {
+                return None;
+            }
+            seen_proto = true;
+            let value = parse_forwarded_value(value)?;
+            origin.proto = Some(forwarded_proto(&value)?);
+        } else if !is_forwarded_value(value) {
+            return None;
+        }
+    }
+
+    Some(origin)
+}
+
+fn split_forwarded(value: &[u8], delimiter: u8) -> Option<ForwardedParts<'_>> {
+    // RFC 7239 Section 4 and Section 7.1: comma separates list elements and
+    // semicolon separates pairs, but delimiters inside quoted-string are data.
+    debug_assert!(matches!(delimiter, b',' | b';'));
+    has_balanced_forwarded_quotes(value).then_some(ForwardedParts {
+        value,
+        delimiter,
+        start: 0,
+        finished: false,
+    })
+}
+
+struct ForwardedParts<'a> {
+    value: &'a [u8],
+    delimiter: u8,
+    start: usize,
+    finished: bool,
+}
+
+impl<'a> Iterator for ForwardedParts<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        let mut in_quotes = false;
+        let mut escaped = false;
+        for index in self.start..self.value.len() {
+            let byte = self.value[index];
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' if in_quotes => escaped = true,
+                b'"' => in_quotes = !in_quotes,
+                byte if byte == self.delimiter && !in_quotes => {
+                    let part = &self.value[self.start..index];
+                    self.start = index + 1;
+                    return Some(part);
+                }
+                _ => {}
+            }
+        }
+
+        self.finished = true;
+        Some(&self.value[self.start..])
+    }
+}
+
+fn has_balanced_forwarded_quotes(value: &[u8]) -> bool {
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for byte in value.iter().copied() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if in_quotes => escaped = true,
+            b'"' => in_quotes = !in_quotes,
+            _ => {}
+        }
+    }
+
+    !in_quotes && !escaped
+}
+
+fn parse_forwarded_value(value: &[u8]) -> Option<Cow<'_, [u8]>> {
+    // RFC 7239 Section 4: forwarded-pair values are token / quoted-string.
+    // Section 5.3 and 5.4 validation runs after any quoted-pair unescaping.
+    if value.starts_with(b"\"") {
+        parse_quoted_forwarded_value(value).map(Cow::Owned)
+    } else {
+        is_token(value).then_some(Cow::Borrowed(value))
+    }
+}
+
+fn parse_quoted_forwarded_value(value: &[u8]) -> Option<Vec<u8>> {
+    let value = value.strip_prefix(b"\"")?;
+    let mut parsed = Vec::new();
+    let mut escaped = false;
+
+    for (index, byte) in value.iter().copied().enumerate() {
+        if escaped {
+            if !is_quoted_pair_byte(byte) {
+                return None;
+            }
+            parsed.push(byte);
+            escaped = false;
+            continue;
+        }
+
+        match byte {
+            b'\\' => escaped = true,
+            b'"' => return (index + 1 == value.len()).then_some(parsed),
+            byte if is_quoted_text_byte(byte) => parsed.push(byte),
+            _ => return None,
+        }
+    }
+
+    None
+}
+
+fn is_forwarded_value(value: &[u8]) -> bool {
+    if value.starts_with(b"\"") {
+        validate_quoted_forwarded_value(value)
+    } else {
+        is_token(value)
+    }
+}
+
+fn validate_quoted_forwarded_value(value: &[u8]) -> bool {
+    let Some(value) = value.strip_prefix(b"\"") else {
+        return false;
+    };
+    let mut escaped = false;
+
+    for (index, byte) in value.iter().copied().enumerate() {
+        if escaped {
+            if !is_quoted_pair_byte(byte) {
+                return false;
+            }
+            escaped = false;
+            continue;
+        }
+
+        match byte {
+            b'\\' => escaped = true,
+            b'"' => return index + 1 == value.len(),
+            byte if is_quoted_text_byte(byte) => {}
+            _ => return false,
+        }
+    }
+
+    false
+}
+
+fn header_proto(value: &str) -> Option<&'static str> {
+    forwarded_proto(trim_ows(value.as_bytes()))
+}
+
+fn forwarded_proto(value: &[u8]) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case(b"http") {
+        Some("http")
+    } else if value.eq_ignore_ascii_case(b"https") {
+        Some("https")
+    } else {
+        None
+    }
+}
+
+fn forwarded_host(value: &[u8]) -> Option<String> {
+    let value = std::str::from_utf8(value).ok()?;
+    valid_authority(value).map(ToOwned::to_owned)
+}
+
+fn valid_authority(value: &str) -> Option<&str> {
+    (!value.is_empty() && !value.contains('@') && value.parse::<http::uri::Authority>().is_ok())
+        .then_some(value)
+}
+
+fn trim_ows_str(value: &str) -> &str {
+    std::str::from_utf8(trim_ows(value.as_bytes())).expect("trimmed str should remain valid UTF-8")
+}
+
+fn split_once_byte(value: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
+    value
+        .iter()
+        .position(|byte| *byte == delimiter)
+        .map(|index| (&value[..index], &value[index + 1..]))
+}
+
+fn trim_ows(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+        .map_or(start, |index| index + 1);
+    &value[start..end]
+}
+
+fn is_token(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().copied().all(is_token_byte)
+}
+
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_quoted_text_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' ' | b'!' | b'#'..=b'[' | b']'..=b'~' | 0x80..=0xff)
+}
+
+fn is_quoted_pair_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b' ' | b'!'..=b'~' | 0x80..=0xff)
+}
+
+#[cfg(test)]
+mod forwarded_tests {
+    use super::*;
+
+    fn request_with_forwarded(values: &[&str]) -> Request<Body> {
+        let mut builder = Request::builder().uri("/protected");
+        for value in values {
+            builder = builder.header("forwarded", *value);
+        }
+        builder
+            .body(Body::empty())
+            .expect("test request should be valid")
+    }
+
+    #[test]
+    fn forwarded_origin_parses_proto_and_host() {
+        let request = request_with_forwarded(&["proto=https;host=app.example"]);
+
+        assert_eq!(
+            forwarded_origin(&request),
+            Some(ForwardedOrigin {
+                host: Some("app.example".to_owned()),
+                proto: Some("https"),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_parses_case_insensitive_quoted_values() {
+        let request =
+            request_with_forwarded(&[r#"For=unknown;Proto="HTTPS";Host="app.example:8443""#]);
+
+        assert_eq!(
+            forwarded_origin(&request),
+            Some(ForwardedOrigin {
+                host: Some("app.example:8443".to_owned()),
+                proto: Some("https"),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_splits_quoted_commas_and_semicolons() {
+        let request = request_with_forwarded(&[
+            r#"for="client,with;punctuation";proto=https;host=app.example, proto=http;host=internal.example"#,
+        ]);
+
+        assert_eq!(
+            forwarded_origin(&request),
+            Some(ForwardedOrigin {
+                host: Some("app.example".to_owned()),
+                proto: Some("https"),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_unescapes_quoted_pairs() {
+        let request = request_with_forwarded(&[r#"proto="https";host="app\.example""#]);
+
+        assert_eq!(
+            forwarded_origin(&request),
+            Some(ForwardedOrigin {
+                host: Some("app.example".to_owned()),
+                proto: Some("https"),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_accepts_obs_text_in_ignored_quoted_extension() {
+        let request = Request::builder()
+            .uri("/protected")
+            .header(
+                "forwarded",
+                HeaderValue::from_bytes(b"ext=\"\xff\";proto=https;host=app.example")
+                    .expect("header value should be valid"),
+            )
+            .body(Body::empty())
+            .expect("test request should be valid");
+
+        assert_eq!(
+            forwarded_origin(&request),
+            Some(ForwardedOrigin {
+                host: Some("app.example".to_owned()),
+                proto: Some("https"),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_reads_multiple_header_fields() {
+        let request = request_with_forwarded(&["for=unknown", "proto=https;host=app.example"]);
+
+        assert_eq!(
+            forwarded_origin(&request),
+            Some(ForwardedOrigin {
+                host: Some("app.example".to_owned()),
+                proto: Some("https"),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_uses_next_valid_element_after_duplicate_parameter() {
+        let request =
+            request_with_forwarded(&["proto=http;proto=https, proto=https;host=app.example"]);
+
+        assert_eq!(
+            forwarded_origin(&request),
+            Some(ForwardedOrigin {
+                host: Some("app.example".to_owned()),
+                proto: Some("https"),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_uses_next_valid_element_after_invalid_known_value() {
+        let request = request_with_forwarded(&[
+            "proto=ftp;host=app.example, proto=https;host=public.example",
+        ]);
+
+        assert_eq!(
+            forwarded_origin(&request),
+            Some(ForwardedOrigin {
+                host: Some("public.example".to_owned()),
+                proto: Some("https"),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_does_not_combine_distinct_elements() {
+        let request = request_with_forwarded(&["proto=https, host=app.example"]);
+
+        assert_eq!(
+            forwarded_origin(&request),
+            Some(ForwardedOrigin {
+                host: None,
+                proto: Some("https"),
+            })
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_ignores_invalid_values() {
+        let request = request_with_forwarded(&[
+            r#"proto=ftp;host="bad host""#,
+            r#"proto="https;host=app.example"#,
+        ]);
+
+        assert_eq!(forwarded_origin(&request), None);
+    }
+
+    #[test]
+    fn forwarded_origin_rejects_host_with_userinfo() {
+        let request = request_with_forwarded(&["proto=https;host=user@app.example"]);
+
+        assert_eq!(forwarded_origin(&request), None);
+    }
+
+    #[test]
+    fn request_scheme_ignores_invalid_x_forwarded_proto() {
+        let request = Request::builder()
+            .uri("https://app.example/protected")
+            .header("x-forwarded-proto", "javascript")
+            .body(Body::empty())
+            .expect("test request should be valid");
+
+        assert_eq!(request_scheme(&request, None), "https");
+    }
+
+    #[test]
+    fn request_host_ignores_invalid_header_authorities() {
+        let request = Request::builder()
+            .uri("https://uri.example/protected")
+            .header("x-forwarded-host", "attacker.example/path")
+            .header(HOST, "user@app.example")
+            .body(Body::empty())
+            .expect("test request should be valid");
+
+        assert_eq!(request_host(&request, None).as_deref(), Some("uri.example"));
+    }
 }
 
 #[derive(Clone)]
