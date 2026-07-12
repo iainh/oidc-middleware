@@ -212,6 +212,13 @@ pub struct OidcAuthenticationConfig {
     /// configure a stable 64-byte random key so browser sessions survive
     /// process restarts.
     pub token_state_cookie_key: Option<String>,
+    /// Require nonce binding for authorization-code authentication responses.
+    ///
+    /// When enabled, the authorization request includes a nonce and the
+    /// callback requires the returned ID token to contain the matching claim.
+    /// Disable this only for compatibility with providers that do not support
+    /// the OpenID Connect nonce parameter.
+    pub nonce_required: bool,
     /// OIDC scopes requested from the provider.
     ///
     /// The list must include `openid`; without it the provider is not required
@@ -226,6 +233,7 @@ impl Default for OidcAuthenticationConfig {
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
+            nonce_required: true,
             scopes: vec!["openid".to_owned()],
         }
     }
@@ -280,6 +288,7 @@ impl ConfigProperties for OidcAuthenticationConfig {
                 config,
                 &key("token-state-cookie-key"),
             )?,
+            nonce_required: config.get_optional(&key("nonce-required"))?.unwrap_or(true),
             scopes,
         })
     }

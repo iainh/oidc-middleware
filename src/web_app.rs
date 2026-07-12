@@ -14,6 +14,7 @@ use cookie::{Cookie, CookieJar, Key, SameSite};
 use http::header::{CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE};
 use http::{HeaderValue, Request, StatusCode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -54,6 +55,7 @@ pub(crate) struct WebApp {
     lifespan_grace: u64,
     session_age_extension: u64,
     scopes: Vec<String>,
+    nonce_required: bool,
     token_state_cookie: CookieTokenStateManager,
     redirect_state_cookie: RedirectStateCookieManager,
 }
@@ -164,6 +166,7 @@ impl WebApp {
             lifespan_grace: config.token.lifespan_grace.unwrap_or_default(),
             session_age_extension: config.authentication.session_age_extension.as_secs(),
             scopes: config.authentication.scopes.clone(),
+            nonce_required: config.authentication.nonce_required,
             token_state_cookie: CookieTokenStateManager::new(
                 cookie_key.clone(),
                 configured_cookie_key.is_some(),
@@ -264,7 +267,7 @@ impl WebApp {
                 match self.refresh_tokens(refresh_token).await {
                     Ok(token_response) => {
                         let refreshed = match self
-                            .validated_tokens(token_response, validator, Some(refresh_token))
+                            .validated_tokens(token_response, validator, Some(refresh_token), None)
                             .await
                         {
                             Ok(refreshed) => refreshed,
@@ -305,6 +308,8 @@ impl WebApp {
         let original_uri = request.uri().to_string();
         let redirect_uri = self.redirect_uri(request)?;
         let state = random_state()?;
+        let nonce = self.nonce_required.then(random_nonce).transpose()?;
+        let nonce_hash = nonce.as_deref().map(hash_nonce);
         debug!(
             original_uri = %original_uri,
             redirect_uri = %redirect_uri,
@@ -313,6 +318,7 @@ impl WebApp {
         );
         let redirect_state = RedirectState {
             state: state.clone(),
+            nonce,
             original_uri: self
                 .restore_path_after_redirect
                 .then_some(original_uri.clone()),
@@ -323,14 +329,17 @@ impl WebApp {
         // `openid`, `response_type=code`, `client_id`, and the `redirect_uri`
         // used for the token request. Section 3.1.2.2 leaves `state`
         // RECOMMENDED; Quarkus and Payara both bind the code flow to local
-        // state. We store that state in an encrypted cookie instead of sending
-        // a nonce, which is optional for Authorization Code Flow unless sent.
+        // state. Like Payara, keep the secret nonce in local transient state
+        // and send its SHA-256 hash to the provider.
         serializer
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.client_id)
             .append_pair("redirect_uri", &redirect_uri)
             .append_pair("scope", &self.scopes.join(" "))
             .append_pair("state", &state);
+        if let Some(nonce_hash) = nonce_hash.as_deref() {
+            serializer.append_pair("nonce", nonce_hash);
+        }
         let mut response = redirect_response(&format!(
             "{}?{}",
             self.authorization_endpoint,
@@ -383,8 +392,17 @@ impl WebApp {
             has_id_token = token_response.id_token.is_some(),
             "OIDC token endpoint returned callback tokens"
         );
+        let expected_nonce = match redirect_state.nonce.as_deref() {
+            Some(nonce) => Some(hash_nonce(nonce)),
+            None if self.nonce_required => {
+                return Err(Error::TokenRejected(
+                    "redirect state is missing the nonce required for validation".into(),
+                ));
+            }
+            None => None,
+        };
         let authenticated = self
-            .validated_tokens(token_response, validator, None)
+            .validated_tokens(token_response, validator, None, expected_nonce.as_deref())
             .await?;
         let redirect_to = redirect_state
             .original_uri
@@ -501,6 +519,7 @@ impl WebApp {
         token_response: TokenResponse,
         validator: Arc<dyn TokenValidator>,
         previous_refresh_token: Option<&str>,
+        expected_nonce: Option<&str>,
     ) -> Result<AuthenticatedTokens> {
         trace!(
             has_id_token = token_response.id_token.is_some(),
@@ -515,7 +534,12 @@ impl WebApp {
         // configured validator is used for both token shapes and provider
         // conventions can be selected by configuration.
         let validated_id_token = match token_response.id_token.as_deref() {
-            Some(raw) => Some(validate_id_token(raw, validator.clone()).await?),
+            Some(raw) => Some(validate_id_token(raw, validator.clone(), expected_nonce).await?),
+            None if expected_nonce.is_some() => {
+                return Err(Error::TokenRejected(
+                    "token response is missing an ID token required for nonce validation".into(),
+                ));
+            }
             None => None,
         };
         let principal = match validator
@@ -884,14 +908,13 @@ impl AuthenticatedTokens {
 async fn validate_id_token(
     token: &str,
     validator: Arc<dyn TokenValidator>,
+    expected_nonce: Option<&str>,
 ) -> Result<(IdToken, Principal)> {
     trace!("validating OIDC ID token from web-app token response");
     // The validator enforces signature, issuer, audience, exp, and iat policy.
-    // If this crate starts sending a nonce in the Authentication Request,
-    // OpenID Connect Core 1.0 Section 3.1.3.7 requires checking the returned
-    // ID Token `nonce` here against the stored redirect state.
     let principal = validator.validate(Arc::from(token)).await?;
     let claims = decode_id_token_claims(token)?;
+    validate_id_token_nonce(&claims, expected_nonce)?;
     trace!(
         has_subject = claims.sub.is_some(),
         has_issuer = claims.iss.is_some(),
@@ -900,6 +923,21 @@ async fn validate_id_token(
         "decoded OIDC ID token claims"
     );
     Ok((IdToken::with_raw(claims, token), principal))
+}
+
+fn validate_id_token_nonce(claims: &IdTokenClaims, expected_nonce: Option<&str>) -> Result<()> {
+    let Some(expected_nonce) = expected_nonce else {
+        return Ok(());
+    };
+    match claims.nonce.as_deref() {
+        Some(nonce) if nonce == expected_nonce => Ok(()),
+        Some(_) => Err(Error::TokenRejected(
+            "ID token nonce does not match the authentication request".into(),
+        )),
+        None => Err(Error::TokenRejected(
+            "ID token is missing the nonce claim".into(),
+        )),
+    }
 }
 
 fn decode_id_token_claims(token: &str) -> Result<IdTokenClaims> {
@@ -1329,6 +1367,36 @@ fn is_quoted_pair_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod forwarded_tests {
     use super::*;
+
+    #[test]
+    fn nonce_hash_is_sha256_base64url_without_padding() {
+        assert_eq!(
+            hash_nonce("nonce-123"),
+            "HZZkR4rdvk7nGGwZsqLJjkYad9weGDZU82kWv5-1HLo"
+        );
+    }
+
+    #[test]
+    fn id_token_nonce_must_match_when_expected() {
+        let matching = IdTokenClaims {
+            nonce: Some("expected".to_owned()),
+            ..IdTokenClaims::default()
+        };
+        assert!(validate_id_token_nonce(&matching, Some("expected")).is_ok());
+
+        let mismatch = validate_id_token_nonce(&matching, Some("different"))
+            .expect_err("a mismatched nonce should be rejected");
+        assert!(mismatch.to_string().contains("nonce does not match"));
+
+        let missing = validate_id_token_nonce(&IdTokenClaims::default(), Some("expected"))
+            .expect_err("a missing nonce should be rejected");
+        assert!(missing.to_string().contains("missing the nonce claim"));
+    }
+
+    #[test]
+    fn id_token_nonce_is_ignored_when_not_requested() {
+        assert!(validate_id_token_nonce(&IdTokenClaims::default(), None).is_ok());
+    }
 
     fn request_with_forwarded(values: &[&str]) -> Request<Body> {
         let mut builder = Request::builder().uri("/protected");
@@ -1918,6 +1986,20 @@ fn random_state() -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn random_nonce() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        Error::Session(
+            std::io::Error::other(format!("failed to generate OIDC nonce: {error}")).into(),
+        )
+    })?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn hash_nonce(nonce: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(nonce.as_bytes()))
+}
+
 fn session_error<E>(error: E) -> Error
 where
     E: StdError + Send + Sync + 'static,
@@ -1957,6 +2039,8 @@ struct StoredAuthentication {
 #[derive(Deserialize, Serialize)]
 struct RedirectState {
     state: String,
+    #[serde(default)]
+    nonce: Option<String>,
     original_uri: Option<String>,
 }
 

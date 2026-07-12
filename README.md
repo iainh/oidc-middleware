@@ -23,7 +23,7 @@ compliance, operational, and provider-compatibility requirements.
 - Quarkus-inspired `oidc.*` configuration through `mp-config`.
 - Bearer-token authentication for service APIs.
 - Browser `web-app` authorization-code flow with encrypted redirect-state and
-  token-state cookies.
+  token-state cookies, plus nonce-bound ID-token validation.
 - Web-app callback and logout route helpers for authorization-code flow
   completion and RP-initiated logout.
 - Static public-key, JWKS, refreshable JWKS, introspection, and UserInfo-backed
@@ -220,6 +220,8 @@ The current implementation supports:
 - Service and hybrid `oidc.application-type` bearer-token middleware.
 - Browser `web-app` login routes with `Oidc::routes()` when provider discovery
   or explicit authorization and token endpoints are configured.
+- Nonce-bound ID-token validation for browser login, enabled by default; set
+  `oidc.authentication.nonce-required=false` only for incompatible providers.
 - Browser `web-app` logout with Quarkus-style `oidc.logout.path`,
   `oidc.logout.post-logout-path`, `oidc.logout.post-logout-uri-param`, and
   `oidc.logout.extra-params.*` settings.
@@ -246,7 +248,7 @@ Default features preserve the full convenience API:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.7.0" }
+oidc-middleware = { version = "0.9.0" }
 ```
 
 Applications that provide their own validators can opt into a smaller dependency
@@ -254,7 +256,7 @@ surface:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.7.0", default-features = false }
+oidc-middleware = { version = "0.9.0", default-features = false }
 ```
 
 Available features:
@@ -282,7 +284,7 @@ one TLS backend for HTTPS provider calls:
 
 ```toml
 [dependencies]
-oidc-middleware = { version = "0.7.0", default-features = false, features = ["web-app", "rustls-native-certs"] }
+oidc-middleware = { version = "0.9.0", default-features = false, features = ["web-app", "rustls-native-certs"] }
 ```
 
 ## Design guidance

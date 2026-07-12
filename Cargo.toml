@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "oidc-middleware"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Quarkus-inspired OIDC middleware for Axum."
@@ -21,7 +21,7 @@ macros = ["dep:oidc-middleware-macros"]
 native-tls = ["http-client", "reqwest/native-tls"]
 rustls = ["http-client", "reqwest/rustls"]
 rustls-native-certs = ["http-client", "reqwest/rustls"]
-web-app = ["http-client", "jwt", "dep:cookie", "dep:getrandom"]
+web-app = ["http-client", "jwt", "dep:cookie", "dep:getrandom", "dep:sha2"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["json"] }
@@ -31,10 +31,11 @@ getrandom = { version = "0.4", optional = true }
 http = "1"
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"], optional = true }
 mp-config = { git = "ssh://git@github.com/iainh/mp-config", tag = "v0.1.1" }
-oidc-middleware-macros = { version = "0.8.2", path = "oidc-middleware-macros", optional = true }
+oidc-middleware-macros = { version = "0.9.0", path = "oidc-middleware-macros", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query"], optional = true }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = "1"
+sha2 = { version = "0.10", optional = true }
 tower-layer = "0.3"
 tower-service = "0.3"
 tracing = "0.1"

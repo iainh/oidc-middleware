@@ -109,6 +109,7 @@ fn config_loads_quarkus_oidc_properties() {
                     "oidc.authentication.token-state-cookie-key",
                     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 )
+                .with("oidc.authentication.nonce-required", "false")
                 .with("oidc.authentication.scopes", "openid,email,profile")
                 .with("oidc.logout.path", "/signout")
                 .with("oidc.logout.post-logout-path", "/signed-out")
@@ -186,6 +187,7 @@ fn config_loads_quarkus_oidc_properties() {
                     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                         .to_owned(),
                 ),
+                nonce_required: false,
                 scopes: vec![
                     "openid".to_owned(),
                     "email".to_owned(),
@@ -1837,6 +1839,7 @@ fn web_app_redirect_test_app() -> Router {
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
+            nonce_required: false,
             scopes: vec!["openid".to_owned()],
         },
         ..OidcConfig::default()
@@ -1887,6 +1890,7 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
+            nonce_required: true,
             scopes: vec!["openid".to_owned(), "email".to_owned()],
         },
         ..OidcConfig::default()
@@ -1950,6 +1954,11 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
         Some("openid email")
     );
     assert!(query.contains_key("state"));
+    let nonce = query
+        .get("nonce")
+        .expect("nonce should be sent by default for web-app authentication");
+    assert_eq!(nonce.len(), 43);
+    assert_ne!(query.get("state"), Some(nonce));
 }
 
 #[tokio::test]
@@ -1962,6 +1971,7 @@ async fn web_app_redirects_without_external_session_layer() {
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
+            nonce_required: false,
             scopes: vec!["openid".to_owned()],
         },
         ..OidcConfig::default()
@@ -1997,7 +2007,14 @@ async fn web_app_redirects_without_external_session_layer() {
         .expect("request should complete");
 
     assert_eq!(response.status(), StatusCode::FOUND);
-    assert!(response.headers().get(LOCATION).is_some());
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    let location = reqwest::Url::parse(location).expect("redirect location should parse");
+    let query = location.query_pairs().collect::<HashMap<_, _>>();
+    assert!(!query.contains_key("nonce"));
 }
 
 #[tokio::test]
@@ -2010,6 +2027,7 @@ async fn web_app_redirect_uri_uses_absolute_request_authority_without_host_heade
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
+            nonce_required: false,
             scopes: vec!["openid".to_owned()],
         },
         ..OidcConfig::default()
@@ -2126,6 +2144,7 @@ async fn web_app_redirect_uri_requires_request_origin_for_relative_redirect_path
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
+            nonce_required: false,
             scopes: vec!["openid".to_owned()],
         },
         ..OidcConfig::default()
@@ -2223,6 +2242,7 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
+            nonce_required: false,
             scopes: vec!["openid".to_owned()],
         },
         ..OidcConfig::default()
@@ -2354,6 +2374,7 @@ async fn web_app_callback_uses_configured_basic_client_secret_method() {
             redirect_path: "/login/callback".to_owned(),
             restore_path_after_redirect: true,
             token_state_cookie_key: None,
+            nonce_required: false,
             scopes: vec!["openid".to_owned()],
             ..OidcAuthenticationConfig::default()
         },
@@ -2449,6 +2470,7 @@ async fn hybrid_callback_uses_web_app_flow_without_bearer_token() {
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
+            nonce_required: false,
             scopes: vec!["openid".to_owned()],
         },
         ..OidcConfig::default()
@@ -2525,6 +2547,10 @@ async fn web_app_clears_tampered_token_state_cookie() {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            nonce_required: false,
+            ..OidcAuthenticationConfig::default()
+        },
         ..OidcConfig::default()
     })
     .provider_metadata(
@@ -2630,6 +2656,10 @@ async fn web_app_logout_route_clears_local_session_and_redirects_locally() {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            nonce_required: false,
+            ..OidcAuthenticationConfig::default()
+        },
         logout: OidcLogoutConfig {
             path: "/signout".to_owned(),
             post_logout_path: Some("/signed-out".to_owned()),
@@ -2761,6 +2791,10 @@ async fn web_app_logout_route_redirects_to_provider_end_session_endpoint() {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            nonce_required: false,
+            ..OidcAuthenticationConfig::default()
+        },
         logout: OidcLogoutConfig {
             path: "/signout".to_owned(),
             post_logout_path: Some("/signed-out".to_owned()),
@@ -2893,6 +2927,7 @@ async fn web_app_token_state_cookie_lifetime_tracks_tokens() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             session_age_extension: Duration::from_secs(20),
+            nonce_required: false,
             ..OidcAuthenticationConfig::default()
         },
         token: OidcTokenConfig {
@@ -3004,6 +3039,10 @@ async fn web_app_refreshes_expired_session_tokens() {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            nonce_required: false,
+            ..OidcAuthenticationConfig::default()
+        },
         token: OidcTokenConfig {
             refresh_expired: true,
             ..OidcTokenConfig::default()
@@ -3112,6 +3151,10 @@ async fn web_app_redirects_when_expired_session_refresh_is_disabled() {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            nonce_required: false,
+            ..OidcAuthenticationConfig::default()
+        },
         ..OidcConfig::default()
     })
     .provider_metadata(
@@ -3228,6 +3271,10 @@ async fn web_app_refresh_token_time_skew_enables_proactive_refresh() {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
+        authentication: OidcAuthenticationConfig {
+            nonce_required: false,
+            ..OidcAuthenticationConfig::default()
+        },
         token: OidcTokenConfig {
             refresh_token_time_skew: Some(Duration::from_secs(7200)),
             ..OidcTokenConfig::default()
@@ -3357,6 +3404,7 @@ async fn web_app_session_age_extension_bounds_expired_token_refresh() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             session_age_extension: Duration::from_secs(0),
+            nonce_required: false,
             ..OidcAuthenticationConfig::default()
         },
         token: OidcTokenConfig {
