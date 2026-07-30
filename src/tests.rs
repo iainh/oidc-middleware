@@ -1957,7 +1957,7 @@ fn web_app_redirect_test_app_with_options(
 }
 
 #[tokio::test]
-async fn web_app_callback_errors_are_opaque_browser_errors_and_consume_redirect_state() {
+async fn web_app_query_callback_only_consumes_correlated_redirect_state() {
     for callback in [
         "/login/callback?error=access_denied",
         "/login/callback",
@@ -2009,11 +2009,51 @@ async fn web_app_callback_errors_are_opaque_browser_errors_and_consume_redirect_
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{callback}");
         assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
-        let cleared = set_cookie_header(&response, "q_oidc_redirect")
-            .expect("terminal callback should clear redirect state");
-        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(
+            set_cookie_header(&response, "q_oidc_redirect")
+                .is_none_or(|cookie| !cookie.contains("Max-Age=0")),
+            "uncorrelated callback must not clear redirect state: {callback}"
+        );
         assert!(response_body(response).await.is_empty());
     }
+
+    let app = web_app_redirect_test_app_with_endpoint("https://issuer.example/realms/app/auth");
+    let redirect = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(HOST, "app.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = cookie_header(&redirect);
+    let state = reqwest::Url::parse(redirect.headers().get(LOCATION).unwrap().to_str().unwrap())
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/login/callback?error=access_denied&state={state}"))
+                .header(HOST, "app.example")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
+    assert!(
+        set_cookie_header(&response, "q_oidc_redirect")
+            .expect("correlated provider denial should clear redirect state")
+            .contains("Max-Age=0")
+    );
+    assert!(response_body(response).await.is_empty());
 }
 
 async fn web_app_authorization_redirect_location(request: Request<Body>) -> reqwest::Url {
@@ -2570,6 +2610,7 @@ async fn web_app_form_post_callback_exchanges_code_and_stores_token_state_cookie
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(set_cookie_header(&response, "q_oidc_redirect").is_none());
 
     let response = app
         .clone()
@@ -2586,6 +2627,52 @@ async fn web_app_form_post_callback_exchanges_code_and_stores_token_state_cookie
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(set_cookie_header(&response, "q_oidc_redirect").is_none());
+
+    for body in [
+        "error=access_denied".to_owned(),
+        "code=good-code&state=wrong-state".to_owned(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login/callback")
+                    .header(HOST, "app.example")
+                    .header(COOKIE, &cookie)
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
+        assert!(set_cookie_header(&response, "q_oidc_redirect").is_none());
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login/callback")
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("error=access_denied&state={state}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
+    assert!(
+        set_cookie_header(&response, "q_oidc_redirect")
+            .expect("correlated form_post denial should clear redirect state")
+            .contains("Max-Age=0")
+    );
 
     let response = app
         .clone()

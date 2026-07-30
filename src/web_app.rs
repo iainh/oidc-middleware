@@ -395,11 +395,6 @@ impl WebApp {
         validator: Arc<dyn TokenValidator>,
         id_token_validator: Arc<dyn IdTokenValidator>,
     ) -> Result<Response> {
-        // A callback consumes its one-time correlation state regardless of its
-        // outcome. Queue the removal before parsing or contacting the provider
-        // so every terminal callback response clears it.
-        queue_cookie(request, self.redirect_state_cookie.clear()?);
-        let redirect_uri = self.redirect_uri(request)?;
         let params = match self.response_mode {
             OidcResponseMode::Query => {
                 CallbackQuery::parse(request.uri().query().unwrap_or_default())
@@ -421,15 +416,6 @@ impl WebApp {
                 CallbackQuery::parse(form)
             }
         };
-        debug!(redirect_uri = %redirect_uri, "processing OIDC authorization callback");
-        if let Some(error) = params.error {
-            debug!(provider_error = %error, "OIDC authorization endpoint returned an error");
-            return Err(Error::InvalidCallbackRequest);
-        }
-        let code = params.code.ok_or_else(|| {
-            warn!("OIDC callback did not include an authorization code");
-            Error::InvalidCallbackRequest
-        })?;
         let state = params.state.ok_or_else(|| {
             warn!("OIDC callback did not include a state parameter");
             Error::InvalidCallbackRequest
@@ -442,6 +428,21 @@ impl WebApp {
             warn!("OIDC callback state did not match redirect-state cookie");
             return Err(Error::InvalidCallbackRequest);
         }
+        // Only a callback correlated to this browser's encrypted state may
+        // consume the one-time state. Provider errors and later terminal
+        // failures are correlated outcomes and therefore clear it.
+        queue_cookie(request, self.redirect_state_cookie.clear()?);
+
+        if let Some(error) = params.error {
+            debug!(provider_error = %error, "OIDC authorization endpoint returned an error");
+            return Err(Error::InvalidCallbackRequest);
+        }
+        let code = params.code.ok_or_else(|| {
+            warn!("OIDC callback did not include an authorization code");
+            Error::InvalidCallbackRequest
+        })?;
+        let redirect_uri = self.redirect_uri(request)?;
+        debug!(redirect_uri = %redirect_uri, "processing OIDC authorization callback");
 
         // OpenID Connect Core 1.0 Section 3.1.3.1 requires the authorization
         // code grant token request to include the code and redirect_uri used in
