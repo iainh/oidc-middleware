@@ -1,8 +1,10 @@
+use crate::claims::{ClaimPath, compile_claim_paths, extract_roles};
+use crate::config::role_claim_paths_for_source;
 use crate::provider::provider_endpoint_url;
 use crate::validation_claims::unix_timestamp;
 use crate::{
     BuildError, ClientSecretMethod, Error, IdToken, IdTokenClaims, IdTokenValidator, OidcConfig,
-    Principal, Result, TokenValidator,
+    Principal, Result, RolesSource, TokenValidator,
 };
 use axum::body::Body;
 use axum::response::Response;
@@ -57,6 +59,8 @@ pub(crate) struct WebApp {
     session_age_extension: u64,
     scopes: Vec<String>,
     nonce_required: bool,
+    id_token_role_claim_paths: Arc<[ClaimPath]>,
+    role_claim_separator: Arc<str>,
     token_state_cookie: CookieTokenStateManager,
     redirect_state_cookie: RedirectStateCookieManager,
 }
@@ -169,6 +173,11 @@ impl WebApp {
             session_age_extension: config.authentication.session_age_extension.as_secs(),
             scopes: config.authentication.scopes.clone(),
             nonce_required: config.authentication.nonce_required,
+            id_token_role_claim_paths: compile_claim_paths(&role_claim_paths_for_source(
+                config,
+                RolesSource::IdToken,
+            )),
+            role_claim_separator: Arc::from(config.roles.role_claim_separator.clone()),
             token_state_cookie: CookieTokenStateManager::new(
                 cookie_key.clone(),
                 configured_cookie_key.is_some(),
@@ -584,7 +593,7 @@ impl WebApp {
             }
             None => None,
         };
-        let principal = match validator
+        let mut principal = match validator
             .validate(Arc::from(token_response.access_token.as_str()))
             .await
         {
@@ -603,6 +612,26 @@ impl WebApp {
                 None => return Err(error),
             },
         };
+        if !self.id_token_role_claim_paths.is_empty() {
+            let role_id_token = validated_id_token
+                .as_ref()
+                .map(|(id_token, _)| id_token)
+                .or(previous_id_token);
+            let Some(id_token) = role_id_token else {
+                return Err(Error::TokenRejected(
+                    "ID token is required when roles.source is idtoken".into(),
+                ));
+            };
+            let groups = extract_roles(
+                &serde_json::Value::Object(id_token.claims().extra.clone()),
+                &self.id_token_role_claim_paths,
+                &self.role_claim_separator,
+            )
+            .into_iter()
+            .map(Arc::from)
+            .collect();
+            principal = principal.with_claim_groups(groups);
+        }
         let now = unix_timestamp()?;
         let refreshed_id_token = validated_id_token.map(|(id_token, _)| id_token);
         let token_state = StoredTokenState::from_response(

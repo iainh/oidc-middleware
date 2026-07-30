@@ -146,7 +146,7 @@ pub use jose::JoseIdTokenValidator;
 ///
 /// ID tokens describe the authentication event and user profile context for the
 /// client application. They are intentionally separate from [`crate::Principal`],
-/// which remains the access-token-derived value used for API authorization.
+/// though web apps may configure ID-token claims as the principal's role source.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IdToken {
     claims: IdTokenClaims,

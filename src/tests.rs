@@ -2379,11 +2379,20 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
             "exp": 4_102_444_800_u64,
             "groups": [],
             "realm_access": { "roles": [] },
+            "application_roles": ["id-token-admin", "id-token-user"],
             "email": "alice@example.com",
             "email_verified": true
         }),
     );
-    let token_endpoint = one_shot_token_endpoint("opaque-access-token".to_owned(), Some(token));
+    let access_token = jwt(TestClaims {
+        sub: "alice",
+        iss: "https://issuer.example/realms/app",
+        aud: "orders-web",
+        exp: 4_102_444_800,
+        groups: vec!["access-token-only"],
+        realm_access: RealmAccessClaims { roles: Vec::new() },
+    });
+    let token_endpoint = one_shot_token_endpoint(access_token, Some(token));
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
@@ -2395,6 +2404,11 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
             token_state_cookie_key: None,
             nonce_required: false,
             scopes: vec!["openid".to_owned()],
+        },
+        roles: OidcRolesConfig {
+            source: RolesSource::IdToken,
+            role_claim_path: "application_roles".to_owned(),
+            ..OidcRolesConfig::default()
         },
         ..OidcConfig::default()
     })
@@ -2418,9 +2432,10 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
             "/protected",
             get(|session: OidcSession| async move {
                 format!(
-                    "{}:{}",
+                    "{}:{}:{}",
                     session.principal().subject(),
-                    identity_email(&session).unwrap_or("missing-email")
+                    identity_email(&session).unwrap_or("missing-email"),
+                    session.principal().groups().collect::<Vec<_>>().join(",")
                 )
             }),
         )
@@ -2487,7 +2502,10 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
         .await
         .expect("request should complete");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response_body(response).await, "alice:alice@example.com");
+    assert_eq!(
+        response_body(response).await,
+        "alice:alice@example.com:id-token-admin,id-token-user"
+    );
 }
 
 #[tokio::test]
