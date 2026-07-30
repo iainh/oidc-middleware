@@ -1382,6 +1382,22 @@ async fn introspection_fallback_accepts_opaque_token_when_enabled() {
 }
 
 #[tokio::test]
+async fn introspection_fallback_never_accepts_explicit_id_tokens() {
+    let token = jwt_with_header_type(
+        "id_token",
+        json!({
+            "sub": "alice", "exp": 4_102_444_800_u64
+        }),
+    );
+    let validator = IntrospectionFallbackValidator::new(
+        StaticTokenValidator::bearer("access-token", "alice"),
+        StaticTokenValidator::bearer(&token, "alice"),
+        &OidcConfig::default(),
+    );
+    assert!(validator.validate(Arc::from(token)).await.is_err());
+}
+
+#[tokio::test]
 async fn introspection_fallback_rejects_opaque_token_when_disabled() {
     let config = OidcConfig {
         token: OidcTokenConfig {
@@ -4303,6 +4319,68 @@ async fn jwt_validator_rejects_wrong_token_type() {
     .expect("request should complete");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn jwt_validator_rejects_explicit_id_token_type_by_default() {
+    let token = jwt_with_header_type(
+        "id+jwt",
+        json!({
+            "sub": "alice", "exp": 4_102_444_800_u64
+        }),
+    );
+    let error = JwtValidator::hs256("secret", &OidcConfig::default())
+        .validate(Arc::from(token))
+        .await
+        .expect_err("an explicitly typed ID token must not be accepted as an access token");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be used as a bearer access token")
+    );
+}
+
+#[tokio::test]
+async fn jose_id_token_validator_enforces_oidc_purpose_claims() {
+    let validator = JoseIdTokenValidator::jwks(
+        test_jwks(),
+        "https://issuer.example/realms/app",
+        "orders-web",
+        0,
+    );
+    let valid = jwt_with_kid_and_secret(
+        "test-key",
+        b"secret",
+        json!({
+            "sub": "alice", "iss": "https://issuer.example/realms/app",
+            "aud": ["orders-web", "other"], "azp": "orders-web",
+            "exp": 4_102_444_800_u64, "iat": TEST_IAT
+        }),
+    );
+    assert_eq!(
+        validator
+            .validate(Arc::from(valid))
+            .await
+            .unwrap()
+            .subject(),
+        Some("alice")
+    );
+
+    for claims in [
+        json!({"sub":"alice","iss":"https://wrong.example","aud":"orders-web","exp":4_102_444_800_u64,"iat":TEST_IAT}),
+        json!({"sub":"alice","iss":"https://issuer.example/realms/app","aud":"api-a","exp":4_102_444_800_u64,"iat":TEST_IAT}),
+        json!({"sub":"alice","iss":"https://issuer.example/realms/app","aud":["orders-web","other"],"exp":4_102_444_800_u64,"iat":TEST_IAT}),
+        json!({"sub":"alice","iss":"https://issuer.example/realms/app","aud":"orders-web","iat":TEST_IAT}),
+        json!({"iss":"https://issuer.example/realms/app","aud":"orders-web","exp":4_102_444_800_u64,"iat":TEST_IAT}),
+    ] {
+        let token = jwt_with_kid_and_secret("test-key", b"secret", claims);
+        assert!(validator.validate(Arc::from(token)).await.is_err());
+    }
+    let missing_iat = jwt_without_iat(json!({
+        "sub":"alice", "iss":"https://issuer.example/realms/app",
+        "aud":"orders-web", "exp":4_102_444_800_u64
+    }));
+    assert!(validator.validate(Arc::from(missing_iat)).await.is_err());
 }
 
 #[tokio::test]

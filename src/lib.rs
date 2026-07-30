@@ -71,8 +71,11 @@
 //! - `oidc.tenant-enabled=false` returns `404 Not Found` for the selected
 //!   tenant so disabled tenants do not advertise protected resources.
 //! - `oidc.token.audience=any` and `oidc.token.issuer=any` bypass the
-//!   corresponding validation and should be reserved for providers that cannot
-//!   emit stable claims.
+//!   corresponding *access-token* validation and should be reserved for providers
+//!   that cannot emit stable claims. Web-app ID tokens always require the exact
+//!   provider issuer and client ID audience. Bearer JWTs explicitly typed as
+//!   `id_token` or `id+jwt` are rejected even when access-token audience and type
+//!   are otherwise unconfigured.
 //!
 //! More complete runnable patterns live in the `examples/` directory.
 
@@ -116,7 +119,9 @@ pub use config::{
     WellKnownProvider,
 };
 pub use error::{BuildError, Error};
-pub use id_token::{IdToken, IdTokenClaims};
+#[cfg(feature = "jwt")]
+pub use id_token::JoseIdTokenValidator;
+pub use id_token::{IdToken, IdTokenClaims, IdTokenValidationFuture, IdTokenValidator};
 pub use introspection::{
     IntrospectionFallbackValidator, IntrospectionResponse, IntrospectionValidator,
     TokenIntrospector,

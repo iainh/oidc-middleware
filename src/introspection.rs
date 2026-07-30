@@ -11,6 +11,8 @@ use crate::{
     BoxError, Error, IntrospectionFuture, OidcConfig, Principal, RolesSource, TokenValidator,
     ValidationFuture, role_claim_paths_for_source,
 };
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -64,6 +66,12 @@ impl TokenValidator for IntrospectionFallbackValidator {
                     Ok(principal)
                 }
                 Err(error) => {
+                    if explicitly_typed_as_id_token(&token) {
+                        debug!(
+                            "explicitly typed ID token is ineligible for introspection fallback"
+                        );
+                        return Err(error);
+                    }
                     let token_is_jwt = token_looks_like_jwt(&token);
                     debug!(
                         token_is_jwt,
@@ -90,6 +98,24 @@ impl TokenValidator for IntrospectionFallbackValidator {
 
 fn token_looks_like_jwt(token: &str) -> bool {
     token.split('.').count() == 3
+}
+
+fn explicitly_typed_as_id_token(token: &str) -> bool {
+    let Some(header) = token.split('.').next() else {
+        return false;
+    };
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(header) else {
+        return false;
+    };
+    let Ok(header) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+        return false;
+    };
+    header
+        .get("typ")
+        .and_then(Value::as_str)
+        .is_some_and(|typ| {
+            typ.eq_ignore_ascii_case("id_token") || typ.eq_ignore_ascii_case("id+jwt")
+        })
 }
 
 /// OAuth2 token introspection response.

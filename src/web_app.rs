@@ -1,8 +1,8 @@
 use crate::provider::provider_endpoint_url;
 use crate::validation_claims::unix_timestamp;
 use crate::{
-    BuildError, ClientSecretMethod, Error, IdToken, IdTokenClaims, OidcConfig, Principal, Result,
-    TokenValidator,
+    BuildError, ClientSecretMethod, Error, IdToken, IdTokenClaims, IdTokenValidator, OidcConfig,
+    Principal, Result, TokenValidator,
 };
 use axum::body::Body;
 use axum::response::Response;
@@ -206,6 +206,7 @@ impl WebApp {
         &self,
         request: &mut Request<Body>,
         validator: Arc<dyn TokenValidator>,
+        id_token_validator: Arc<dyn IdTokenValidator>,
     ) -> Result<Option<WebAppSession>> {
         let stored_authentication = self.token_state_cookie.load(request)?;
         trace!(
@@ -267,7 +268,13 @@ impl WebApp {
                 match self.refresh_tokens(refresh_token).await {
                     Ok(token_response) => {
                         let refreshed = match self
-                            .validated_tokens(token_response, validator, Some(refresh_token), None)
+                            .validated_tokens(
+                                token_response,
+                                validator,
+                                id_token_validator,
+                                Some(refresh_token),
+                                None,
+                            )
                             .await
                         {
                             Ok(refreshed) => refreshed,
@@ -361,6 +368,7 @@ impl WebApp {
         &self,
         request: &mut Request<Body>,
         validator: Arc<dyn TokenValidator>,
+        id_token_validator: Arc<dyn IdTokenValidator>,
     ) -> Result<Response> {
         let redirect_uri = self.redirect_uri(request)?;
         let params = CallbackQuery::parse(request.uri().query().unwrap_or_default());
@@ -409,7 +417,13 @@ impl WebApp {
             None => None,
         };
         let authenticated = self
-            .validated_tokens(token_response, validator, None, expected_nonce.as_deref())
+            .validated_tokens(
+                token_response,
+                validator,
+                id_token_validator,
+                None,
+                expected_nonce.as_deref(),
+            )
             .await?;
         let redirect_to = redirect_state
             .original_uri
@@ -531,6 +545,7 @@ impl WebApp {
         &self,
         token_response: TokenResponse,
         validator: Arc<dyn TokenValidator>,
+        id_token_validator: Arc<dyn IdTokenValidator>,
         previous_refresh_token: Option<&str>,
         expected_nonce: Option<&str>,
     ) -> Result<AuthenticatedTokens> {
@@ -544,10 +559,10 @@ impl WebApp {
         // OpenID Connect Core 1.0 Section 3.1.3.7 requires ID Token validation
         // after a successful code exchange. Access-token validation is
         // deliberately application-specific in Section 3.1.3.8, so the same
-        // configured validator is used for both token shapes and provider
-        // conventions can be selected by configuration.
+        // ID tokens use a purpose-specific validator and never the access-token
+        // introspection or UserInfo fallback.
         let validated_id_token = match token_response.id_token.as_deref() {
-            Some(raw) => Some(validate_id_token(raw, validator.clone(), expected_nonce).await?),
+            Some(raw) => Some(validate_id_token(raw, id_token_validator, expected_nonce).await?),
             None if expected_nonce.is_some() => {
                 return Err(Error::TokenRejected(
                     "token response is missing an ID token required for nonce validation".into(),
@@ -791,6 +806,7 @@ impl Default for OidcWebAppRoutesOptions {
 pub(crate) struct OidcCallbackService {
     web_app: Arc<WebApp>,
     validator: Arc<dyn TokenValidator>,
+    id_token_validator: Arc<dyn IdTokenValidator>,
     authorization_scheme: String,
 }
 
@@ -798,11 +814,13 @@ impl OidcCallbackService {
     pub(crate) fn new(
         web_app: Arc<WebApp>,
         validator: Arc<dyn TokenValidator>,
+        id_token_validator: Arc<dyn IdTokenValidator>,
         authorization_scheme: String,
     ) -> Self {
         Self {
             web_app,
             validator,
+            id_token_validator,
             authorization_scheme,
         }
     }
@@ -827,11 +845,12 @@ impl Service<Request<Body>> for OidcCallbackService {
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
         let web_app = self.web_app.clone();
         let validator = self.validator.clone();
+        let id_token_validator = self.id_token_validator.clone();
         let authorization_scheme = self.authorization_scheme.clone();
 
         Box::pin(async move {
             let response = web_app
-                .callback(&mut request, validator)
+                .callback(&mut request, validator, id_token_validator)
                 .await
                 .unwrap_or_else(|error| {
                     error.into_response_with_scheme_for_request(
@@ -920,13 +939,13 @@ impl AuthenticatedTokens {
 
 async fn validate_id_token(
     token: &str,
-    validator: Arc<dyn TokenValidator>,
+    validator: Arc<dyn IdTokenValidator>,
     expected_nonce: Option<&str>,
 ) -> Result<(IdToken, Principal)> {
     trace!("validating OIDC ID token from web-app token response");
     // The validator enforces signature, issuer, audience, exp, and iat policy.
-    let principal = validator.validate(Arc::from(token)).await?;
-    let claims = decode_id_token_claims(token)?;
+    let id_token = validator.validate(Arc::from(token)).await?;
+    let claims = id_token.claims();
     validate_id_token_nonce(&claims, expected_nonce)?;
     trace!(
         has_subject = claims.sub.is_some(),
@@ -935,7 +954,8 @@ async fn validate_id_token(
         expires_at = ?claims.exp,
         "decoded OIDC ID token claims"
     );
-    Ok((IdToken::with_raw(claims, token), principal))
+    let principal = Principal::new(claims.sub.clone().expect("ID-token validator requires sub"));
+    Ok((id_token, principal))
 }
 
 fn validate_id_token_nonce(claims: &IdTokenClaims, expected_nonce: Option<&str>) -> Result<()> {
@@ -951,31 +971,6 @@ fn validate_id_token_nonce(claims: &IdTokenClaims, expected_nonce: Option<&str>)
             "ID token is missing the nonce claim".into(),
         )),
     }
-}
-
-fn decode_id_token_claims(token: &str) -> Result<IdTokenClaims> {
-    let mut parts = token.split('.');
-    let Some(_header) = parts.next() else {
-        return Err(Error::TokenRejected("ID token is missing a header".into()));
-    };
-    let Some(payload) = parts.next() else {
-        return Err(Error::TokenRejected("ID token is missing a payload".into()));
-    };
-    if parts.next().is_none() {
-        return Err(Error::TokenRejected(
-            "ID token is missing a signature".into(),
-        ));
-    }
-    if parts.next().is_some() {
-        return Err(Error::TokenRejected(
-            "ID token has too many segments".into(),
-        ));
-    }
-    let decoded = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|error| Error::TokenRejected(Box::new(error)))?;
-    serde_json::from_slice::<IdTokenClaims>(&decoded)
-        .map_err(|error| Error::TokenRejected(Box::new(error)))
 }
 
 fn unverified_jwt_exp(token: &str) -> Option<u64> {

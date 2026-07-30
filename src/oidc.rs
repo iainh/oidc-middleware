@@ -4,8 +4,6 @@ use crate::BuildError;
 use crate::BuildResult;
 #[cfg(all(feature = "http-client", feature = "jwt"))]
 use crate::IntrospectionFallbackValidator;
-#[cfg(feature = "jwt")]
-use crate::JwtValidator;
 #[cfg(any(all(feature = "http-client", feature = "jwt"), feature = "web-app"))]
 use crate::ProviderMetadata;
 #[cfg(all(feature = "http-client", feature = "jwt"))]
@@ -35,9 +33,11 @@ use crate::web_app::{
     OidcCallbackService, OidcLogoutOptions, OidcLogoutService, OidcWebAppRoutesOptions,
 };
 use crate::{
-    ApplicationType, Error, IntrospectionValidator, OidcConfig, Result, RolesSource,
-    TokenIntrospector, TokenValidator, UserInfoProvider, UserInfoValidator,
+    ApplicationType, Error, IdTokenValidator, IntrospectionValidator, OidcConfig, Result,
+    RolesSource, TokenIntrospector, TokenValidator, UserInfoProvider, UserInfoValidator,
 };
+#[cfg(feature = "jwt")]
+use crate::{JoseIdTokenValidator, JwtValidator};
 #[cfg(feature = "web-app")]
 use axum::Router;
 use axum::body::Body;
@@ -79,6 +79,7 @@ enum WebAppPrincipal {
 pub struct Oidc {
     pub(crate) config: OidcConfig,
     validator: Arc<dyn TokenValidator>,
+    id_token_validator: Arc<dyn IdTokenValidator>,
     pub(crate) token_header_name: Option<HeaderName>,
     #[cfg(feature = "web-app")]
     web_app: Option<Arc<WebApp>>,
@@ -94,6 +95,7 @@ impl Oidc {
         OidcBuilder {
             config,
             validator: None,
+            id_token_validator: None,
             #[cfg(feature = "web-app")]
             web_app: None,
         }
@@ -226,6 +228,7 @@ impl Oidc {
                     OidcCallbackService::new(
                         web_app.clone(),
                         self.validator.clone(),
+                        self.id_token_validator.clone(),
                         self.config.token.authorization_scheme.clone(),
                     )
                     .route(),
@@ -369,7 +372,14 @@ impl Oidc {
 
         if web_app.is_callback(request) {
             debug!(method = %request.method(), path = %request.uri().path(), "handling OIDC web-app callback");
-            return match web_app.callback(request, self.validator.clone()).await {
+            return match web_app
+                .callback(
+                    request,
+                    self.validator.clone(),
+                    self.id_token_validator.clone(),
+                )
+                .await
+            {
                 Ok(response) => Ok(Some(response)),
                 Err(error) => {
                     warn!(method = %request.method(), path = %request.uri().path(), error = %error, "OIDC web-app callback failed");
@@ -397,7 +407,11 @@ impl Oidc {
         web_app: &WebApp,
     ) -> Result<WebAppPrincipal> {
         if let Some(session) = web_app
-            .session_context(request, self.validator.clone())
+            .session_context(
+                request,
+                self.validator.clone(),
+                self.id_token_validator.clone(),
+            )
             .await?
         {
             trace!(
@@ -667,11 +681,20 @@ fn oidc_http_client(config: &OidcConfig) -> BuildResult<reqwest::Client> {
 pub struct OidcBuilder {
     config: OidcConfig,
     validator: Option<Arc<dyn TokenValidator>>,
+    id_token_validator: Option<Arc<dyn IdTokenValidator>>,
     #[cfg(feature = "web-app")]
     web_app: Option<Arc<WebApp>>,
 }
 
 impl OidcBuilder {
+    /// Sets the dedicated validator used only for web-app ID tokens.
+    pub fn id_token_validator<V>(mut self, validator: V) -> Self
+    where
+        V: IdTokenValidator,
+    {
+        self.id_token_validator = Some(Arc::new(validator));
+        self
+    }
     /// Sets the bearer token validator.
     ///
     /// Use this for custom validation, tests, or when another component owns
@@ -956,6 +979,7 @@ impl OidcBuilder {
         debug!("installing validator from supplied provider metadata");
         validate_provider_metadata(&metadata, self.config.auth_server_url.as_deref())?;
         self.install_web_app_from_metadata(&metadata, reqwest::Client::new())?;
+        self.install_id_token_jwks(&metadata, jwks.clone())?;
         if self.config.token.require_jwt_introspection_only {
             self.install_metadata_introspection(metadata, reqwest::Client::new())?;
             return Ok(self.build());
@@ -996,6 +1020,28 @@ impl OidcBuilder {
         debug!("installing refreshable validator from supplied provider metadata");
         validate_provider_metadata(&metadata, self.config.auth_server_url.as_deref())?;
         self.install_web_app_from_metadata(&metadata, client.clone())?;
+        if self.config.application_type != ApplicationType::Service {
+            let issuer =
+                metadata
+                    .issuer
+                    .as_deref()
+                    .ok_or_else(|| BuildError::InvalidConfiguration {
+                        message: "provider metadata issuer is required for ID-token validation"
+                            .to_owned(),
+                    })?;
+            let client_id = self
+                .config
+                .client_id
+                .as_deref()
+                .ok_or(BuildError::MissingClientId)?;
+            self.id_token_validator = Some(Arc::new(JoseIdTokenValidator::refreshable_jwks(
+                jwks.clone(),
+                HttpJwksProvider::new(client.clone(), metadata.jwks_uri.clone()),
+                issuer,
+                client_id,
+                &self.config,
+            )));
+        }
         if self.config.token.require_jwt_introspection_only {
             self.install_metadata_introspection(metadata, client)?;
             return Ok(self.build());
@@ -1027,6 +1073,19 @@ impl OidcBuilder {
     #[cfg(all(feature = "http-client", feature = "jwt"))]
     fn install_jwks_with_optional_introspection(&mut self, jwks: JwkSet, client: reqwest::Client) {
         debug!("installing JWKS validator with optional introspection fallback");
+        if self.config.application_type != ApplicationType::Service
+            && let (Some(issuer), Some(client_id)) = (
+                self.config.auth_server_url.as_deref(),
+                self.config.client_id.as_deref(),
+            )
+        {
+            self.id_token_validator = Some(Arc::new(JoseIdTokenValidator::jwks(
+                jwks.clone(),
+                issuer,
+                client_id,
+                self.config.token.lifespan_grace.unwrap_or_default(),
+            )));
+        }
         let jwt = JwtValidator::jwks(jwks, &self.config);
         let user_info_endpoint = self.user_info_endpoint_from_config();
         let Some(introspection_path) = self.config.introspection_path.as_deref() else {
@@ -1133,6 +1192,37 @@ impl OidcBuilder {
     fn uses_user_info_roles(&self) -> bool {
         self.config.roles.source == RolesSource::UserInfo
             && !self.config.token.verify_access_token_with_user_info
+    }
+
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
+    fn install_id_token_jwks(
+        &mut self,
+        metadata: &ProviderMetadata,
+        jwks: JwkSet,
+    ) -> BuildResult<()> {
+        if self.config.application_type == ApplicationType::Service {
+            return Ok(());
+        }
+        let issuer =
+            metadata
+                .issuer
+                .as_deref()
+                .ok_or_else(|| BuildError::InvalidConfiguration {
+                    message: "provider metadata issuer is required for ID-token validation"
+                        .to_owned(),
+                })?;
+        let client_id = self
+            .config
+            .client_id
+            .as_deref()
+            .ok_or(BuildError::MissingClientId)?;
+        self.id_token_validator = Some(Arc::new(JoseIdTokenValidator::jwks(
+            jwks,
+            issuer,
+            client_id,
+            self.config.token.lifespan_grace.unwrap_or_default(),
+        )));
+        Ok(())
     }
 
     #[cfg(feature = "web-app")]
@@ -1253,6 +1343,9 @@ impl OidcBuilder {
         Oidc {
             config: self.config,
             validator: self.validator.unwrap_or_else(|| Arc::new(RejectAllTokens)),
+            id_token_validator: self
+                .id_token_validator
+                .unwrap_or_else(|| Arc::new(crate::id_token::RejectAllIdTokens)),
             token_header_name,
             #[cfg(feature = "web-app")]
             web_app: self.web_app,

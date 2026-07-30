@@ -3,6 +3,145 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::{Error, Result};
+use std::future::Future;
+use std::pin::Pin;
+
+/// Future returned by an [`IdTokenValidator`].
+pub type IdTokenValidationFuture = Pin<Box<dyn Future<Output = Result<IdToken>> + Send>>;
+
+/// Validates an OpenID Connect ID token for a relying party.
+///
+/// This extension point is deliberately separate from bearer-token validation:
+/// implementations must apply ID-token signature and claim rules and must not
+/// use introspection or UserInfo as a fallback.
+pub trait IdTokenValidator: Send + Sync + 'static {
+    /// Validates a compact ID token and returns its trusted claims.
+    fn validate(&self, token: Arc<str>) -> IdTokenValidationFuture;
+}
+
+impl<F, Fut> IdTokenValidator for F
+where
+    F: Fn(Arc<str>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<IdToken>> + Send + 'static,
+{
+    fn validate(&self, token: Arc<str>) -> IdTokenValidationFuture {
+        Box::pin(self(token))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RejectAllIdTokens;
+
+impl IdTokenValidator for RejectAllIdTokens {
+    fn validate(&self, _token: Arc<str>) -> IdTokenValidationFuture {
+        Box::pin(async {
+            Err(Error::TokenRejected(
+                "no ID-token validator configured".into(),
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "jwt")]
+mod jose {
+    use super::*;
+    use crate::jwks::{JwtKeys, supported_algorithms};
+    use crate::{JwksProvider, OidcConfig};
+    use jsonwebtoken::jwk::JwkSet;
+    use jsonwebtoken::{Algorithm, Validation, decode};
+
+    /// Local JOSE validator for OpenID Connect ID tokens.
+    #[derive(Clone)]
+    pub struct JoseIdTokenValidator {
+        keys: JwtKeys,
+        validation: Validation,
+        client_id: Arc<str>,
+    }
+
+    impl JoseIdTokenValidator {
+        /// Builds an ID-token validator backed by a JWKS.
+        pub fn jwks(jwks: JwkSet, issuer: &str, client_id: &str, leeway: u64) -> Self {
+            let mut validation = Validation::new(Algorithm::RS256);
+            validation.leeway = leeway;
+            validation.set_issuer(&[issuer]);
+            validation.set_audience(&[client_id]);
+            validation
+                .required_spec_claims
+                .extend(["iat".into(), "sub".into()]);
+            let algorithms = supported_algorithms(&jwks);
+            if !algorithms.is_empty() {
+                validation.algorithms = algorithms;
+            }
+            Self {
+                keys: JwtKeys::set(jwks),
+                validation,
+                client_id: Arc::from(client_id),
+            }
+        }
+
+        /// Builds a refreshable JWKS-backed ID-token validator.
+        pub fn refreshable_jwks<P>(
+            jwks: JwkSet,
+            provider: P,
+            issuer: &str,
+            client_id: &str,
+            config: &OidcConfig,
+        ) -> Self
+        where
+            P: JwksProvider,
+        {
+            let mut value = Self::jwks(
+                jwks.clone(),
+                issuer,
+                client_id,
+                config.token.lifespan_grace.unwrap_or_default(),
+            );
+            value.keys =
+                JwtKeys::refreshing(jwks, provider, config.token.forced_jwk_refresh_interval);
+            value
+        }
+    }
+
+    impl IdTokenValidator for JoseIdTokenValidator {
+        fn validate(&self, token: Arc<str>) -> IdTokenValidationFuture {
+            let keys = self.keys.clone();
+            let validation = self.validation.clone();
+            let client_id = self.client_id.clone();
+            Box::pin(async move {
+                let key = keys.decoding_key(&token).await?;
+                let data = decode::<IdTokenClaims>(token.as_ref(), &key, &validation)
+                    .map_err(|error| Error::TokenRejected(Box::new(error)))?;
+                let claims = data.claims;
+                if claims.iat.is_none() || claims.sub.as_deref().is_none_or(str::is_empty) {
+                    return Err(Error::TokenRejected(
+                        "ID token requires iat and non-empty sub claims".into(),
+                    ));
+                }
+                if claims.aud.len() > 1 && claims.azp.as_deref() != Some(client_id.as_ref()) {
+                    return Err(Error::TokenRejected(
+                        "ID token with additional audiences requires azp equal to client_id".into(),
+                    ));
+                }
+                if let Some(azp) = claims.azp.as_deref()
+                    && azp != client_id.as_ref()
+                {
+                    return Err(Error::TokenRejected(
+                        "ID token azp did not match client_id".into(),
+                    ));
+                }
+                Ok(IdToken {
+                    claims,
+                    raw: Some(token),
+                })
+            })
+        }
+    }
+}
+
+#[cfg(feature = "jwt")]
+pub use jose::JoseIdTokenValidator;
+
 /// Validated OpenID Connect ID token data.
 ///
 /// ID tokens describe the authentication event and user profile context for the

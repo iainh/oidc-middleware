@@ -174,6 +174,16 @@ impl TokenValidator for JwtValidator {
                 }
             };
             let result = (|| {
+                if token_type.is_none()
+                    && data.header.typ.as_deref().is_some_and(|typ| {
+                        typ.eq_ignore_ascii_case("id_token") || typ.eq_ignore_ascii_case("id+jwt")
+                    })
+                {
+                    return Err(Error::TokenRejected(
+                        "an explicitly typed ID token cannot be used as a bearer access token"
+                            .into(),
+                    ));
+                }
                 validate_token_type(
                     data.header.typ.as_deref(),
                     &data.claims,
