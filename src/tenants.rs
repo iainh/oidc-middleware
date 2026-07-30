@@ -502,7 +502,8 @@ where
 
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
         let tenants = self.tenants.clone();
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let Some(tenant) = tenants.select(&request) else {

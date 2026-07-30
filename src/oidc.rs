@@ -1396,7 +1396,8 @@ where
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
         let oidc = self.oidc.clone();
         let authorization_scheme = oidc.config.token.authorization_scheme.clone();
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             match oidc.authenticate_or_response(&mut request).await {

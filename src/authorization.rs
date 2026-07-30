@@ -77,7 +77,8 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             if request.extensions().get::<Principal>().is_none() {
@@ -193,7 +194,8 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
         let roles = self.roles.clone();
         let mode = self.mode;
 

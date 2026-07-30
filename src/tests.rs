@@ -24,10 +24,15 @@ use serde_json::Value;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::future::{Ready, ready};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tower::ServiceExt;
+use tower_layer::Layer;
+use tower_service::Service;
 use url::form_urlencoded;
 
 const TEST_IAT: u64 = 1_700_000_000;
@@ -70,6 +75,51 @@ oPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xq
 i+yUod+j8MtvIj812dkS4QMiRVN/by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5T
 dQIDAQAB
 -----END PUBLIC KEY-----"#;
+
+struct StatefulReadinessService {
+    ready: bool,
+}
+
+impl Clone for StatefulReadinessService {
+    fn clone(&self) -> Self {
+        Self { ready: false }
+    }
+}
+
+impl Service<Request<Body>> for StatefulReadinessService {
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Ready<std::result::Result<Response, Infallible>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.ready = true;
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _request: Request<Body>) -> Self::Future {
+        let status = if self.ready {
+            StatusCode::OK
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        ready(Ok(Response::builder()
+            .status(status)
+            .body(Body::empty())
+            .unwrap()))
+    }
+}
+
+#[tokio::test]
+async fn middleware_calls_the_inner_instance_that_was_polled_ready() {
+    let mut service =
+        RequireAuthenticatedLayer::new().layer(StatefulReadinessService { ready: false });
+    let mut request = Request::new(Body::empty());
+    request.extensions_mut().insert(Principal::new("alice"));
+
+    let response = service.ready().await.unwrap().call(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
 
 #[test]
 fn config_loads_quarkus_oidc_properties() {
