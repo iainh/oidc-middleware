@@ -460,6 +460,7 @@ impl WebApp {
         ];
         debug!(token_endpoint = %self.token_endpoint, "exchanging OIDC authorization code for tokens");
         let response = self.token_request(&form).await?;
+        validate_token_response(&response, TokenResponseKind::Initial)?;
         Ok(response)
     }
 
@@ -469,7 +470,9 @@ impl WebApp {
             ("refresh_token", refresh_token),
         ];
         debug!(token_endpoint = %self.token_endpoint, "refreshing OIDC web-app tokens");
-        self.token_request(&form).await
+        let response = self.token_request(&form).await?;
+        validate_token_response(&response, TokenResponseKind::Refresh)?;
+        Ok(response)
     }
 
     #[allow(deprecated)]
@@ -526,6 +529,7 @@ impl WebApp {
             .json::<TokenResponse>()
             .await
             .map_err(|error| Error::TokenRejected(error.into()))?;
+        validate_token_response_type(&response)?;
         trace!(
             grant_type,
             has_id_token = response.id_token.is_some(),
@@ -558,11 +562,6 @@ impl WebApp {
         // introspection or UserInfo fallback.
         let validated_id_token = match token_response.id_token.as_deref() {
             Some(raw) => Some(validate_id_token(raw, id_token_validator, expected_nonce).await?),
-            None if expected_nonce.is_some() => {
-                return Err(Error::TokenRejected(
-                    "token response is missing an ID token required for nonce validation".into(),
-                ));
-            }
             None => None,
         };
         let principal = match validator
@@ -1401,6 +1400,50 @@ mod forwarded_tests {
         assert!(validate_id_token_nonce(&IdTokenClaims::default(), None).is_ok());
     }
 
+    fn token_response(json: &str) -> TokenResponse {
+        serde_json::from_str(json).expect("token response should deserialize")
+    }
+
+    #[test]
+    fn initial_token_response_requires_id_token_without_nonce() {
+        let response = token_response(r#"{"access_token":"access","token_type":"Bearer"}"#);
+        let error = validate_token_response(&response, TokenResponseKind::Initial)
+            .expect_err("initial response without an ID token should be rejected");
+        assert!(error.to_string().contains("missing an ID token"));
+    }
+
+    #[test]
+    fn refresh_token_response_may_omit_id_token() {
+        let response = token_response(r#"{"access_token":"access","token_type":"Bearer"}"#);
+        assert!(validate_token_response(&response, TokenResponseKind::Refresh).is_ok());
+    }
+
+    #[test]
+    fn token_response_requires_token_type() {
+        let error = serde_json::from_str::<TokenResponse>(r#"{"access_token":"access"}"#)
+            .err()
+            .expect("missing token_type should fail deserialization");
+        assert!(error.to_string().contains("token_type"));
+    }
+
+    #[test]
+    fn token_response_rejects_unsupported_token_type() {
+        let response = token_response(r#"{"access_token":"access","token_type":"MAC"}"#);
+        let error = validate_token_response_type(&response)
+            .expect_err("unsupported token_type should be rejected");
+        assert!(error.to_string().contains("unsupported token type `MAC`"));
+    }
+
+    #[test]
+    fn token_response_accepts_bearer_case_insensitively() {
+        for token_type in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let response = token_response(&format!(
+                r#"{{"access_token":"access","token_type":"{token_type}"}}"#
+            ));
+            assert!(validate_token_response_type(&response).is_ok());
+        }
+    }
+
     fn request_with_forwarded(values: &[&str]) -> Request<Body> {
         let mut builder = Request::builder().uri("/protected");
         for value in values {
@@ -2031,9 +2074,38 @@ where
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
+    token_type: String,
     id_token: Option<String>,
     refresh_token: Option<String>,
     expires_in: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum TokenResponseKind {
+    Initial,
+    Refresh,
+}
+
+fn validate_token_response(response: &TokenResponse, kind: TokenResponseKind) -> Result<()> {
+    if matches!(kind, TokenResponseKind::Initial) && response.id_token.is_none() {
+        return Err(Error::TokenRejected(
+            "initial authorization-code token response is missing an ID token".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_token_response_type(response: &TokenResponse) -> Result<()> {
+    if !response.token_type.eq_ignore_ascii_case("Bearer") {
+        return Err(Error::TokenRejected(
+            format!(
+                "token response uses unsupported token type `{}`; expected Bearer",
+                response.token_type
+            )
+            .into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
