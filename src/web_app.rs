@@ -32,6 +32,9 @@ use url::form_urlencoded;
 const TOKEN_STATE_COOKIE_NAME: &str = "q_oidc";
 const REDIRECT_STATE_COOKIE_NAME: &str = "q_oidc_redirect";
 const REDIRECT_STATE_COOKIE_MAX_AGE_SECS: i64 = 600;
+// Common browsers limit a cookie to 4096 bytes. Apply that limit to the whole
+// encoded Set-Cookie value so the name and attributes are included as well.
+const MAX_SET_COOKIE_BYTES: usize = 4096;
 const MAX_COOKIE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_COOKIE_SEGMENTS: usize = 64;
 const MAX_CALLBACK_FORM_BYTES: usize = 16 * 1024;
@@ -1991,7 +1994,7 @@ impl CookieTokenStateManager {
         let encrypted = jar.get(TOKEN_STATE_COOKIE_NAME).ok_or_else(|| {
             session_error(std::io::Error::other("token-state cookie was not created"))
         })?;
-        header_value(encrypted.encoded().to_string())
+        header_value(encrypted.encoded().to_string(), "token-state")
     }
 
     fn clear(&self) -> Result<HeaderValue> {
@@ -2006,6 +2009,7 @@ impl CookieTokenStateManager {
                 .build()
                 .encoded()
                 .to_string(),
+            "token-state",
         )
     }
 
@@ -2090,7 +2094,7 @@ impl RedirectStateCookieManager {
                 "redirect-state cookie was not created",
             ))
         })?;
-        header_value(encrypted.encoded().to_string())
+        header_value(encrypted.encoded().to_string(), "redirect-state")
     }
 
     fn clear(&self) -> Result<HeaderValue> {
@@ -2105,6 +2109,7 @@ impl RedirectStateCookieManager {
                 .build()
                 .encoded()
                 .to_string(),
+            "redirect-state",
         )
     }
 
@@ -2198,10 +2203,16 @@ fn key_from_config(value: &str) -> crate::BuildResult<Key> {
     Ok(key)
 }
 
-fn header_value(cookie: String) -> Result<HeaderValue> {
+fn header_value(cookie: String, state_kind: &str) -> Result<HeaderValue> {
+    if cookie.len() > MAX_SET_COOKIE_BYTES {
+        return Err(session_error(std::io::Error::other(format!(
+            "encrypted {state_kind} cookie is {} bytes, exceeding the {MAX_SET_COOKIE_BYTES}-byte Set-Cookie limit; reduce token/claim/session data or use server-side session storage",
+            cookie.len()
+        ))));
+    }
     HeaderValue::from_str(&cookie).map_err(|error| {
         Error::Session(
-            std::io::Error::other(format!("invalid token-state cookie header: {error}")).into(),
+            std::io::Error::other(format!("invalid {state_kind} cookie header: {error}")).into(),
         )
     })
 }
@@ -2481,5 +2492,70 @@ impl StoredPrincipal {
 
     fn into_principal(self) -> Principal {
         Principal::from_parts(self.subject, self.issuer, self.audience, self.groups)
+    }
+}
+
+#[cfg(test)]
+mod cookie_size_tests {
+    use super::*;
+
+    #[test]
+    fn set_cookie_limit_includes_name_value_and_attributes_at_boundary() {
+        let attributes = "; Path=/; Secure; HttpOnly; SameSite=Lax";
+        let prefix = "q_oidc=";
+        let value = "x".repeat(MAX_SET_COOKIE_BYTES - prefix.len() - attributes.len());
+        let cookie = format!("{prefix}{value}{attributes}");
+
+        assert_eq!(cookie.len(), MAX_SET_COOKIE_BYTES);
+        assert!(header_value(cookie, "token-state").is_ok());
+
+        let oversized = format!("{prefix}{value}x{attributes}");
+        let error = header_value(oversized, "token-state").unwrap_err();
+        assert!(error.to_string().contains("4096-byte Set-Cookie limit"));
+        assert!(error.to_string().contains("server-side session storage"));
+    }
+
+    #[test]
+    fn rejects_encrypted_token_state_with_large_jwt_data() {
+        let manager = CookieTokenStateManager::new(Key::generate(), true, 0, 0, false).unwrap();
+        let jwt = format!("{}.{}.signature", "header", "x".repeat(6_000));
+        let authentication = StoredAuthentication {
+            principal: StoredPrincipal {
+                subject: "alice".to_owned(),
+                issuer: None,
+                audience: vec![],
+                groups: vec![],
+            },
+            id_token: None,
+            token_state: StoredTokenState {
+                access_token: jwt,
+                refresh_token: Some("r".repeat(1_000)),
+                expires_at: None,
+            },
+        };
+
+        let error = manager.store_stored(&authentication).unwrap_err();
+        assert!(error.to_string().contains("encrypted token-state cookie"));
+        assert!(error.to_string().contains("4096-byte Set-Cookie limit"));
+    }
+
+    #[test]
+    fn rejects_encrypted_redirect_state_when_original_uri_is_oversized() {
+        let manager =
+            RedirectStateCookieManager::new(Key::generate(), true, OidcResponseMode::Query);
+        let state = RedirectState {
+            state: "state".to_owned(),
+            nonce: Some("nonce".to_owned()),
+            code_verifier: "verifier".to_owned(),
+            original_uri: Some(format!("/return?data={}", "x".repeat(6_000))),
+        };
+
+        let error = manager.store(&state).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("encrypted redirect-state cookie")
+        );
+        assert!(error.to_string().contains("4096-byte Set-Cookie limit"));
     }
 }

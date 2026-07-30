@@ -223,6 +223,10 @@ The current implementation supports:
 - Service and hybrid `oidc.application-type` bearer-token middleware.
 - Browser `web-app` login routes with `Oidc::routes()` when provider discovery
   or explicit authorization and token endpoints are configured.
+- Encrypted token-state and redirect-state `Set-Cookie` values are limited to
+  4096 bytes, including the cookie name and attributes, for compatibility with
+  common browsers. Applications with larger tokens, claims, or session state
+  should keep that data in server-side session storage instead of cookies.
 - Nonce-bound ID-token validation for browser login, enabled by default; set
   `oidc.authentication.nonce-required=false` only for incompatible providers.
 - Query/GET callbacks by default. Set
