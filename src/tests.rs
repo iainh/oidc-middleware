@@ -14,7 +14,9 @@ use axum::routing::get;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::Request;
-use http::header::{AUTHORIZATION, COOKIE, HOST, LOCATION, SET_COOKIE, WWW_AUTHENTICATE};
+use http::header::{
+    AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST, LOCATION, SET_COOKIE, WWW_AUTHENTICATE,
+};
 use http::{HeaderValue, StatusCode};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -157,6 +159,7 @@ fn config_loads_quarkus_oidc_properties() {
                 .with("oidc.public-key", "configured-public-key")
                 .with("oidc.application-type", "hybrid")
                 .with("oidc.authentication.redirect-path", "/login/callback")
+                .with("oidc.authentication.response-mode", "form_post")
                 .with("oidc.authentication.trust-forwarded-headers", "true")
                 .with("oidc.authentication.restore-path-after-redirect", "false")
                 .with("oidc.authentication.session-age-extension", "120s")
@@ -236,6 +239,7 @@ fn config_loads_quarkus_oidc_properties() {
             application_type: ApplicationType::Hybrid,
             authentication: OidcAuthenticationConfig {
                 redirect_path: "/login/callback".to_owned(),
+                response_mode: OidcResponseMode::FormPost,
                 trust_forwarded_headers: true,
                 restore_path_after_redirect: false,
                 session_age_extension: Duration::from_secs(120),
@@ -1919,6 +1923,7 @@ fn web_app_redirect_test_app_with_options(
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            response_mode: OidcResponseMode::Query,
             trust_forwarded_headers,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
@@ -1966,6 +1971,11 @@ async fn web_app_authorization_redirect_location_with_trust(
     .expect("request should complete");
 
     assert_eq!(response.status(), StatusCode::FOUND);
+    assert!(
+        set_cookie_header(&response, "q_oidc_redirect")
+            .unwrap()
+            .contains("; SameSite=Lax")
+    );
     let location = response
         .headers()
         .get(LOCATION)
@@ -2018,6 +2028,7 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            response_mode: OidcResponseMode::Query,
             trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
@@ -2069,6 +2080,7 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
         "https://issuer.example/realms/app/auth"
     );
     let query = location.query_pairs().collect::<HashMap<_, _>>();
+    assert!(!query.contains_key("response_mode"));
     assert_eq!(
         query.get("response_type").map(|value| value.as_ref()),
         Some("code")
@@ -2110,6 +2122,7 @@ async fn web_app_redirects_without_external_session_layer() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            response_mode: OidcResponseMode::Query,
             trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
@@ -2167,6 +2180,7 @@ async fn web_app_redirect_uri_uses_absolute_request_authority_without_host_heade
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            response_mode: OidcResponseMode::Query,
             trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
@@ -2290,6 +2304,7 @@ async fn web_app_redirect_uri_requires_request_origin_for_relative_redirect_path
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            response_mode: OidcResponseMode::Query,
             trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
@@ -2368,7 +2383,7 @@ fn web_app_rejects_invalid_token_state_cookie_key() {
 }
 
 #[tokio::test]
-async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
+async fn web_app_form_post_callback_exchanges_code_and_stores_token_state_cookie() {
     let token = jwt_with_kid_and_secret(
         "test-key",
         b"secret",
@@ -2398,6 +2413,7 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            response_mode: OidcResponseMode::FormPost,
             trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
@@ -2428,6 +2444,7 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
     )
     .expect("web-app provider metadata should build");
     let app = Router::new()
+        .merge(oidc.routes())
         .route(
             "/protected",
             get(|session: OidcSession| async move {
@@ -2464,16 +2481,60 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
         .query_pairs()
         .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
         .expect("state should be present");
+    assert_eq!(
+        reqwest::Url::parse(redirect)
+            .unwrap()
+            .query_pairs()
+            .find_map(|(key, value)| (key == "response_mode").then(|| value.into_owned()))
+            .as_deref(),
+        Some("form_post")
+    );
+    let redirect_cookie = set_cookie_header(&response, "q_oidc_redirect").unwrap();
+    assert!(redirect_cookie.contains("; SameSite=None"));
+    assert!(redirect_cookie.contains("; Secure"));
 
-    let callback = format!("/login/callback?code=good-code&state={state}");
     let response = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri(callback)
+                .method("POST")
+                .uri("/login/callback")
                 .header(HOST, "app.example")
                 .header(COOKIE, &cookie)
-                .body(Body::empty())
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::from("code=good-code"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login/callback")
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(vec![b'x'; 16 * 1024 + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login/callback")
+                .header(HOST, "app.example")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("code=good-code&state={state}")))
                 .expect("request should be valid"),
         )
         .await
@@ -2542,6 +2603,7 @@ async fn web_app_callback_uses_configured_basic_client_secret_method() {
         },
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            response_mode: OidcResponseMode::Query,
             trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             token_state_cookie_key: None,
@@ -2658,6 +2720,7 @@ async fn hybrid_callback_uses_web_app_flow_without_bearer_token() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            response_mode: OidcResponseMode::Query,
             trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),

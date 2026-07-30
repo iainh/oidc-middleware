@@ -222,6 +222,11 @@ The current implementation supports:
   or explicit authorization and token endpoints are configured.
 - Nonce-bound ID-token validation for browser login, enabled by default; set
   `oidc.authentication.nonce-required=false` only for incompatible providers.
+- Query/GET callbacks by default. Set
+  `oidc.authentication.response-mode=form_post` to request an OIDC form-post
+  response; the callback then accepts only a bounded
+  `application/x-www-form-urlencoded` POST and uses a transient
+  `SameSite=None; Secure` correlation cookie.
 - Browser `web-app` logout with Quarkus-style `oidc.logout.path`,
   `oidc.logout.post-logout-path`, `oidc.logout.post-logout-uri-param`, and
   `oidc.logout.extra-params.*` settings.

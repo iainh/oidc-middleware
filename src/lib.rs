@@ -115,8 +115,8 @@ pub use authorization::{
 pub use config::{
     ApplicationType, ClientSecretMethod, OidcAuthenticationConfig, OidcClientSecretConfig,
     OidcConfig, OidcCredentialsConfig, OidcIntrospectionCredentialsConfig, OidcLogoutConfig,
-    OidcRolesConfig, OidcTokenBindingConfig, OidcTokenConfig, RolesSource, TokenSignatureAlgorithm,
-    WellKnownProvider,
+    OidcResponseMode, OidcRolesConfig, OidcTokenBindingConfig, OidcTokenConfig, RolesSource,
+    TokenSignatureAlgorithm, WellKnownProvider,
 };
 pub use error::{BuildError, Error};
 #[cfg(feature = "jwt")]

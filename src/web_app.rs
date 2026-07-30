@@ -4,11 +4,11 @@ use crate::provider::provider_endpoint_url;
 use crate::validation_claims::unix_timestamp;
 use crate::{
     BuildError, ClientSecretMethod, Error, IdToken, IdTokenClaims, IdTokenValidator, OidcConfig,
-    Principal, Result, RolesSource, TokenValidator,
+    OidcResponseMode, Principal, Result, RolesSource, TokenValidator,
 };
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::response::Response;
-use axum::routing::{MethodRouter, get_service};
+use axum::routing::{MethodRouter, get_service, post_service};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use cookie::time::Duration as CookieDuration;
@@ -34,6 +34,7 @@ const REDIRECT_STATE_COOKIE_NAME: &str = "q_oidc_redirect";
 const REDIRECT_STATE_COOKIE_MAX_AGE_SECS: i64 = 600;
 const MAX_COOKIE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_COOKIE_SEGMENTS: usize = 64;
+const MAX_CALLBACK_FORM_BYTES: usize = 16 * 1024;
 // Local defensive bounds for RFC 7239 parsing; the header ABNF is a list
 // grammar and does not provide operational size limits.
 const MAX_FORWARDED_HEADER_BYTES: usize = 8 * 1024;
@@ -51,6 +52,7 @@ pub(crate) struct WebApp {
     token_endpoint: String,
     end_session_endpoint: Option<String>,
     redirect_path: String,
+    response_mode: OidcResponseMode,
     trust_forwarded_headers: bool,
     restore_path_after_redirect: bool,
     refresh_expired: bool,
@@ -162,6 +164,7 @@ impl WebApp {
             token_endpoint,
             end_session_endpoint,
             redirect_path: config.authentication.redirect_path.clone(),
+            response_mode: config.authentication.response_mode,
             trust_forwarded_headers: config.authentication.trust_forwarded_headers,
             restore_path_after_redirect: config.authentication.restore_path_after_redirect,
             refresh_expired: config.token.refresh_expired,
@@ -188,6 +191,7 @@ impl WebApp {
             redirect_state_cookie: RedirectStateCookieManager::new(
                 cookie_key,
                 configured_cookie_key.is_some(),
+                config.authentication.response_mode,
             ),
         })
     }
@@ -373,6 +377,9 @@ impl WebApp {
             .append_pair("state", &state)
             .append_pair("code_challenge", &code_challenge)
             .append_pair("code_challenge_method", "S256");
+        if self.response_mode == OidcResponseMode::FormPost {
+            query.append_pair("response_mode", "form_post");
+        }
         if let Some(nonce_hash) = nonce_hash.as_deref() {
             query.append_pair("nonce", nonce_hash);
         }
@@ -392,7 +399,27 @@ impl WebApp {
         id_token_validator: Arc<dyn IdTokenValidator>,
     ) -> Result<Response> {
         let redirect_uri = self.redirect_uri(request)?;
-        let params = CallbackQuery::parse(request.uri().query().unwrap_or_default());
+        let params = match self.response_mode {
+            OidcResponseMode::Query => {
+                CallbackQuery::parse(request.uri().query().unwrap_or_default())
+            }
+            OidcResponseMode::FormPost => {
+                let content_type = request
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok());
+                if content_type != Some("application/x-www-form-urlencoded") {
+                    return Err(Error::InvalidCallbackRequest);
+                }
+                let body = std::mem::replace(request.body_mut(), Body::empty());
+                let bytes = to_bytes(body, MAX_CALLBACK_FORM_BYTES)
+                    .await
+                    .map_err(|_| Error::CallbackBodyTooLarge)?;
+                let form =
+                    std::str::from_utf8(&bytes).map_err(|_| Error::InvalidCallbackRequest)?;
+                CallbackQuery::parse(form)
+            }
+        };
         debug!(redirect_uri = %redirect_uri, "processing OIDC authorization callback");
         if let Some(error) = params.error {
             debug!(provider_error = %error, "OIDC authorization endpoint returned an error");
@@ -887,7 +914,10 @@ impl OidcCallbackService {
     where
         S: Clone,
     {
-        get_service(self)
+        match self.web_app.response_mode {
+            OidcResponseMode::Query => get_service(self),
+            OidcResponseMode::FormPost => post_service(self),
+        }
     }
 }
 
@@ -2007,16 +2037,23 @@ impl CookieTokenStateManager {
 #[derive(Clone)]
 struct RedirectStateCookieManager {
     key: Key,
+    same_site: SameSite,
 }
 
 impl RedirectStateCookieManager {
-    fn new(key: Key, has_configured_key: bool) -> Self {
+    fn new(key: Key, has_configured_key: bool, response_mode: OidcResponseMode) -> Self {
         debug!(
             has_configured_key,
             max_age_secs = REDIRECT_STATE_COOKIE_MAX_AGE_SECS,
             "configured web-app redirect-state cookie manager"
         );
-        Self { key }
+        Self {
+            key,
+            same_site: match response_mode {
+                OidcResponseMode::Query => SameSite::Lax,
+                OidcResponseMode::FormPost => SameSite::None,
+            },
+        }
     }
 
     fn load(&self, request: &Request<Body>) -> Result<Option<RedirectState>> {
@@ -2056,7 +2093,7 @@ impl RedirectStateCookieManager {
                 .path("/")
                 .secure(true)
                 .http_only(true)
-                .same_site(SameSite::Lax)
+                .same_site(self.same_site)
                 .max_age(CookieDuration::ZERO)
                 .build()
                 .encoded()
@@ -2069,7 +2106,7 @@ impl RedirectStateCookieManager {
             .path("/")
             .secure(true)
             .http_only(true)
-            .same_site(SameSite::Lax)
+            .same_site(self.same_site)
             .max_age(CookieDuration::seconds(REDIRECT_STATE_COOKIE_MAX_AGE_SECS))
     }
 }
@@ -2162,14 +2199,14 @@ fn header_value(cookie: String) -> Result<HeaderValue> {
     })
 }
 
-struct CallbackQuery<'a> {
-    code: Option<Cow<'a, str>>,
-    state: Option<Cow<'a, str>>,
-    error: Option<Cow<'a, str>>,
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
 }
 
-impl<'a> CallbackQuery<'a> {
-    fn parse(query: &'a str) -> Self {
+impl CallbackQuery {
+    fn parse(query: &str) -> Self {
         let mut parsed = Self {
             code: None,
             state: None,
@@ -2178,9 +2215,9 @@ impl<'a> CallbackQuery<'a> {
 
         for (key, value) in form_urlencoded::parse(query.as_bytes()) {
             match key.as_ref() {
-                "code" => parsed.code = Some(value),
-                "state" => parsed.state = Some(value),
-                "error" => parsed.error = Some(value),
+                "code" => parsed.code = Some(value.into_owned()),
+                "state" => parsed.state = Some(value.into_owned()),
+                "error" => parsed.error = Some(value.into_owned()),
                 _ => {}
             }
         }

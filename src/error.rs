@@ -23,6 +23,10 @@ pub enum Error {
     InvalidAuthorizationHeader,
     /// The configured token header exceeded the maximum accepted size.
     AuthorizationHeaderTooLarge,
+    /// An OIDC form-post callback had an invalid method, content type, or body.
+    InvalidCallbackRequest,
+    /// An OIDC form-post callback body exceeded the defensive size limit.
+    CallbackBodyTooLarge,
     /// The selected tenant is disabled.
     ///
     /// This maps to `404 Not Found`, mirroring the common Quarkus behaviour of
@@ -44,6 +48,8 @@ impl Error {
         match self {
             Self::TenantDisabled => StatusCode::NOT_FOUND,
             Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::InvalidCallbackRequest => StatusCode::BAD_REQUEST,
+            Self::CallbackBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Session(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::MissingBearerToken
             | Self::InvalidAuthorizationHeader
@@ -63,6 +69,7 @@ impl Error {
                 format!(r#"{scheme} error="invalid_request""#)
             }
             Self::TokenRejected(_) => format!(r#"{scheme} error="invalid_token""#),
+            Self::InvalidCallbackRequest | Self::CallbackBodyTooLarge => scheme.to_owned(),
             Self::Session(_) => scheme.to_owned(),
         };
         HeaderValue::from_str(&value).unwrap_or_else(|_| self.challenge())
@@ -114,6 +121,8 @@ impl fmt::Display for Error {
             Self::MissingBearerToken => write!(f, "missing bearer token"),
             Self::InvalidAuthorizationHeader => write!(f, "invalid authorization header"),
             Self::AuthorizationHeaderTooLarge => write!(f, "authorization token header too large"),
+            Self::InvalidCallbackRequest => write!(f, "invalid OIDC callback request"),
+            Self::CallbackBodyTooLarge => write!(f, "OIDC callback body too large"),
             Self::TenantDisabled => write!(f, "OIDC tenant is disabled"),
             Self::Forbidden => write!(f, "authenticated principal is not allowed"),
             Self::TokenRejected(source) => write!(f, "token rejected: {source}"),

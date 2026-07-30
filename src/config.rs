@@ -196,6 +196,11 @@ pub struct OidcAuthenticationConfig {
     /// Use an absolute URI when the public callback URL differs from the
     /// internal request.
     pub redirect_path: String,
+    /// How the provider returns the authorization response.
+    ///
+    /// `Query` (the default) uses a GET callback. `FormPost` requests
+    /// `response_mode=form_post` and accepts a form-encoded POST callback.
+    pub response_mode: OidcResponseMode,
     /// Trust `Forwarded` and `X-Forwarded-*` when constructing external URIs.
     ///
     /// This is disabled by default because clients can spoof these headers.
@@ -235,6 +240,7 @@ impl Default for OidcAuthenticationConfig {
     fn default() -> Self {
         Self {
             redirect_path: "/q/oidc/callback".to_owned(),
+            response_mode: OidcResponseMode::Query,
             trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
@@ -284,6 +290,19 @@ impl ConfigProperties for OidcAuthenticationConfig {
 
         Ok(Self {
             redirect_path,
+            response_mode: config
+                .get_optional::<String>(&key("response-mode"))?
+                .map(|value| {
+                    OidcResponseMode::from_str(&value).map_err(|message| {
+                        mp_config::ConfigError::Conversion {
+                            name: key("response-mode"),
+                            value,
+                            message,
+                        }
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default(),
             trust_forwarded_headers: config
                 .get_optional(&key("trust-forwarded-headers"))?
                 .unwrap_or(false),
@@ -300,6 +319,28 @@ impl ConfigProperties for OidcAuthenticationConfig {
             nonce_required: config.get_optional(&key("nonce-required"))?.unwrap_or(true),
             scopes,
         })
+    }
+}
+
+/// Delivery mode for an OIDC authorization response.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OidcResponseMode {
+    /// Return parameters in the callback URI query using GET.
+    #[default]
+    Query,
+    /// Return parameters in an HTML form submission using POST.
+    FormPost,
+}
+
+impl FromStr for OidcResponseMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "query" => Ok(Self::Query),
+            "form_post" | "form-post" => Ok(Self::FormPost),
+            _ => Err("response-mode must be `query` or `form_post`".to_owned()),
+        }
     }
 }
 
