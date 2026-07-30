@@ -226,7 +226,12 @@ The current implementation supports:
   `oidc.logout.post-logout-path`, `oidc.logout.post-logout-uri-param`, and
   `oidc.logout.extra-params.*` settings.
 - Absolute `oidc.authentication.redirect-path` values for deployments where
-  request host or forwarding headers are unavailable.
+  the public callback origin differs from the direct request origin.
+- Forwarding headers are ignored when callback and post-logout URIs are built
+  by default. Set `oidc.authentication.trust-forwarded-headers=true` only behind
+  a trusted proxy that strips client-supplied `Forwarded` and `X-Forwarded-*`
+  headers; otherwise configure an absolute redirect/post-logout URI. Direct
+  `Host` headers and absolute request URI authorities remain supported.
 - OIDC provider discovery from `oidc.auth-server-url` and discovered `jwks_uri`.
 - Direct `oidc.jwks-path` loading when `oidc.discovery-enabled=false`.
 - Local JWT verification with `oidc.public-key`.

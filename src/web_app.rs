@@ -49,6 +49,7 @@ pub(crate) struct WebApp {
     token_endpoint: String,
     end_session_endpoint: Option<String>,
     redirect_path: String,
+    trust_forwarded_headers: bool,
     restore_path_after_redirect: bool,
     refresh_expired: bool,
     refresh_token_time_skew: Option<u64>,
@@ -157,6 +158,7 @@ impl WebApp {
             token_endpoint,
             end_session_endpoint,
             redirect_path: config.authentication.redirect_path.clone(),
+            trust_forwarded_headers: config.authentication.trust_forwarded_headers,
             restore_path_after_redirect: config.authentication.restore_path_after_redirect,
             refresh_expired: config.token.refresh_expired,
             refresh_token_time_skew: config
@@ -607,7 +609,12 @@ impl WebApp {
     }
 
     fn redirect_uri(&self, request: &Request<Body>) -> Result<String> {
-        absolute_request_uri(request, &self.redirect_path, "OIDC redirect URI")
+        absolute_request_uri(
+            request,
+            &self.redirect_path,
+            "OIDC redirect URI",
+            self.trust_forwarded_headers,
+        )
     }
 
     fn logout(&self, request: &Request<Body>, options: &OidcLogoutOptions) -> Result<Response> {
@@ -674,6 +681,7 @@ impl WebApp {
                     request,
                     post_logout_redirect,
                     "OIDC post-logout redirect URI",
+                    self.trust_forwarded_headers,
                 )?;
                 query.append_pair(
                     &options.post_logout_redirect_uri_parameter,
@@ -693,6 +701,7 @@ fn absolute_request_uri(
     request: &Request<Body>,
     path_or_uri: &str,
     purpose: &str,
+    trust_forwarded_headers: bool,
 ) -> Result<String> {
     if path_or_uri.starts_with("http://") || path_or_uri.starts_with("https://") {
         reqwest::Url::parse(path_or_uri).map_err(|error| {
@@ -708,22 +717,29 @@ fn absolute_request_uri(
             std::io::Error::other(format!("{purpose} path must start with `/`")).into(),
         ));
     }
-    let forwarded = forwarded_origin(request);
-    let host = request_host(request, forwarded.as_ref().and_then(|origin| origin.host.as_deref()))
+    let forwarded = trust_forwarded_headers
+        .then(|| forwarded_origin(request))
+        .flatten();
+    let forwarded_host = forwarded.as_ref().and_then(|origin| origin.host.as_deref());
+    let host = request_host(request, trust_forwarded_headers, forwarded_host)
         .ok_or_else(|| {
         warn!(
             path = %request.uri().path(),
             configured_path = %path_or_uri,
-            "cannot build absolute OIDC URI without Host, X-Forwarded-Host, Forwarded host, URI authority, or an absolute configured URI"
+            "cannot build absolute OIDC URI without Host, URI authority, or an absolute configured URI"
         );
         Error::Session(
             std::io::Error::other(
-                format!("missing request host for {purpose}; set Host/X-Forwarded-Host/Forwarded, use an absolute request URI, or configure an absolute URI"),
+                format!("missing request host for {purpose}; set Host, use an absolute request URI, or configure an absolute URI"),
             )
             .into(),
         )
     })?;
-    let scheme = request_scheme(request, forwarded.as_ref().and_then(|origin| origin.proto));
+    let scheme = request_scheme(
+        request,
+        trust_forwarded_headers,
+        forwarded.as_ref().and_then(|origin| origin.proto),
+    );
     let uri = format!("{scheme}://{host}{path_or_uri}");
     reqwest::Url::parse(&uri).map_err(|error| {
         Error::Session(
@@ -1021,33 +1037,46 @@ fn path_matches(configured: &str, actual: &str) -> bool {
     configured == actual
 }
 
-fn request_scheme(request: &Request<Body>, forwarded_proto: Option<&'static str>) -> &'static str {
+fn request_scheme(
+    request: &Request<Body>,
+    trust_forwarded_headers: bool,
+    forwarded_proto: Option<&'static str>,
+) -> &'static str {
     // RFC 7239 Section 8.1: forwarded values can be client-modified, so treat
     // every origin source as untrusted and validate before URL construction.
-    request
-        .headers()
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .and_then(header_proto)
-        .or(forwarded_proto)
+    trust_forwarded_headers
+        .then(|| {
+            request
+                .headers()
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok())
+                .and_then(header_proto)
+                .or(forwarded_proto)
+        })
+        .flatten()
         .or_else(|| request.uri().scheme_str().and_then(header_proto))
         .unwrap_or("http")
 }
 
 fn request_host<'a>(
     request: &'a Request<Body>,
+    trust_forwarded_headers: bool,
     forwarded_host: Option<&'a str>,
 ) -> Option<Cow<'a, str>> {
     // RFC 7239 Section 8.1 applies to forwarded hosts; apply the same
     // authority validation to legacy X-Forwarded-Host and Host as well.
-    request
-        .headers()
-        .get("x-forwarded-host")
-        .and_then(|value| value.to_str().ok())
-        .map(trim_ows_str)
-        .and_then(valid_authority)
-        .map(Cow::Borrowed)
-        .or_else(|| forwarded_host.and_then(valid_authority).map(Cow::Borrowed))
+    trust_forwarded_headers
+        .then(|| {
+            request
+                .headers()
+                .get("x-forwarded-host")
+                .and_then(|value| value.to_str().ok())
+                .map(trim_ows_str)
+                .and_then(valid_authority)
+                .map(Cow::Borrowed)
+                .or_else(|| forwarded_host.and_then(valid_authority).map(Cow::Borrowed))
+        })
+        .flatten()
         .or_else(|| {
             request
                 .headers()
@@ -1617,7 +1646,7 @@ mod forwarded_tests {
             .body(Body::empty())
             .expect("test request should be valid");
 
-        assert_eq!(request_scheme(&request, None), "https");
+        assert_eq!(request_scheme(&request, true, None), "https");
     }
 
     #[test]
@@ -1629,7 +1658,10 @@ mod forwarded_tests {
             .body(Body::empty())
             .expect("test request should be valid");
 
-        assert_eq!(request_host(&request, None).as_deref(), Some("uri.example"));
+        assert_eq!(
+            request_host(&request, true, None).as_deref(),
+            Some("uri.example")
+        );
     }
 }
 

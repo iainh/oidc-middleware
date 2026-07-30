@@ -157,6 +157,7 @@ fn config_loads_quarkus_oidc_properties() {
                 .with("oidc.public-key", "configured-public-key")
                 .with("oidc.application-type", "hybrid")
                 .with("oidc.authentication.redirect-path", "/login/callback")
+                .with("oidc.authentication.trust-forwarded-headers", "true")
                 .with("oidc.authentication.restore-path-after-redirect", "false")
                 .with("oidc.authentication.session-age-extension", "120s")
                 .with(
@@ -235,6 +236,7 @@ fn config_loads_quarkus_oidc_properties() {
             application_type: ApplicationType::Hybrid,
             authentication: OidcAuthenticationConfig {
                 redirect_path: "/login/callback".to_owned(),
+                trust_forwarded_headers: true,
                 restore_path_after_redirect: false,
                 session_age_extension: Duration::from_secs(120),
                 token_state_cookie_key: Some(
@@ -1904,16 +1906,20 @@ fn oidc_from_config_accepts_web_app_application_type() {
     let _builder = Oidc::from_config(&config).expect("web-app should be accepted");
 }
 
-fn web_app_redirect_test_app() -> Router {
-    web_app_redirect_test_app_with_endpoint("https://issuer.example/realms/app/auth")
+fn web_app_redirect_test_app_with_endpoint(authorization_endpoint: &str) -> Router {
+    web_app_redirect_test_app_with_options(authorization_endpoint, false)
 }
 
-fn web_app_redirect_test_app_with_endpoint(authorization_endpoint: &str) -> Router {
+fn web_app_redirect_test_app_with_options(
+    authorization_endpoint: &str,
+    trust_forwarded_headers: bool,
+) -> Router {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            trust_forwarded_headers,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
@@ -1944,10 +1950,20 @@ fn web_app_redirect_test_app_with_endpoint(authorization_endpoint: &str) -> Rout
 }
 
 async fn web_app_authorization_redirect_location(request: Request<Body>) -> reqwest::Url {
-    let response = web_app_redirect_test_app()
-        .oneshot(request)
-        .await
-        .expect("request should complete");
+    web_app_authorization_redirect_location_with_trust(request, false).await
+}
+
+async fn web_app_authorization_redirect_location_with_trust(
+    request: Request<Body>,
+    trust_forwarded_headers: bool,
+) -> reqwest::Url {
+    let response = web_app_redirect_test_app_with_options(
+        "https://issuer.example/realms/app/auth",
+        trust_forwarded_headers,
+    )
+    .oneshot(request)
+    .await
+    .expect("request should complete");
 
     assert_eq!(response.status(), StatusCode::FOUND);
     let location = response
@@ -2002,6 +2018,7 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
@@ -2093,6 +2110,7 @@ async fn web_app_redirects_without_external_session_layer() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
@@ -2149,6 +2167,7 @@ async fn web_app_redirect_uri_uses_absolute_request_authority_without_host_heade
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
@@ -2201,11 +2220,14 @@ async fn web_app_redirect_uri_uses_absolute_request_authority_without_host_heade
 }
 
 #[tokio::test]
-async fn web_app_redirect_uri_uses_forwarded_header_origin() {
+async fn web_app_redirect_uri_ignores_spoofed_forwarded_headers_by_default() {
     let location = web_app_authorization_redirect_location(
         Request::builder()
             .uri("/protected")
-            .header("forwarded", "proto=https;host=app.example")
+            .header("forwarded", "proto=https;host=attacker.example")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "attacker.example")
+            .header(HOST, "app.example")
             .body(Body::empty())
             .expect("request should be valid"),
     )
@@ -2214,13 +2236,13 @@ async fn web_app_redirect_uri_uses_forwarded_header_origin() {
 
     assert_eq!(
         query.get("redirect_uri").map(|value| value.as_ref()),
-        Some("https://app.example/login/callback")
+        Some("http://app.example/login/callback")
     );
 }
 
 #[tokio::test]
 async fn web_app_redirect_uri_prefers_x_forwarded_headers_over_forwarded() {
-    let location = web_app_authorization_redirect_location(
+    let location = web_app_authorization_redirect_location_with_trust(
         Request::builder()
             .uri("/protected")
             .header("forwarded", "proto=http;host=forwarded.example")
@@ -2228,6 +2250,7 @@ async fn web_app_redirect_uri_prefers_x_forwarded_headers_over_forwarded() {
             .header("x-forwarded-host", "x-forwarded.example")
             .body(Body::empty())
             .expect("request should be valid"),
+        true,
     )
     .await;
     let query = location.query_pairs().collect::<HashMap<_, _>>();
@@ -2240,7 +2263,7 @@ async fn web_app_redirect_uri_prefers_x_forwarded_headers_over_forwarded() {
 
 #[tokio::test]
 async fn web_app_redirect_uri_ignores_invalid_forwarded_origin_headers() {
-    let location = web_app_authorization_redirect_location(
+    let location = web_app_authorization_redirect_location_with_trust(
         Request::builder()
             .uri("/protected")
             .header("forwarded", "proto=https;host=forwarded.example")
@@ -2249,6 +2272,7 @@ async fn web_app_redirect_uri_ignores_invalid_forwarded_origin_headers() {
             .header(HOST, "app.example")
             .body(Body::empty())
             .expect("request should be valid"),
+        true,
     )
     .await;
     let query = location.query_pairs().collect::<HashMap<_, _>>();
@@ -2266,6 +2290,7 @@ async fn web_app_redirect_uri_requires_request_origin_for_relative_redirect_path
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
@@ -2364,6 +2389,7 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
@@ -2498,6 +2524,7 @@ async fn web_app_callback_uses_configured_basic_client_secret_method() {
         },
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             token_state_cookie_key: None,
             nonce_required: false,
@@ -2613,6 +2640,7 @@ async fn hybrid_callback_uses_web_app_flow_without_bearer_token() {
         client_id: Some("orders-web".to_owned()),
         authentication: OidcAuthenticationConfig {
             redirect_path: "/login/callback".to_owned(),
+            trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
@@ -3038,7 +3066,7 @@ async fn web_app_logout_route_redirects_to_provider_end_session_endpoint() {
     );
     assert_eq!(
         query.get("returnTo").map(|value| value.as_ref()),
-        Some("https://app.example/signed-out")
+        Some("http://app.example/signed-out")
     );
     assert_eq!(
         query.get("ui_locales").map(|value| value.as_ref()),

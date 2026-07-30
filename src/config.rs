@@ -192,11 +192,16 @@ impl Default for OidcConfig {
 pub struct OidcAuthenticationConfig {
     /// Redirect URI path or absolute URI used for authorization-code callbacks.
     ///
-    /// Relative paths are expanded from `X-Forwarded-Host`, `Forwarded`,
-    /// `Host`, or the request URI authority. Use an absolute URI when the
-    /// public callback URL differs from the internal Axum request, for example
-    /// behind a reverse proxy that does not forward host information.
+    /// Relative paths are expanded from `Host` or the request URI authority.
+    /// Use an absolute URI when the public callback URL differs from the
+    /// internal request.
     pub redirect_path: String,
+    /// Trust `Forwarded` and `X-Forwarded-*` when constructing external URIs.
+    ///
+    /// This is disabled by default because clients can spoof these headers.
+    /// Enable it only when a trusted reverse proxy removes client-supplied
+    /// forwarding headers and writes its own values.
+    pub trust_forwarded_headers: bool,
     /// Return users to their original path after completing the code flow.
     pub restore_path_after_redirect: bool,
     /// Extra session lifetime available after token expiry for refresh attempts.
@@ -230,6 +235,7 @@ impl Default for OidcAuthenticationConfig {
     fn default() -> Self {
         Self {
             redirect_path: "/q/oidc/callback".to_owned(),
+            trust_forwarded_headers: false,
             restore_path_after_redirect: true,
             session_age_extension: Duration::from_secs(300),
             token_state_cookie_key: None,
@@ -278,6 +284,9 @@ impl ConfigProperties for OidcAuthenticationConfig {
 
         Ok(Self {
             redirect_path,
+            trust_forwarded_headers: config
+                .get_optional(&key("trust-forwarded-headers"))?
+                .unwrap_or(false),
             restore_path_after_redirect: config
                 .get_optional(&key("restore-path-after-redirect"))?
                 .unwrap_or(true),
