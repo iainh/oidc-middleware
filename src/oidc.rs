@@ -15,7 +15,9 @@ use crate::introspection::http_token_introspector;
 #[cfg(all(feature = "http-client", feature = "jwt"))]
 use crate::jwks::HttpJwksProvider;
 #[cfg(all(feature = "http-client", feature = "jwt"))]
-use crate::provider::{auth_server_url_from_config, provider_validation_config};
+use crate::provider::{
+    auth_server_url_from_config, provider_validation_config, validate_provider_metadata,
+};
 #[cfg(all(feature = "http-client", feature = "jwt"))]
 use crate::provider::{discovery_url, provider_endpoint_url};
 use crate::token::bearer_token;
@@ -883,6 +885,10 @@ impl OidcBuilder {
             .json()
             .await?;
 
+        // Bind the document to the issuer that selected its discovery URL before
+        // trusting any endpoint supplied by the document.
+        validate_provider_metadata(&metadata, Some(&auth_server_url))?;
+
         debug!(
             issuer = ?metadata.issuer,
             jwks_uri = %metadata.jwks_uri,
@@ -948,6 +954,7 @@ impl OidcBuilder {
         jwks: JwkSet,
     ) -> BuildResult<Oidc> {
         debug!("installing validator from supplied provider metadata");
+        validate_provider_metadata(&metadata, self.config.auth_server_url.as_deref())?;
         self.install_web_app_from_metadata(&metadata, reqwest::Client::new())?;
         if self.config.token.require_jwt_introspection_only {
             self.install_metadata_introspection(metadata, reqwest::Client::new())?;
@@ -987,6 +994,7 @@ impl OidcBuilder {
         client: reqwest::Client,
     ) -> BuildResult<Oidc> {
         debug!("installing refreshable validator from supplied provider metadata");
+        validate_provider_metadata(&metadata, self.config.auth_server_url.as_deref())?;
         self.install_web_app_from_metadata(&metadata, client.clone())?;
         if self.config.token.require_jwt_introspection_only {
             self.install_metadata_introspection(metadata, client)?;

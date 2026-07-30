@@ -5389,6 +5389,50 @@ fn provider_metadata_parses_oidc_discovery_document() {
     );
 }
 
+#[test]
+fn provider_metadata_json_requires_issuer() {
+    let error = ProviderMetadata::from_json(r#"{"jwks_uri":"https://issuer.example/certs"}"#)
+        .expect_err("discovery metadata without an issuer must be rejected");
+    assert!(error.to_string().contains("requires a non-empty issuer"));
+}
+
+#[test]
+fn supplied_provider_metadata_must_match_configured_issuer() {
+    let result = Oidc::builder(OidcConfig {
+        auth_server_url: Some("https://configured.example".to_owned()),
+        ..OidcConfig::default()
+    })
+    .provider_metadata(test_metadata(), test_jwks());
+
+    assert!(matches!(
+        result,
+        Err(BuildError::InvalidConfiguration { .. })
+    ));
+}
+
+#[test]
+fn supplied_provider_metadata_rejects_non_loopback_http_endpoints() {
+    let mut metadata = test_metadata();
+    metadata.jwks_uri = "http://issuer.example/certs".to_owned();
+
+    let result = Oidc::builder(OidcConfig::default()).provider_metadata(metadata, test_jwks());
+    assert!(matches!(result, Err(BuildError::InvalidUrl { .. })));
+}
+
+#[test]
+fn loopback_http_provider_metadata_is_allowed_for_development() {
+    let mut metadata = test_metadata();
+    metadata.issuer = Some("http://127.0.0.1:8080".to_owned());
+    metadata.jwks_uri = "http://127.0.0.1:8080/certs".to_owned();
+
+    Oidc::builder(OidcConfig {
+        auth_server_url: Some("http://127.0.0.1:8080".to_owned()),
+        ..OidcConfig::default()
+    })
+    .provider_metadata(metadata, test_jwks())
+    .expect("loopback HTTP should remain available for local development");
+}
+
 #[tokio::test]
 async fn provider_metadata_installs_issuer_and_jwks_validator() {
     let token = jwt_with_kid(

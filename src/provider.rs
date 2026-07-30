@@ -10,6 +10,7 @@ use serde::Deserialize;
 /// configured. The field names follow OpenID Connect Discovery 1.0 Section 3,
 /// with `end_session_endpoint` included for RP-Initiated Logout discovery.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(try_from = "RawProviderMetadata")]
 pub struct ProviderMetadata {
     /// Canonical issuer returned by the provider.
     ///
@@ -34,6 +35,40 @@ pub struct ProviderMetadata {
     pub userinfo_endpoint: Option<String>,
     /// OIDC end-session endpoint returned by the provider.
     pub end_session_endpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawProviderMetadata {
+    issuer: Option<String>,
+    jwks_uri: String,
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+    registration_endpoint: Option<String>,
+    revocation_endpoint: Option<String>,
+    introspection_endpoint: Option<String>,
+    userinfo_endpoint: Option<String>,
+    end_session_endpoint: Option<String>,
+}
+
+impl TryFrom<RawProviderMetadata> for ProviderMetadata {
+    type Error = &'static str;
+
+    fn try_from(raw: RawProviderMetadata) -> Result<Self, Self::Error> {
+        if raw.issuer.as_deref().is_none_or(str::is_empty) {
+            return Err("provider metadata requires a non-empty issuer");
+        }
+        Ok(Self {
+            issuer: raw.issuer,
+            jwks_uri: raw.jwks_uri,
+            authorization_endpoint: raw.authorization_endpoint,
+            token_endpoint: raw.token_endpoint,
+            registration_endpoint: raw.registration_endpoint,
+            revocation_endpoint: raw.revocation_endpoint,
+            introspection_endpoint: raw.introspection_endpoint,
+            userinfo_endpoint: raw.userinfo_endpoint,
+            end_session_endpoint: raw.end_session_endpoint,
+        })
+    }
 }
 
 impl ProviderMetadata {
@@ -84,10 +119,74 @@ pub(crate) fn provider_endpoint_url(
             path.trim_start_matches('/')
         )
     };
-    reqwest::Url::parse(&url).map_err(|error| BuildError::InvalidUrl {
+    let parsed = reqwest::Url::parse(&url).map_err(|error| BuildError::InvalidUrl {
         url,
         message: error.to_string(),
-    })
+    })?;
+    validate_secure_url(&parsed)?;
+    Ok(parsed)
+}
+
+#[cfg(all(feature = "http-client", feature = "jwt"))]
+fn validate_secure_url(url: &reqwest::Url) -> crate::BuildResult<()> {
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err(BuildError::InvalidUrl {
+            url: url.to_string(),
+            message: "security-sensitive OIDC URLs must use HTTPS (HTTP is allowed only for loopback development)".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "http-client", feature = "jwt"))]
+pub(crate) fn validate_provider_metadata(
+    metadata: &ProviderMetadata,
+    expected_issuer: Option<&str>,
+) -> crate::BuildResult<()> {
+    let issuer = metadata
+        .issuer
+        .as_deref()
+        .ok_or_else(|| BuildError::InvalidConfiguration {
+            message: "provider metadata requires an issuer".to_owned(),
+        })?;
+    if expected_issuer.is_some_and(|expected| expected != issuer) {
+        return Err(BuildError::InvalidConfiguration {
+            message: format!(
+                "provider metadata issuer `{issuer}` did not exactly match configured issuer `{}`",
+                expected_issuer.unwrap()
+            ),
+        });
+    }
+
+    for endpoint in std::iter::once(issuer)
+        .chain(std::iter::once(metadata.jwks_uri.as_str()))
+        .chain(
+            [
+                metadata.authorization_endpoint.as_deref(),
+                metadata.token_endpoint.as_deref(),
+                metadata.registration_endpoint.as_deref(),
+                metadata.revocation_endpoint.as_deref(),
+                metadata.introspection_endpoint.as_deref(),
+                metadata.userinfo_endpoint.as_deref(),
+                metadata.end_session_endpoint.as_deref(),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+    {
+        let url = reqwest::Url::parse(endpoint).map_err(|error| BuildError::InvalidUrl {
+            url: endpoint.to_owned(),
+            message: error.to_string(),
+        })?;
+        validate_secure_url(&url)?;
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "http-client", feature = "jwt"))]
