@@ -92,6 +92,16 @@ impl Error {
         response
     }
 
+    pub(crate) fn into_callback_response_for_request(
+        self,
+        method: &Method,
+        path: &str,
+    ) -> Response {
+        let status = self.status();
+        self.log_opaque_server_error_for_request(status, method, path);
+        status.into_response()
+    }
+
     fn log_opaque_server_error(&self, status: StatusCode) {
         if status.is_server_error() {
             error!(

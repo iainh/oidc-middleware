@@ -398,6 +398,10 @@ impl WebApp {
         validator: Arc<dyn TokenValidator>,
         id_token_validator: Arc<dyn IdTokenValidator>,
     ) -> Result<Response> {
+        // A callback consumes its one-time correlation state regardless of its
+        // outcome. Queue the removal before parsing or contacting the provider
+        // so every terminal callback response clears it.
+        queue_cookie(request, self.redirect_state_cookie.clear()?);
         let redirect_uri = self.redirect_uri(request)?;
         let params = match self.response_mode {
             OidcResponseMode::Query => {
@@ -423,25 +427,23 @@ impl WebApp {
         debug!(redirect_uri = %redirect_uri, "processing OIDC authorization callback");
         if let Some(error) = params.error {
             debug!(provider_error = %error, "OIDC authorization endpoint returned an error");
-            return Err(Error::TokenRejected(
-                std::io::Error::other(format!("authorization endpoint returned `{error}`")).into(),
-            ));
+            return Err(Error::InvalidCallbackRequest);
         }
         let code = params.code.ok_or_else(|| {
             warn!("OIDC callback did not include an authorization code");
-            Error::InvalidAuthorizationHeader
+            Error::InvalidCallbackRequest
         })?;
         let state = params.state.ok_or_else(|| {
             warn!("OIDC callback did not include a state parameter");
-            Error::InvalidAuthorizationHeader
+            Error::InvalidCallbackRequest
         })?;
         let redirect_state = self.redirect_state_cookie.load(request)?.ok_or_else(|| {
             warn!("OIDC callback did not include a readable redirect-state cookie");
-            Error::InvalidAuthorizationHeader
+            Error::InvalidCallbackRequest
         })?;
         if redirect_state.state != state {
             warn!("OIDC callback state did not match redirect-state cookie");
-            return Err(Error::InvalidAuthorizationHeader);
+            return Err(Error::InvalidCallbackRequest);
         }
 
         // OpenID Connect Core 1.0 Section 3.1.3.1 requires the authorization
@@ -478,9 +480,6 @@ impl WebApp {
             .original_uri
             .unwrap_or_else(|| "/".to_owned());
         let mut response = redirect_response(&redirect_to)?;
-        response
-            .headers_mut()
-            .append(SET_COOKIE, self.redirect_state_cookie.clear()?);
         store_authentication_cookie(&self.token_state_cookie, &mut response, &authenticated)?;
 
         trace!(
@@ -488,7 +487,7 @@ impl WebApp {
             "stored web-app principal in token-state cookie"
         );
         debug!(redirect_to = %redirect_to, "OIDC web-app callback completed");
-        Ok(response)
+        with_pending_cookies(request, response)
     }
 
     fn refresh_enabled(&self) -> bool {
@@ -899,7 +898,6 @@ pub(crate) struct OidcCallbackService {
     web_app: Arc<WebApp>,
     validator: Arc<dyn TokenValidator>,
     id_token_validator: Arc<dyn IdTokenValidator>,
-    authorization_scheme: String,
 }
 
 impl OidcCallbackService {
@@ -907,13 +905,12 @@ impl OidcCallbackService {
         web_app: Arc<WebApp>,
         validator: Arc<dyn TokenValidator>,
         id_token_validator: Arc<dyn IdTokenValidator>,
-        authorization_scheme: String,
+        _authorization_scheme: String,
     ) -> Self {
         Self {
             web_app,
             validator,
             id_token_validator,
-            authorization_scheme,
         }
     }
 
@@ -941,19 +938,22 @@ impl Service<Request<Body>> for OidcCallbackService {
         let web_app = self.web_app.clone();
         let validator = self.validator.clone();
         let id_token_validator = self.id_token_validator.clone();
-        let authorization_scheme = self.authorization_scheme.clone();
-
         Box::pin(async move {
-            let response = web_app
+            let response = match web_app
                 .callback(&mut request, validator, id_token_validator)
                 .await
-                .unwrap_or_else(|error| {
-                    error.into_response_with_scheme_for_request(
-                        &authorization_scheme,
-                        request.method(),
-                        request.uri().path(),
-                    )
-                });
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let mut response = error
+                        .into_callback_response_for_request(request.method(), request.uri().path());
+                    if let Some(pending) = request.extensions_mut().remove::<PendingWebAppCookies>()
+                    {
+                        pending.append_to(&mut response);
+                    }
+                    response
+                }
+            };
             Ok(response)
         })
     }

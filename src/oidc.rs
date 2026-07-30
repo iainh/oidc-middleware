@@ -1415,11 +1415,34 @@ where
                     }
                     Ok(response)
                 }
-                Err(error) => Ok(error.into_response_with_scheme_for_request(
-                    &authorization_scheme,
-                    request.method(),
-                    request.uri().path(),
-                )),
+                Err(error) => {
+                    #[cfg(feature = "web-app")]
+                    let is_callback = oidc
+                        .web_app
+                        .as_ref()
+                        .is_some_and(|web_app| web_app.is_callback(&request));
+                    #[cfg(not(feature = "web-app"))]
+                    let is_callback = false;
+                    let mut response = if is_callback {
+                        error.into_callback_response_for_request(
+                            request.method(),
+                            request.uri().path(),
+                        )
+                    } else {
+                        error.into_response_with_scheme_for_request(
+                            &authorization_scheme,
+                            request.method(),
+                            request.uri().path(),
+                        )
+                    };
+                    #[cfg(feature = "web-app")]
+                    if let Some(pending_cookies) =
+                        request.extensions_mut().remove::<PendingWebAppCookies>()
+                    {
+                        pending_cookies.append_to(&mut response);
+                    }
+                    Ok(response)
+                }
             }
         })
     }

@@ -1954,6 +1954,66 @@ fn web_app_redirect_test_app_with_options(
         .layer(oidc.layer())
 }
 
+#[tokio::test]
+async fn web_app_callback_errors_are_opaque_browser_errors_and_consume_redirect_state() {
+    for callback in [
+        "/login/callback?error=access_denied",
+        "/login/callback",
+        "/login/callback?code=code-without-state",
+        "/login/callback?code=code&state=wrong-state",
+    ] {
+        let app = web_app_redirect_test_app_with_endpoint("https://issuer.example/realms/app/auth");
+        let redirect = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header(HOST, "app.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = cookie_header(&redirect);
+
+        // Merely carrying redirect state on another request must not consume it.
+        let unrelated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/not-the-callback")
+                    .header(HOST, "app.example")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            set_cookie_header(&unrelated, "q_oidc_redirect")
+                .is_none_or(|cookie| !cookie.contains("Max-Age=0"))
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(callback)
+                    .header(HOST, "app.example")
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{callback}");
+        assert!(response.headers().get(WWW_AUTHENTICATE).is_none());
+        let cleared = set_cookie_header(&response, "q_oidc_redirect")
+            .expect("terminal callback should clear redirect state");
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(response_body(response).await.is_empty());
+    }
+}
+
 async fn web_app_authorization_redirect_location(request: Request<Body>) -> reqwest::Url {
     web_app_authorization_redirect_location_with_trust(request, false).await
 }
