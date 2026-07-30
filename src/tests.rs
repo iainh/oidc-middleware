@@ -11,6 +11,8 @@ use axum::body::Body;
 use axum::extract::Extension;
 use axum::response::Response;
 use axum::routing::get;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::Request;
 use http::header::{AUTHORIZATION, COOKIE, HOST, LOCATION, SET_COOKIE, WWW_AUTHENTICATE};
 use http::{HeaderValue, StatusCode};
@@ -20,11 +22,13 @@ use mp_config::{Config, ConfigProperties, MapSource};
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tower::ServiceExt;
+use url::form_urlencoded;
 
 const TEST_IAT: u64 = 1_700_000_000;
 
@@ -1954,6 +1958,16 @@ async fn web_app_redirects_unauthenticated_request_to_authorization_endpoint() {
         Some("openid email")
     );
     assert!(query.contains_key("state"));
+    let code_challenge = query
+        .get("code_challenge")
+        .expect("PKCE code challenge should be present");
+    assert_eq!(code_challenge.len(), 43);
+    assert_eq!(
+        query
+            .get("code_challenge_method")
+            .map(|value| value.as_ref()),
+        Some("S256")
+    );
     let nonce = query
         .get("nonce")
         .expect("nonce should be sent by default for web-app authentication");
@@ -2414,6 +2428,17 @@ async fn web_app_callback_uses_configured_basic_client_secret_method() {
     assert_eq!(response.status(), StatusCode::FOUND);
     let cookie = cookie_header(&response);
     let state = redirect_state(&response);
+    let code_challenge = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|location| reqwest::Url::parse(location).ok())
+        .and_then(|location| {
+            location
+                .query_pairs()
+                .find_map(|(key, value)| (key == "code_challenge").then(|| value.into_owned()))
+        })
+        .expect("PKCE code challenge should be present");
 
     let response = app
         .oneshot(
@@ -2443,6 +2468,15 @@ async fn web_app_callback_uses_configured_basic_client_secret_method() {
         .map(|(_, body)| body)
         .expect("request should include a body");
     assert!(body.contains("grant_type=authorization_code"), "{body}");
+    let form = form_urlencoded::parse(body.as_bytes()).collect::<HashMap<_, _>>();
+    let code_verifier = form
+        .get("code_verifier")
+        .expect("token request should include PKCE code verifier");
+    assert_eq!(code_verifier.len(), 43);
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes())),
+        code_challenge
+    );
     assert!(!body.contains("client_secret="), "{body}");
 }
 

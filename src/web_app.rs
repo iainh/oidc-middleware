@@ -310,6 +310,8 @@ impl WebApp {
         let state = random_state()?;
         let nonce = self.nonce_required.then(random_nonce).transpose()?;
         let nonce_hash = nonce.as_deref().map(hash_nonce);
+        let code_verifier = random_code_verifier()?;
+        let code_challenge = pkce_code_challenge(&code_verifier);
         debug!(
             original_uri = %original_uri,
             redirect_uri = %redirect_uri,
@@ -319,6 +321,7 @@ impl WebApp {
         let redirect_state = RedirectState {
             state: state.clone(),
             nonce,
+            code_verifier,
             original_uri: self
                 .restore_path_after_redirect
                 .then_some(original_uri.clone()),
@@ -336,7 +339,9 @@ impl WebApp {
             .append_pair("client_id", &self.client_id)
             .append_pair("redirect_uri", &redirect_uri)
             .append_pair("scope", &self.scopes.join(" "))
-            .append_pair("state", &state);
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &code_challenge)
+            .append_pair("code_challenge_method", "S256");
         if let Some(nonce_hash) = nonce_hash.as_deref() {
             serializer.append_pair("nonce", nonce_hash);
         }
@@ -387,7 +392,9 @@ impl WebApp {
         // code grant token request to include the code and redirect_uri used in
         // the Authentication Request. The state check above is the local
         // correlation guard before exchanging the code.
-        let token_response = self.exchange_code(&code, &redirect_uri).await?;
+        let token_response = self
+            .exchange_code(&code, &redirect_uri, &redirect_state.code_verifier)
+            .await?;
         trace!(
             has_id_token = token_response.id_token.is_some(),
             "OIDC token endpoint returned callback tokens"
@@ -425,11 +432,17 @@ impl WebApp {
         self.refresh_expired || self.refresh_token_time_skew.is_some()
     }
 
-    async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<TokenResponse> {
+    async fn exchange_code(
+        &self,
+        code: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> Result<TokenResponse> {
         let form = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", redirect_uri),
+            ("code_verifier", code_verifier),
         ];
         debug!(token_endpoint = %self.token_endpoint, "exchanging OIDC authorization code for tokens");
         let response = self.token_request(&form).await?;
@@ -2000,6 +2013,20 @@ fn random_nonce() -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn random_code_verifier() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        Error::Session(
+            std::io::Error::other(format!("failed to generate PKCE code verifier: {error}")).into(),
+        )
+    })?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn pkce_code_challenge(code_verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()))
+}
+
 fn hash_nonce(nonce: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(nonce.as_bytes()))
 }
@@ -2045,6 +2072,7 @@ struct RedirectState {
     state: String,
     #[serde(default)]
     nonce: Option<String>,
+    code_verifier: String,
     original_uri: Option<String>,
 }
 
