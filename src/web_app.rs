@@ -472,6 +472,7 @@ impl WebApp {
         self.token_request(&form).await
     }
 
+    #[allow(deprecated)]
     async fn token_request(&self, form: &[(&str, &str)]) -> Result<TokenResponse> {
         let grant_type = form
             .iter()
@@ -487,7 +488,9 @@ impl WebApp {
         // OpenID Connect Core 1.0 Section 9 defines client authentication for
         // token endpoint calls. This maps the Quarkus-compatible
         // `credentials.client-secret.method` setting to the common
-        // client_secret_basic, client_secret_post, and query-parameter shapes.
+        // client_secret_basic and client_secret_post shapes. The deprecated
+        // Query variant is treated as POST so programmatic configuration can
+        // never put a secret in a URL.
         let request = match (self.client_secret.as_deref(), self.client_secret_method) {
             (Some(secret), ClientSecretMethod::Basic) => self
                 .client
@@ -495,7 +498,8 @@ impl WebApp {
                 .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .form(form)
                 .basic_auth(&self.client_id, Some(secret)),
-            (Some(secret), ClientSecretMethod::Post) => {
+            (Some(secret), ClientSecretMethod::Post)
+            | (Some(secret), ClientSecretMethod::Query) => {
                 let mut authenticated_form = form.to_vec();
                 authenticated_form.push(("client_id", self.client_id.as_str()));
                 authenticated_form.push(("client_secret", secret));
@@ -504,15 +508,6 @@ impl WebApp {
                     .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .form(&authenticated_form)
             }
-            (Some(secret), ClientSecretMethod::Query) => self
-                .client
-                .post(&self.token_endpoint)
-                .query(&[
-                    ("client_id", self.client_id.as_str()),
-                    ("client_secret", secret),
-                ])
-                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .form(form),
             (None, _) => {
                 let mut public_form = form.to_vec();
                 public_form.push(("client_id", self.client_id.as_str()));

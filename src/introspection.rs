@@ -414,6 +414,7 @@ pub(crate) fn http_token_introspector(
 }
 
 #[cfg(feature = "http-client")]
+#[allow(deprecated)]
 pub(crate) fn introspection_request<'a>(
     client: &'a reqwest::Client,
     endpoint: &'a str,
@@ -438,17 +439,14 @@ pub(crate) fn introspection_request<'a>(
                 .form(&form)
                 .basic_auth(client_auth_name, Some(client_secret))
         }
-        (Some(client_id), _, Some(client_secret), ClientSecretMethod::Post) => {
+        (Some(client_id), _, Some(client_secret), ClientSecretMethod::Post)
+        | (Some(client_id), _, Some(client_secret), ClientSecretMethod::Query) => {
             client.post(endpoint).form(&[
                 ("token", token),
                 ("client_id", client_id),
                 ("client_secret", client_secret),
             ])
         }
-        (Some(client_id), _, Some(client_secret), ClientSecretMethod::Query) => client
-            .post(endpoint)
-            .query(&[("client_id", client_id), ("client_secret", client_secret)])
-            .form(&[("token", token)]),
         _ => client.post(endpoint).form(&[("token", token)]),
     }
 }

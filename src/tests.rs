@@ -545,18 +545,23 @@ fn config_rejects_empty_introspection_credentials_secret() {
 }
 
 #[test]
-fn config_loads_query_client_secret_method() {
+fn config_rejects_query_client_secret_method() {
     let config = Config::builder()
         .add_source(
             MapSource::new("test", 100).with("oidc.credentials.client-secret.method", "query"),
         )
         .build();
 
-    let oidc = OidcConfig::from_config(&config).expect("config should load");
+    let error = OidcConfig::from_config(&config)
+        .expect_err("query client secret method should be rejected at startup");
 
-    assert_eq!(
-        oidc.credentials.client_secret.method,
-        ClientSecretMethod::Query
+    assert!(
+        error.to_string().contains("exposes secrets in URLs"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("use `basic` or `post`"),
+        "{error}"
     );
 }
 
@@ -574,7 +579,7 @@ fn config_rejects_unknown_client_secret_method() {
     assert!(
         error
             .to_string()
-            .contains("expected one of `basic`, `post`, or `query`"),
+            .contains("expected one of `basic` or `post`"),
         "{error}"
     );
 }
@@ -1244,7 +1249,8 @@ fn introspection_request_posts_client_secret_when_configured() {
 }
 
 #[test]
-fn introspection_request_uses_query_client_secret_when_configured() {
+#[allow(deprecated)]
+fn introspection_request_never_puts_query_client_secret_in_url() {
     let request = introspection_request(
         &reqwest::Client::new(),
         "https://issuer.example/realms/app/protocol/openid-connect/token/introspect",
@@ -1264,14 +1270,11 @@ fn introspection_request_uses_query_client_secret_when_configured() {
         .and_then(reqwest::Body::as_bytes)
         .and_then(|body| std::str::from_utf8(body).ok())
         .expect("request body should be buffered form data");
-    let query = request.url().query().expect("query should be present");
-
     assert!(!request.headers().contains_key(AUTHORIZATION));
     assert!(body.contains("token=opaque-token"), "{body}");
-    assert!(!body.contains("client_id="), "{body}");
-    assert!(!body.contains("client_secret="), "{body}");
-    assert!(query.contains("client_id=orders-service"), "{query}");
-    assert!(query.contains("client_secret=orders-secret"), "{query}");
+    assert!(body.contains("client_id=orders-service"), "{body}");
+    assert!(body.contains("client_secret=orders-secret"), "{body}");
+    assert!(request.url().query().is_none(), "{}", request.url());
 }
 
 #[test]
@@ -1317,6 +1320,7 @@ fn http_introspector_uses_client_secret_value() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn http_introspector_uses_introspection_credentials() {
     let config = OidcConfig {
         client_id: Some("orders-service".to_owned()),

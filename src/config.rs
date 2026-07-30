@@ -393,9 +393,8 @@ pub struct OidcCredentialsConfig {
     pub secret: Option<String>,
     /// Client-secret authentication method.
     ///
-    /// Providers differ on whether they expect Basic authentication, form
-    /// parameters, or query parameters. Prefer Basic unless the provider
-    /// explicitly requires a different method.
+    /// Providers differ on whether they expect Basic authentication or form
+    /// parameters. Prefer Basic unless the provider explicitly requires POST.
     pub client_secret: OidcClientSecretConfig,
 }
 
@@ -464,9 +463,8 @@ impl ConfigProperties for OidcClientSecretConfig {
 
 /// Client-secret authentication method.
 ///
-/// Providers differ on whether they expect Basic authentication, form
-/// parameters, or query parameters. Prefer Basic unless the provider
-/// explicitly requires a different method.
+/// Providers differ on whether they expect Basic authentication or form
+/// parameters. Prefer Basic unless the provider explicitly requires POST.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ClientSecretMethod {
     /// Send client credentials with HTTP Basic authentication.
@@ -474,7 +472,15 @@ pub enum ClientSecretMethod {
     Basic,
     /// Send client credentials as form parameters.
     Post,
-    /// Send client credentials as query parameters.
+    /// Legacy query-parameter authentication method.
+    ///
+    /// Configuration no longer accepts this method because URLs are commonly
+    /// logged. Requests constructed programmatically with this variant send
+    /// credentials in the form body instead.
+    #[deprecated(
+        since = "0.9.0",
+        note = "query authentication can expose client secrets in URLs; use `Post` instead"
+    )]
     Query,
 }
 
@@ -483,9 +489,12 @@ impl mp_config::FromConfigValue for ClientSecretMethod {
         match value.to_ascii_lowercase().as_str() {
             "basic" => Ok(Self::Basic),
             "post" => Ok(Self::Post),
-            "query" => Ok(Self::Query),
+            "query" => Err(
+                "`query` client-secret authentication is insecure because it exposes secrets in URLs; use `basic` or `post`"
+                    .to_owned(),
+            ),
             other => Err(format!(
-                "expected one of `basic`, `post`, or `query`, got `{other}`"
+                "expected one of `basic` or `post`, got `{other}`"
             )),
         }
     }
