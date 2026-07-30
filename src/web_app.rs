@@ -224,7 +224,9 @@ impl WebApp {
             return Ok(None);
         };
         let stored_principal = stored_authentication.principal;
-        let stored_id_token = stored_authentication.id_token;
+        let stored_id_token = stored_authentication
+            .id_token
+            .map(StoredIdToken::into_id_token);
         let stored_token_state = stored_authentication.token_state;
 
         let freshness = stored_token_state.freshness(
@@ -244,7 +246,7 @@ impl WebApp {
         match freshness {
             TokenFreshness::Current => Ok(Some(WebAppSession {
                 principal: stored_principal.into_principal(),
-                id_token: stored_id_token.map(StoredIdToken::into_id_token),
+                id_token: stored_id_token,
             })),
             TokenFreshness::RefreshNeeded if self.refresh_enabled() => {
                 let Some(refresh_token) = stored_token_state.refresh_token.as_deref() else {
@@ -264,7 +266,7 @@ impl WebApp {
                     );
                     return Ok(Some(WebAppSession {
                         principal: stored_principal.into_principal(),
-                        id_token: stored_id_token.map(StoredIdToken::into_id_token),
+                        id_token: stored_id_token,
                     }));
                 };
                 match self.refresh_tokens(refresh_token).await {
@@ -276,6 +278,7 @@ impl WebApp {
                                 id_token_validator,
                                 Some(refresh_token),
                                 None,
+                                stored_id_token.as_ref(),
                             )
                             .await
                         {
@@ -432,6 +435,7 @@ impl WebApp {
                 id_token_validator,
                 None,
                 expected_nonce.as_deref(),
+                None,
             )
             .await?;
         let redirect_to = redirect_state
@@ -556,6 +560,7 @@ impl WebApp {
         id_token_validator: Arc<dyn IdTokenValidator>,
         previous_refresh_token: Option<&str>,
         expected_nonce: Option<&str>,
+        previous_id_token: Option<&IdToken>,
     ) -> Result<AuthenticatedTokens> {
         trace!(
             has_id_token = token_response.id_token.is_some(),
@@ -570,7 +575,13 @@ impl WebApp {
         // ID tokens use a purpose-specific validator and never the access-token
         // introspection or UserInfo fallback.
         let validated_id_token = match token_response.id_token.as_deref() {
-            Some(raw) => Some(validate_id_token(raw, id_token_validator, expected_nonce).await?),
+            Some(raw) => {
+                let validated = validate_id_token(raw, id_token_validator, expected_nonce).await?;
+                if let Some(previous) = previous_id_token {
+                    validate_refreshed_id_token(previous.claims(), validated.0.claims())?;
+                }
+                Some(validated)
+            }
             None => None,
         };
         let principal = match validator
@@ -593,13 +604,14 @@ impl WebApp {
             },
         };
         let now = unix_timestamp()?;
-        let id_token = validated_id_token.map(|(id_token, _)| id_token);
+        let refreshed_id_token = validated_id_token.map(|(id_token, _)| id_token);
         let token_state = StoredTokenState::from_response(
             &token_response,
             previous_refresh_token,
-            &id_token,
+            &refreshed_id_token,
             now,
         );
+        let id_token = refreshed_or_previous_id_token(refreshed_id_token, previous_id_token);
 
         Ok(AuthenticatedTokens {
             principal,
@@ -987,6 +999,103 @@ fn validate_id_token_nonce(claims: &IdTokenClaims, expected_nonce: Option<&str>)
         None => Err(Error::TokenRejected(
             "ID token is missing the nonce claim".into(),
         )),
+    }
+}
+
+fn validate_refreshed_id_token(previous: &IdTokenClaims, refreshed: &IdTokenClaims) -> Result<()> {
+    if refreshed.iss != previous.iss {
+        return Err(Error::TokenRejected(
+            "refreshed ID token issuer does not match the original ID token".into(),
+        ));
+    }
+    if refreshed.sub != previous.sub {
+        return Err(Error::TokenRejected(
+            "refreshed ID token subject does not match the original ID token".into(),
+        ));
+    }
+    if refreshed.aud.len() != previous.aud.len()
+        || !refreshed.aud.iter().all(|aud| previous.aud.contains(aud))
+    {
+        return Err(Error::TokenRejected(
+            "refreshed ID token audience does not match the original ID token".into(),
+        ));
+    }
+    if previous.auth_time.is_some() && refreshed.auth_time != previous.auth_time {
+        return Err(Error::TokenRejected(
+            "refreshed ID token auth_time does not match the original ID token".into(),
+        ));
+    }
+    if refreshed.nonce.is_some() && refreshed.nonce != previous.nonce {
+        return Err(Error::TokenRejected(
+            "refreshed ID token nonce does not match the original ID token".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn refreshed_or_previous_id_token(
+    refreshed: Option<IdToken>,
+    previous: Option<&IdToken>,
+) -> Option<IdToken> {
+    refreshed.or_else(|| previous.cloned())
+}
+
+#[cfg(test)]
+mod refresh_id_token_tests {
+    use super::*;
+
+    fn claims() -> IdTokenClaims {
+        IdTokenClaims {
+            iss: Some("https://issuer.example".to_owned()),
+            sub: Some("alice".to_owned()),
+            aud: vec!["client".to_owned(), "api".to_owned()],
+            auth_time: Some(1_700_000_000),
+            nonce: Some("original-nonce".to_owned()),
+            ..IdTokenClaims::default()
+        }
+    }
+
+    #[test]
+    fn refreshed_id_token_rejects_subject_audience_and_issuer_changes() {
+        let previous = claims();
+
+        let mut refreshed = claims();
+        refreshed.sub = Some("mallory".to_owned());
+        assert!(validate_refreshed_id_token(&previous, &refreshed).is_err());
+
+        let mut refreshed = claims();
+        refreshed.aud = vec!["other-client".to_owned()];
+        assert!(validate_refreshed_id_token(&previous, &refreshed).is_err());
+
+        let mut refreshed = claims();
+        refreshed.iss = Some("https://other-issuer.example".to_owned());
+        assert!(validate_refreshed_id_token(&previous, &refreshed).is_err());
+    }
+
+    #[test]
+    fn refresh_without_id_token_preserves_previous_validated_token() {
+        let previous = IdToken::with_raw(claims(), "original.jwt");
+        let retained = refreshed_or_previous_id_token(None, Some(&previous));
+
+        assert_eq!(retained, Some(previous));
+    }
+
+    #[test]
+    fn valid_refreshed_id_token_preserves_authentication_event_semantics() {
+        let previous = claims();
+        let mut refreshed = claims();
+        refreshed.aud.reverse();
+        refreshed.nonce = None;
+
+        validate_refreshed_id_token(&previous, &refreshed)
+            .expect("audience order and an omitted refresh nonce are valid");
+
+        refreshed.auth_time = None;
+        assert!(validate_refreshed_id_token(&previous, &refreshed).is_err());
+
+        let mut refreshed = claims();
+        refreshed.nonce = Some("different-nonce".to_owned());
+        assert!(validate_refreshed_id_token(&previous, &refreshed).is_err());
     }
 }
 
