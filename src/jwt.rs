@@ -275,7 +275,7 @@ fn apply_jwks_algorithm_config(validation: &mut Validation, jwks: &JwkSet, confi
     }
 }
 
-fn public_key_algorithm(config: &OidcConfig) -> Algorithm {
+pub(crate) fn public_key_algorithm(config: &OidcConfig) -> Algorithm {
     config
         .token
         .signature_algorithm
@@ -283,7 +283,10 @@ fn public_key_algorithm(config: &OidcConfig) -> Algorithm {
         .unwrap_or(Algorithm::RS256)
 }
 
-fn public_decoding_key(public_key: &str, validation: &Validation) -> BuildResult<DecodingKey> {
+pub(crate) fn public_decoding_key(
+    public_key: &str,
+    validation: &Validation,
+) -> BuildResult<DecodingKey> {
     let key = public_key.as_bytes();
     let algorithm = validation
         .algorithms

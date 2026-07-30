@@ -1903,6 +1903,8 @@ fn oidc_from_config_accepts_web_app_application_type() {
         .add_source(
             MapSource::new("web-app", 100)
                 .with("oidc.public-key", PUBLIC_RSA_KEY)
+                .with("oidc.auth-server-url", "https://issuer.example/realms/app")
+                .with("oidc.client-id", "web-client")
                 .with("oidc.application-type", "web-app"),
         )
         .build();
@@ -3949,11 +3951,30 @@ fn oidc_from_config_accepts_hybrid_application_type() {
         .add_source(
             MapSource::new("hybrid", 100)
                 .with("oidc.public-key", PUBLIC_RSA_KEY)
+                .with("oidc.auth-server-url", "https://issuer.example/realms/app")
+                .with("oidc.client-id", "hybrid-client")
                 .with("oidc.application-type", "hybrid"),
         )
         .build();
 
     let _builder = Oidc::from_config(&config).expect("hybrid should support bearer middleware");
+}
+
+#[test]
+fn public_key_web_app_fails_fast_without_id_token_verifier_inputs() {
+    let config = Config::builder()
+        .add_source(
+            MapSource::new("web-app-missing-client", 100)
+                .with("oidc.public-key", PUBLIC_RSA_KEY)
+                .with("oidc.auth-server-url", "https://issuer.example/realms/app")
+                .with("oidc.application-type", "web-app"),
+        )
+        .build();
+
+    let error = Oidc::from_config(&config)
+        .err()
+        .expect("web-app public-key configuration needs an ID-token audience");
+    assert!(error.to_string().contains("client-id"), "{error}");
 }
 
 #[tokio::test]

@@ -47,7 +47,8 @@ impl IdTokenValidator for RejectAllIdTokens {
 mod jose {
     use super::*;
     use crate::jwks::{JwtKeys, supported_algorithms};
-    use crate::{JwksProvider, OidcConfig};
+    use crate::jwt::{public_decoding_key, public_key_algorithm};
+    use crate::{BuildResult, JwksProvider, OidcConfig};
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{Algorithm, Validation, decode};
 
@@ -60,6 +61,28 @@ mod jose {
     }
 
     impl JoseIdTokenValidator {
+        /// Builds an ID-token validator backed by a static PEM public key.
+        pub fn public_key(
+            public_key: &str,
+            issuer: &str,
+            client_id: &str,
+            config: &OidcConfig,
+        ) -> BuildResult<Self> {
+            let mut validation = Validation::new(public_key_algorithm(config));
+            validation.leeway = config.token.lifespan_grace.unwrap_or_default();
+            validation.set_issuer(&[issuer]);
+            validation.set_audience(&[client_id]);
+            validation
+                .required_spec_claims
+                .extend(["iat".into(), "sub".into()]);
+            let key = public_decoding_key(public_key, &validation)?;
+            Ok(Self {
+                keys: JwtKeys::single(key),
+                validation,
+                client_id: Arc::from(client_id),
+            })
+        }
+
         /// Builds an ID-token validator backed by a JWKS.
         pub fn jwks(jwks: JwkSet, issuer: &str, client_id: &str, leeway: u64) -> Self {
             let mut validation = Validation::new(Algorithm::RS256);

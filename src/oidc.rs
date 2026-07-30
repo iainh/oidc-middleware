@@ -722,6 +722,26 @@ impl OidcBuilder {
             public_key,
             &self.config,
         )?));
+        if self.config.application_type != ApplicationType::Service {
+            let issuer = self
+                .config
+                .token
+                .issuer
+                .as_deref()
+                .or(self.config.auth_server_url.as_deref())
+                .ok_or(BuildError::MissingAuthServerUrl)?;
+            let client_id = self
+                .config
+                .client_id
+                .as_deref()
+                .ok_or(BuildError::MissingClientId)?;
+            self.id_token_validator = Some(Arc::new(JoseIdTokenValidator::public_key(
+                public_key,
+                issuer,
+                client_id,
+                &self.config,
+            )?));
+        }
         Ok(self)
     }
 
@@ -847,6 +867,29 @@ impl OidcBuilder {
             if builder.config.public_key.is_some() {
                 return Ok(builder.build());
             }
+            // Introspection and UserInfo are access-token policies. Web-app and
+            // hybrid flows still require a separate local verifier for the ID
+            // token returned by the authorization-code exchange.
+            if builder.config.application_type != ApplicationType::Service
+                && (builder.config.token.require_jwt_introspection_only
+                    || builder.config.token.verify_access_token_with_user_info)
+            {
+                let jwks_path = builder
+                    .config
+                    .jwks_path
+                    .clone()
+                    .ok_or(BuildError::MissingJwksPath)?;
+                let jwks_url = provider_endpoint_url(&auth_server_url, &jwks_path)?;
+                debug!(jwks_url = %jwks_url, "loading configured JWKS for ID-token validation");
+                let jwks: JwkSet = client
+                    .get(jwks_url)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                builder.install_config_id_token_jwks(jwks)?;
+            }
             if builder.config.token.require_jwt_introspection_only {
                 debug!("discovery disabled; installing configured introspection-only validator");
                 let introspection_path = builder
@@ -924,6 +967,21 @@ impl OidcBuilder {
         builder.install_web_app_from_metadata(&metadata, client.clone())?;
         if builder.config.public_key.is_some() {
             return Ok(builder.build());
+        }
+
+        if builder.config.application_type != ApplicationType::Service
+            && (builder.config.token.require_jwt_introspection_only
+                || builder.config.token.verify_access_token_with_user_info)
+        {
+            debug!(jwks_uri = %metadata.jwks_uri, "fetching provider JWKS for ID-token validation");
+            let jwks: JwkSet = client
+                .get(&metadata.jwks_uri)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            builder.install_id_token_jwks(&metadata, jwks)?;
         }
 
         if builder.config.token.require_jwt_introspection_only {
@@ -1212,6 +1270,32 @@ impl OidcBuilder {
                     message: "provider metadata issuer is required for ID-token validation"
                         .to_owned(),
                 })?;
+        let client_id = self
+            .config
+            .client_id
+            .as_deref()
+            .ok_or(BuildError::MissingClientId)?;
+        self.id_token_validator = Some(Arc::new(JoseIdTokenValidator::jwks(
+            jwks,
+            issuer,
+            client_id,
+            self.config.token.lifespan_grace.unwrap_or_default(),
+        )));
+        Ok(())
+    }
+
+    #[cfg(all(feature = "http-client", feature = "jwt"))]
+    fn install_config_id_token_jwks(&mut self, jwks: JwkSet) -> BuildResult<()> {
+        if self.config.application_type == ApplicationType::Service {
+            return Ok(());
+        }
+        let issuer = self
+            .config
+            .token
+            .issuer
+            .as_deref()
+            .or(self.config.auth_server_url.as_deref())
+            .ok_or(BuildError::MissingAuthServerUrl)?;
         let client_id = self
             .config
             .client_id

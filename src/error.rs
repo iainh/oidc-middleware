@@ -190,6 +190,8 @@ pub enum BuildError {
     MissingTokenEndpoint,
     /// Web-app authorization-code flow requires `oidc.client-id`.
     MissingClientId,
+    /// Web-app and hybrid applications require a local ID-token verifier.
+    MissingIdTokenValidator,
     /// Web-app authorization-code flow requires the `web-app` crate feature.
     WebAppFeatureDisabled,
     /// The configured public key could not be parsed.
@@ -246,6 +248,10 @@ impl fmt::Display for BuildError {
             Self::MissingClientId => {
                 write!(f, "OIDC web-app authentication requires `oidc.client-id`")
             }
+            Self::MissingIdTokenValidator => write!(
+                f,
+                "OIDC web-app and hybrid applications require a local ID-token validator"
+            ),
             Self::WebAppFeatureDisabled => write!(
                 f,
                 "OIDC web-app authentication requires the `web-app` crate feature"
