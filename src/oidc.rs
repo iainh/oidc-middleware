@@ -259,7 +259,8 @@ impl Oidc {
     /// Prefer [`Oidc::routes`] for most web-apps. Use this when an application
     /// needs to mount only the logout route manually.
     ///
-    /// The route clears the local token-state and redirect-state cookies. When
+    /// The route accepts only `POST` and requires a valid local token-state
+    /// cookie before clearing the token-state and redirect-state cookies. When
     /// provider metadata or configuration includes an end-session endpoint, it
     /// redirects there with `id_token_hint` and the configured post-logout
     /// redirect parameter when available. Otherwise it redirects locally.

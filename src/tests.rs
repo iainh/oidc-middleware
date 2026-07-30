@@ -2981,10 +2981,65 @@ async fn web_app_logout_route_clears_local_session_and_redirects_locally() {
     assert_eq!(response.status(), StatusCode::FOUND);
     let session_cookie = cookie_header(&response);
 
+    // GET must never mutate logout state, even when the browser sends its
+    // SameSite=Lax cookie on a top-level cross-site navigation.
     let response = app
         .clone()
         .oneshot(
             Request::builder()
+                .uri("/logout")
+                .header(HOST, "app.example")
+                .header(COOKIE, &session_cookie)
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(response.headers().get(SET_COOKIE).is_none());
+    assert!(response.headers().get(LOCATION).is_none());
+
+    // A cross-site POST does not carry the SameSite=Lax session cookie and
+    // must not reach provider logout or clear local state.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header(HOST, "app.example")
+                .header("origin", "https://attacker.example")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(response.headers().get(SET_COOKIE).is_none());
+    assert!(response.headers().get(LOCATION).is_none());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header(HOST, "app.example")
+                .header(COOKIE, "q_oidc=not-a-valid-private-cookie")
+                .body(Body::empty())
+                .expect("request should be valid"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(response.headers().get(SET_COOKIE).is_none());
+    assert!(response.headers().get(LOCATION).is_none());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
                 .uri("/logout")
                 .header(HOST, "app.example")
                 .header(COOKIE, session_cookie)
@@ -3115,6 +3170,7 @@ async fn web_app_logout_route_redirects_to_provider_end_session_endpoint() {
     let response = app
         .oneshot(
             Request::builder()
+                .method("POST")
                 .uri("/signout")
                 .header(HOST, "app.example")
                 .header("x-forwarded-proto", "https")

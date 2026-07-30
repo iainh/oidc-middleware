@@ -30,8 +30,8 @@ async fn app() -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
 
     Ok(Router::new()
         .route("/health", get(health))
-        // OIDC-owned callback and logout routes must stay outside the OIDC
-        // layer so they can complete login and logout flows directly.
+        // OIDC-owned callback and POST-only logout routes stay outside the
+        // OIDC layer. Logout still requires the SameSite token-state cookie.
         .merge(oidc.routes())
         .merge(protected))
 }

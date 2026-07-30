@@ -7,7 +7,7 @@ use crate::{
     OidcResponseMode, Principal, Result, RolesSource, TokenValidator,
 };
 use axum::body::{Body, to_bytes};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get_service, post_service};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -686,16 +686,23 @@ impl WebApp {
     }
 
     fn logout(&self, request: &Request<Body>, options: &OidcLogoutOptions) -> Result<Response> {
+        // The token-state cookie is encrypted, HttpOnly, and SameSite=Lax. Requiring
+        // it on POST makes it a practical CSRF credential: cross-site POSTs do not
+        // carry it, while callers cannot manufacture a valid value.
+        let Some(authentication) = self
+            .token_state_cookie
+            .load(request)
+            .unwrap_or_else(|error| {
+                debug!(error = %error, "OIDC logout rejected an invalid token-state cookie");
+                None
+            })
+        else {
+            debug!("OIDC logout rejected because no valid token-state cookie was supplied");
+            return Ok(StatusCode::FORBIDDEN.into_response());
+        };
+
         let id_token_hint = if options.id_token_hint {
-            match self.token_state_cookie.load(request) {
-                Ok(authentication) => authentication
-                    .and_then(|authentication| authentication.id_token)
-                    .and_then(|id_token| id_token.raw),
-                Err(error) => {
-                    debug!(error = %error, "OIDC logout could not read token-state cookie for id_token_hint");
-                    None
-                }
-            }
+            authentication.id_token.and_then(|id_token| id_token.raw)
         } else {
             None
         };
@@ -973,15 +980,15 @@ impl OidcLogoutService {
         }
     }
 
-    /// Converts this service into a `GET` route.
+    /// Converts this service into a `POST` route.
     ///
-    /// Add the route outside [`crate::Oidc::layer`] so logout can clear local
-    /// session cookies without first requiring a valid session.
+    /// Add the route outside [`crate::Oidc::layer`]. The request must include a
+    /// valid local token-state cookie before logout can mutate the session.
     pub fn route<S>(self) -> MethodRouter<S>
     where
         S: Clone,
     {
-        get_service(self)
+        post_service(self)
     }
 }
 

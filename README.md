@@ -188,7 +188,7 @@ This keeps OIDC mechanics at the edge of the application while letting route
 handlers receive the identity shape the rest of the codebase understands.
 
 Add the OIDC-owned web-app routes outside the protected OIDC layer so callback
-and logout can complete without first requiring an authenticated session:
+and logout can complete without passing through the protected application layer:
 
 ```rust
 use axum::{Router, routing::get};
@@ -207,8 +207,11 @@ Router::new()
 
 For `web-app` and `hybrid` applications, `Oidc::routes()` registers the
 configured callback path and logout path. For `service` applications, it returns
-an empty router. The logout route clears the web-app token-state and
-redirect-state cookies. If provider discovery or `oidc.end-session-path`
+an empty router. Logout is a state-changing `POST`; forms or clients must send a
+POST request with the current web-app session cookie. The route rejects `GET`
+and requests without a valid encrypted token-state cookie, using that
+`SameSite=Lax` cookie as a practical CSRF credential before it clears the
+token-state and redirect-state cookies. If provider discovery or `oidc.end-session-path`
 supplies an end-session endpoint, the route redirects there with
 `id_token_hint`, the configured post-logout redirect parameter, and any
 configured extra logout parameters.
@@ -229,7 +232,8 @@ The current implementation supports:
   `SameSite=None; Secure` correlation cookie.
 - Browser `web-app` logout with Quarkus-style `oidc.logout.path`,
   `oidc.logout.post-logout-path`, `oidc.logout.post-logout-uri-param`, and
-  `oidc.logout.extra-params.*` settings.
+  `oidc.logout.extra-params.*` settings. Logout endpoints accept only `POST`
+  with a valid local token-state cookie; use a POST form rather than a link.
 - Absolute `oidc.authentication.redirect-path` values for deployments where
   the public callback origin differs from the direct request origin.
 - Forwarding headers are ignored when callback and post-logout URIs are built
