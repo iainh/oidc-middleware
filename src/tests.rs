@@ -3477,20 +3477,32 @@ async fn web_app_refreshes_expired_session_tokens() {
     assert_eq!(response.status(), StatusCode::FOUND);
     let cookie = cookie_header(&response);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/protected")
-                .header(HOST, "app.example")
-                .header(COOKIE, cookie)
-                .body(Body::empty())
-                .expect("request should be valid"),
-        )
-        .await
-        .expect("request should complete");
+    let request = || {
+        Request::builder()
+            .uri("/protected")
+            .header(HOST, "app.example")
+            .header(COOKIE, &cookie)
+            .body(Body::empty())
+            .expect("request should be valid")
+    };
+    // Poll both requests together while they still carry the same browser
+    // cookie. The provider rotates the refresh token, so a second grant would
+    // fail (and, before coordination, could clear a successful response).
+    let (first, second) = tokio::join!(app.clone().oneshot(request()), app.oneshot(request()),);
+    let first = first.expect("first concurrent request should complete");
+    let second = second.expect("second concurrent request should complete");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response_body(response).await, "refreshed@example.com");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    for response in [&first, &second] {
+        let cookie = set_cookie_header(response, "q_oidc")
+            .expect("each concurrent response should carry the refreshed state");
+        assert!(!cookie.contains("Max-Age=0"));
+    }
+    // Consume the responses in the opposite order from request creation: a
+    // later-arriving response must still contain the same successful state.
+    assert_eq!(response_body(second).await, "refreshed@example.com");
+    assert_eq!(response_body(first).await, "refreshed@example.com");
     let forms = forms
         .lock()
         .expect("captured token endpoint forms should not be poisoned");

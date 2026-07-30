@@ -21,10 +21,11 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error as StdError;
-use std::future::{Future, Ready, ready};
+use std::future::{Future, Ready, poll_fn, ready};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 use tower_service::Service;
 use tracing::{debug, trace, warn};
 use url::form_urlencoded;
@@ -44,6 +45,7 @@ const MAX_FORWARDED_HEADER_BYTES: usize = 8 * 1024;
 const MAX_FORWARDED_HEADER_FIELDS: usize = 16;
 const MAX_FORWARDED_ELEMENTS: usize = 32;
 const MAX_FORWARDED_PARAMETERS: usize = 16;
+const REFRESH_FLIGHT_RETENTION: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(crate) struct WebApp {
@@ -68,6 +70,7 @@ pub(crate) struct WebApp {
     role_claim_separator: Arc<str>,
     token_state_cookie: CookieTokenStateManager,
     redirect_state_cookie: RedirectStateCookieManager,
+    refresh_flights: RefreshFlights,
 }
 
 impl WebApp {
@@ -196,6 +199,7 @@ impl WebApp {
                 configured_cookie_key.is_some(),
                 config.authentication.response_mode,
             ),
+            refresh_flights: RefreshFlights::default(),
         })
     }
 
@@ -285,26 +289,16 @@ impl WebApp {
                         id_token: stored_id_token,
                     }));
                 };
-                match self.refresh_tokens(refresh_token).await {
-                    Ok(token_response) => {
-                        let refreshed = match self
-                            .validated_tokens(
-                                token_response,
-                                validator,
-                                id_token_validator,
-                                Some(refresh_token),
-                                None,
-                                stored_id_token.as_ref(),
-                            )
-                            .await
-                        {
-                            Ok(refreshed) => refreshed,
-                            Err(error) => {
-                                debug!(error = %error, "OIDC refreshed tokens were rejected; clearing token-state cookie");
-                                clear_authentication(request, &self.token_state_cookie)?;
-                                return Ok(None);
-                            }
-                        };
+                match self
+                    .coordinated_refresh(
+                        refresh_token,
+                        validator,
+                        id_token_validator,
+                        stored_id_token.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(refreshed) => {
                         debug!(
                             expires_at = ?refreshed.token_state.expires_at,
                             has_id_token = refreshed.id_token.is_some(),
@@ -495,6 +489,42 @@ impl WebApp {
 
     fn refresh_enabled(&self) -> bool {
         self.refresh_expired || self.refresh_token_time_skew.is_some()
+    }
+
+    async fn coordinated_refresh(
+        &self,
+        refresh_token: &str,
+        validator: Arc<dyn TokenValidator>,
+        id_token_validator: Arc<dyn IdTokenValidator>,
+        previous_id_token: Option<&IdToken>,
+    ) -> Result<AuthenticatedTokens> {
+        let key: [u8; 32] = Sha256::digest(refresh_token.as_bytes()).into();
+        let (flight, leader) = self.refresh_flights.join(key);
+        if leader {
+            let outcome = match self.refresh_tokens(refresh_token).await {
+                Ok(response) => self
+                    .validated_tokens(
+                        response,
+                        validator,
+                        id_token_validator,
+                        Some(refresh_token),
+                        None,
+                        previous_id_token,
+                    )
+                    .await
+                    .map(RefreshOutcome::Success)
+                    .unwrap_or_else(|error| {
+                        debug!(error = %error, "OIDC refresh single-flight validation failed");
+                        RefreshOutcome::Failed
+                    }),
+                Err(error) => {
+                    debug!(error = %error, "OIDC refresh single-flight leader failed");
+                    RefreshOutcome::Failed
+                }
+            };
+            flight.complete(outcome);
+        }
+        flight.wait().await
     }
 
     async fn exchange_code(
@@ -1020,6 +1050,7 @@ impl Service<Request<Body>> for OidcLogoutService {
     }
 }
 
+#[derive(Clone)]
 struct AuthenticatedTokens {
     principal: Principal,
     id_token: Option<IdToken>,
@@ -2303,7 +2334,95 @@ where
     Error::Session(error.into())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Default)]
+struct RefreshFlights(Arc<Mutex<HashMap<[u8; 32], Arc<RefreshFlight>>>>);
+
+impl RefreshFlights {
+    fn join(&self, key: [u8; 32]) -> (Arc<RefreshFlight>, bool) {
+        let mut flights = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        flights.retain(|_, flight| !flight.is_stale());
+        if let Some(flight) = flights.get(&key) {
+            return (flight.clone(), false);
+        }
+        let flight = Arc::new(RefreshFlight::default());
+        flights.insert(key, flight.clone());
+        (flight, true)
+    }
+}
+
+#[derive(Default)]
+struct RefreshFlight {
+    state: Mutex<RefreshFlightState>,
+}
+
+#[derive(Default)]
+struct RefreshFlightState {
+    outcome: Option<RefreshOutcome>,
+    completed_at: Option<Instant>,
+    waiters: Vec<Waker>,
+}
+
+#[derive(Clone)]
+enum RefreshOutcome {
+    Success(AuthenticatedTokens),
+    Failed,
+}
+
+impl RefreshFlight {
+    fn complete(&self, outcome: RefreshOutcome) {
+        let waiters = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.outcome = Some(outcome);
+            state.completed_at = Some(Instant::now());
+            std::mem::take(&mut state.waiters)
+        };
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+
+    async fn wait(&self) -> Result<AuthenticatedTokens> {
+        poll_fn(|cx| {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match state.outcome.clone() {
+                Some(RefreshOutcome::Success(response)) => Poll::Ready(Ok(response)),
+                Some(RefreshOutcome::Failed) => Poll::Ready(Err(Error::TokenRejected(
+                    "coordinated OIDC token refresh failed".into(),
+                ))),
+                None => {
+                    if !state
+                        .waiters
+                        .iter()
+                        .any(|waiter| waiter.will_wake(cx.waker()))
+                    {
+                        state.waiters.push(cx.waker().clone());
+                    }
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    fn is_stale(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .completed_at
+            .is_some_and(|completed| completed.elapsed() >= REFRESH_FLIGHT_RETENTION)
+    }
+}
+
+#[derive(Clone, Deserialize)]
 struct TokenResponse {
     access_token: String,
     token_type: String,
