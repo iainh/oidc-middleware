@@ -2319,6 +2319,7 @@ async fn web_app_callback_exchanges_code_and_stores_token_state_cookie() {
     );
     let token_state_cookie = set_cookie_header(&response, "q_oidc")
         .expect("token-state cookie should be set after callback");
+    assert!(token_state_cookie.contains("; Secure"));
     assert!(!token_state_cookie.contains("opaque-access-token"));
     assert!(!token_state_cookie.contains("alice@example.com"));
     let cookie = cookie_header(&response);
@@ -2747,9 +2748,11 @@ async fn web_app_logout_route_clears_local_session_and_redirects_locally() {
     let cleared =
         set_cookie_header(&response, "q_oidc").expect("logout should clear token-state cookie");
     assert!(cleared.contains("Max-Age=0"));
+    assert!(cleared.contains("; Secure"));
     let cleared_redirect = set_cookie_header(&response, "q_oidc_redirect")
         .expect("logout should clear redirect-state cookie");
     assert!(cleared_redirect.contains("Max-Age=0"));
+    assert!(cleared_redirect.contains("; Secure"));
 
     let response = app
         .oneshot(

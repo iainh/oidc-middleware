@@ -1739,6 +1739,7 @@ impl CookieTokenStateManager {
         header_value(
             Cookie::build((TOKEN_STATE_COOKIE_NAME, ""))
                 .path("/")
+                .secure(true)
                 .http_only(true)
                 .same_site(SameSite::Lax)
                 .max_age(CookieDuration::ZERO)
@@ -1755,6 +1756,7 @@ impl CookieTokenStateManager {
     ) -> cookie::CookieBuilder<'static> {
         let mut builder = Cookie::build((TOKEN_STATE_COOKIE_NAME, value))
             .path("/")
+            .secure(true)
             .http_only(true)
             .same_site(SameSite::Lax);
         if let Some(max_age) = max_age {
@@ -1829,6 +1831,7 @@ impl RedirectStateCookieManager {
         header_value(
             Cookie::build((REDIRECT_STATE_COOKIE_NAME, ""))
                 .path("/")
+                .secure(true)
                 .http_only(true)
                 .same_site(SameSite::Lax)
                 .max_age(CookieDuration::ZERO)
@@ -1841,6 +1844,7 @@ impl RedirectStateCookieManager {
     fn cookie_builder(&self, value: String) -> cookie::CookieBuilder<'static> {
         Cookie::build((REDIRECT_STATE_COOKIE_NAME, value))
             .path("/")
+            .secure(true)
             .http_only(true)
             .same_site(SameSite::Lax)
             .max_age(CookieDuration::seconds(REDIRECT_STATE_COOKIE_MAX_AGE_SECS))
