@@ -500,7 +500,7 @@ impl WebApp {
     ) -> Result<AuthenticatedTokens> {
         let key: [u8; 32] = Sha256::digest(refresh_token.as_bytes()).into();
         let (flight, leader) = self.refresh_flights.join(key);
-        if leader {
+        if let Some(leader) = leader {
             let outcome = match self.refresh_tokens(refresh_token).await {
                 Ok(response) => self
                     .validated_tokens(
@@ -522,7 +522,7 @@ impl WebApp {
                     RefreshOutcome::Failed
                 }
             };
-            flight.complete(outcome);
+            leader.complete(outcome);
         }
         flight.wait().await
     }
@@ -2338,18 +2338,60 @@ where
 struct RefreshFlights(Arc<Mutex<HashMap<[u8; 32], Arc<RefreshFlight>>>>);
 
 impl RefreshFlights {
-    fn join(&self, key: [u8; 32]) -> (Arc<RefreshFlight>, bool) {
+    fn join(&self, key: [u8; 32]) -> (Arc<RefreshFlight>, Option<RefreshLeaderGuard>) {
         let mut flights = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         flights.retain(|_, flight| !flight.is_stale());
         if let Some(flight) = flights.get(&key) {
-            return (flight.clone(), false);
+            return (flight.clone(), None);
         }
         let flight = Arc::new(RefreshFlight::default());
         flights.insert(key, flight.clone());
-        (flight, true)
+        let leader = RefreshLeaderGuard {
+            flights: self.clone(),
+            key,
+            flight: flight.clone(),
+            armed: true,
+        };
+        (flight, Some(leader))
+    }
+
+    fn remove(&self, key: &[u8; 32], flight: &Arc<RefreshFlight>) {
+        let mut flights = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if flights
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            flights.remove(key);
+        }
+    }
+}
+
+struct RefreshLeaderGuard {
+    flights: RefreshFlights,
+    key: [u8; 32],
+    flight: Arc<RefreshFlight>,
+    armed: bool,
+}
+
+impl RefreshLeaderGuard {
+    fn complete(mut self, outcome: RefreshOutcome) {
+        self.flight.complete(outcome);
+        self.armed = false;
+    }
+}
+
+impl Drop for RefreshLeaderGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flight.complete(RefreshOutcome::Failed);
+            self.flights.remove(&self.key, &self.flight);
+        }
     }
 }
 
@@ -2419,6 +2461,40 @@ impl RefreshFlight {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .completed_at
             .is_some_and(|completed| completed.elapsed() >= REFRESH_FLIGHT_RETENTION)
+    }
+}
+
+#[cfg(test)]
+mod refresh_flight_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_leader_fails_followers_and_allows_retry() {
+        let flights = RefreshFlights::default();
+        let key = Sha256::digest(b"test refresh token").into();
+        let (flight, leader) = flights.join(key);
+        let leader = leader.expect("first refresh should lead the flight");
+        let (follower_flight, follower_leader) = flights.join(key);
+        assert!(follower_leader.is_none());
+
+        let mut leader_wait = Box::pin(flight.wait());
+        let mut follower_wait = Box::pin(follower_flight.wait());
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(leader_wait.as_mut().poll(&mut context).is_pending());
+        assert!(follower_wait.as_mut().poll(&mut context).is_pending());
+
+        drop(leader);
+
+        assert!(follower_wait.as_mut().poll(&mut context).is_ready());
+        assert!(flights.0.lock().unwrap().is_empty());
+
+        let (retry_flight, retry_leader) = flights.join(key);
+        let retry_leader = retry_leader.expect("a later refresh should be able to retry");
+        let mut retry_wait = Box::pin(retry_flight.wait());
+        assert!(retry_wait.as_mut().poll(&mut context).is_pending());
+        retry_leader.complete(RefreshOutcome::Failed);
+        assert!(retry_wait.as_mut().poll(&mut context).is_ready());
     }
 }
 
