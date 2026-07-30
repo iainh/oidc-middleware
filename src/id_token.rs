@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::{Error, Result};
+#[cfg(feature = "jwt")]
+use crate::Error;
+use crate::Result;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -30,9 +32,11 @@ where
     }
 }
 
+#[cfg(feature = "web-app")]
 #[derive(Clone)]
 pub(crate) struct RejectAllIdTokens;
 
+#[cfg(feature = "web-app")]
 impl IdTokenValidator for RejectAllIdTokens {
     fn validate(&self, _token: Arc<str>) -> IdTokenValidationFuture {
         Box::pin(async {

@@ -79,6 +79,7 @@ enum WebAppPrincipal {
 pub struct Oidc {
     pub(crate) config: OidcConfig,
     validator: Arc<dyn TokenValidator>,
+    #[cfg(feature = "web-app")]
     id_token_validator: Arc<dyn IdTokenValidator>,
     pub(crate) token_header_name: Option<HeaderName>,
     #[cfg(feature = "web-app")]
@@ -1428,6 +1429,7 @@ impl OidcBuilder {
         Oidc {
             config: self.config,
             validator: self.validator.unwrap_or_else(|| Arc::new(RejectAllTokens)),
+            #[cfg(feature = "web-app")]
             id_token_validator: self
                 .id_token_validator
                 .unwrap_or_else(|| Arc::new(crate::id_token::RejectAllIdTokens)),
@@ -1507,7 +1509,7 @@ where
                         .is_some_and(|web_app| web_app.is_callback(&request));
                     #[cfg(not(feature = "web-app"))]
                     let is_callback = false;
-                    let mut response = if is_callback {
+                    let response = if is_callback {
                         error.into_callback_response_for_request(
                             request.method(),
                             request.uri().path(),
@@ -1519,6 +1521,8 @@ where
                             request.uri().path(),
                         )
                     };
+                    #[cfg(feature = "web-app")]
+                    let mut response = response;
                     #[cfg(feature = "web-app")]
                     if let Some(pending_cookies) =
                         request.extensions_mut().remove::<PendingWebAppCookies>()
