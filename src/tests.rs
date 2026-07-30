@@ -1905,6 +1905,10 @@ fn oidc_from_config_accepts_web_app_application_type() {
 }
 
 fn web_app_redirect_test_app() -> Router {
+    web_app_redirect_test_app_with_endpoint("https://issuer.example/realms/app/auth")
+}
+
+fn web_app_redirect_test_app_with_endpoint(authorization_endpoint: &str) -> Router {
     let oidc = Oidc::builder(OidcConfig {
         application_type: ApplicationType::WebApp,
         client_id: Some("orders-web".to_owned()),
@@ -1922,7 +1926,7 @@ fn web_app_redirect_test_app() -> Router {
         ProviderMetadata {
             issuer: Some("https://issuer.example/realms/app".to_owned()),
             jwks_uri: "https://issuer.example/realms/app/certs".to_owned(),
-            authorization_endpoint: Some("https://issuer.example/realms/app/auth".to_owned()),
+            authorization_endpoint: Some(authorization_endpoint.to_owned()),
             token_endpoint: Some("https://issuer.example/realms/app/token".to_owned()),
             registration_endpoint: None,
             revocation_endpoint: None,
@@ -1952,6 +1956,43 @@ async fn web_app_authorization_redirect_location(request: Request<Body>) -> reqw
         .and_then(|value| value.to_str().ok())
         .expect("redirect location should be present");
     reqwest::Url::parse(location).expect("redirect location should be a URL")
+}
+
+#[tokio::test]
+async fn web_app_authorization_redirect_preserves_endpoint_query_parameters() {
+    let response = web_app_redirect_test_app_with_endpoint(
+        "https://issuer.example/realms/app/auth?audience=orders%20api",
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/protected")
+            .header(HOST, "app.example")
+            .body(Body::empty())
+            .expect("request should be valid"),
+    )
+    .await
+    .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location should be present");
+    let query = reqwest::Url::parse(location)
+        .expect("redirect location should be a URL")
+        .query_pairs()
+        .into_owned()
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        query.get("audience").map(String::as_str),
+        Some("orders api")
+    );
+    assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
+    assert_eq!(
+        query.get("client_id").map(String::as_str),
+        Some("orders-web")
+    );
 }
 
 #[tokio::test]

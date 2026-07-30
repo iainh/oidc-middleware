@@ -334,14 +334,24 @@ impl WebApp {
                 .then_some(original_uri.clone()),
         };
 
-        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        let mut authorization_url =
+            reqwest::Url::parse(&self.authorization_endpoint).map_err(|error| {
+                Error::Session(
+                    std::io::Error::other(format!(
+                        "invalid OIDC authorization endpoint `{}`: {error}",
+                        self.authorization_endpoint
+                    ))
+                    .into(),
+                )
+            })?;
         // OpenID Connect Core 1.0 Section 3.1.2.1 requires `scope` with
         // `openid`, `response_type=code`, `client_id`, and the `redirect_uri`
         // used for the token request. Section 3.1.2.2 leaves `state`
         // RECOMMENDED; Quarkus and Payara both bind the code flow to local
         // state. Like Payara, keep the secret nonce in local transient state
         // and send its SHA-256 hash to the provider.
-        serializer
+        let mut query = authorization_url.query_pairs_mut();
+        query
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.client_id)
             .append_pair("redirect_uri", &redirect_uri)
@@ -350,13 +360,10 @@ impl WebApp {
             .append_pair("code_challenge", &code_challenge)
             .append_pair("code_challenge_method", "S256");
         if let Some(nonce_hash) = nonce_hash.as_deref() {
-            serializer.append_pair("nonce", nonce_hash);
+            query.append_pair("nonce", nonce_hash);
         }
-        let mut response = redirect_response(&format!(
-            "{}?{}",
-            self.authorization_endpoint,
-            serializer.finish()
-        ))?;
+        drop(query);
+        let mut response = redirect_response(authorization_url.as_str())?;
         response.headers_mut().append(
             SET_COOKIE,
             self.redirect_state_cookie.store(&redirect_state)?,
