@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repository_root"
+
+common_setup_url="https://raw.githubusercontent.com/iainh/amp-orbs/fcb5e318e59d6374081a45bc7769acf01cee0dd2/orb-setup"
+temporary_setup="$(mktemp)"
+trap 'rm -f "$temporary_setup"' EXIT
+
+curl --fail --silent --show-error --location \
+  "$common_setup_url" \
+  --output "$temporary_setup"
+bash "$temporary_setup"
+
+if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+  echo "Installing Rustup..."
+  curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+    https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain 1.88.0
+fi
+
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env"
+
+echo "Installing Rust 1.88.0..."
+rustup toolchain install 1.88.0 --profile minimal
+rustup default 1.88.0
+
+echo "Fetching locked Cargo dependencies..."
+cargo fetch --locked
